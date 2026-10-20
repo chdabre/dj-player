@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.87"
+
+[workspace.dependencies]
+engine-core = { path = "crates/engine-core" }
+engine-media = { path = "crates/engine-media" }
+engine-io = { path = "crates/engine-io" }
+rtrb = "0.4"
+symphonia = { version = "0.6", default-features = false }
+rubato = "5"
+cpal = "0.18"
+assert_no_alloc = "1.1"
+hound = "3.5"
+criterion = "0.8"
+crossterm = "0.29"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.bench]
+debug = true
