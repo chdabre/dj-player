@@ -7,11 +7,13 @@
 //! - [`Source`]: resident sample store with per-chunk ready flags.
 //! - [`Transport`]: playhead, rate, direction and the slip shadow playhead.
 //! - [`Scaler`]: cubic-Hermite reader at fractional positions, any rate.
+//! - [`Keylock`]: the keylock path through a time-stretcher, latency-compensated.
 //! - [`Deck`]: the three together.
 //! - [`Engine`]: owns the decks; [`Engine::process`] is the audio callback body.
 
 pub mod deck;
 pub mod engine;
+pub mod keylock;
 pub mod render;
 pub mod scaler;
 pub mod source;
@@ -20,6 +22,7 @@ pub mod transport;
 
 pub use deck::{BlockOutcome, DECLICK_FRAMES, Deck, DeckCommand, MAX_BLOCK_FRAMES};
 pub use engine::{Command, CommandRingFull, Engine, EngineConfig, EngineHandle};
+pub use keylock::{Keylock, MAX_STRETCH_RATE};
 pub use scaler::Scaler;
 pub use source::{CHANNELS, Frame, FrameSource, SliceSource, Source, SourceWriter};
 pub use state::{AtomicF64, DeckState, LoadMeter, LoadReport};

@@ -8,7 +8,7 @@
 - Options: `--list-devices`, `--device <id or name substring>`, `--buffer <frames>` (e.g. `--buffer 128`; must be in the device's supported range).
 - Debug builds (`cargo run -p engined -- <file>`) install `assert_no_alloc`'s allocator and abort if the audio callback allocates. Use them to check new callback code; use `--release` for listening and load numbers.
 - Before every commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-- Offline render bench (ns per frame, compare Mac vs Pi): `cargo bench -p engine-core --bench render`. The offline render test writes `target/tmp/offline_render.wav` for listening.
+- Offline render bench (ns per frame, compare Mac vs Pi): `cargo bench -p engine-core --bench render`. `keylock_1.08` is the keylock path. The offline render test writes `target/tmp/offline_render.wav` for listening.
 
 ## Test media
 

@@ -10,13 +10,13 @@ Install Rust with [rustup](https://rustup.rs) and the Xcode command line tools (
 cargo run -p engined --release -- <file>
 ```
 
-Any MP3, AAC/M4A, ALAC, FLAC, WAV, AIFF or Ogg file works. Keys: space play/pause, ←/→ seek ±5 s, `+`/`-` rate ±1 %, `0` reset the rate, `r` reverse, `s` slip, `q` quit. Once per second the engine prints the playhead, the rate and the callback load meter. `--list-devices`, `--device <name>` and `--buffer <frames>` select the output. See [docs/dev-setup.md](docs/dev-setup.md) for more.
+Any MP3, AAC/M4A, ALAC, FLAC, WAV, AIFF or Ogg file works. Keys: space play/pause, ←/→ seek ±5 s, `+`/`-` rate ±1 %, `0` reset the rate, `k` keylock, `r` reverse, `s` slip, `q` quit. Once per second the engine prints the playhead, the rate and the callback load meter. `--list-devices`, `--device <name>` and `--buffer <frames>` select the output. See [docs/dev-setup.md](docs/dev-setup.md) for more.
 
 ## Layout
 
 | Crate | What it holds |
 | --- | --- |
-| `crates/engine-core` | Source, Transport (with slip), Scaler, Deck, Engine; no I/O, no threads |
+| `crates/engine-core` | Source, Transport (with slip), Scaler, Keylock, Deck, Engine; no I/O, no threads |
 | `crates/engine-stretch` | `Stretcher` trait for keylock; Signalsmith Stretch (C++, built with `cc` and bindgen) |
 | `crates/engine-media` | Symphonia decode and load-time resample on a loader thread |
 | `crates/engine-io` | `AudioBackend` trait and its cpal implementation |

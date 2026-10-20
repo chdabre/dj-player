@@ -99,7 +99,10 @@ impl Engine {
         let states: Box<[Arc<DeckState>]> = (0..config.decks)
             .map(|_| Arc::new(DeckState::default()))
             .collect();
-        let decks = states.iter().map(|s| Deck::new(Arc::clone(s))).collect();
+        let decks = states
+            .iter()
+            .map(|s| Deck::new(Arc::clone(s), config.sample_rate))
+            .collect();
         let engine = Engine {
             config,
             decks,

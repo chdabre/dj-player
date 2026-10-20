@@ -34,6 +34,11 @@ pub struct DeckState {
     pub reverse: AtomicBool,
     pub slip_enabled: AtomicBool,
     pub slip_active: AtomicBool,
+    /// Keylock is on.
+    pub keylock_enabled: AtomicBool,
+    /// The last block went through the time-stretcher. False with keylock on while the
+    /// deck is paused, reversing or at a rate the stretcher does not play.
+    pub stretching: AtomicBool,
     /// Audible playhead, frames at the engine rate.
     pub position: AtomicF64,
     /// Slip shadow playhead, frames at the engine rate.

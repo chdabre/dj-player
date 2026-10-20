@@ -1,7 +1,7 @@
 //! `engined <file>`: play one track on one deck through the real engine.
 //!
-//! Keys: space play/pause, ←/→ seek ±5 s, +/- rate ±1 %, 0 reset rate, r reverse, s slip,
-//! q quit. Prints the deck state and the callback load meter once per second.
+//! Keys: space play/pause, ←/→ seek ±5 s, +/- rate ±1 %, 0 reset rate, k keylock,
+//! r reverse, s slip, q quit. Prints the deck state and the callback load meter once per second.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ const USAGE: &str = "\
 usage: engined <file> [--device <name>] [--buffer <frames>] [--list-devices]
 
 keys:  space play/pause   <-/-> seek -/+5 s   +/- rate +/-1 %   0 reset rate
-       r reverse   s slip   q quit";
+       k keylock   r reverse   s slip   q quit";
 
 struct Args {
     file: Option<PathBuf>,
@@ -142,7 +142,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let interactive = std::io::stdin().is_terminal() && terminal::enable_raw_mode().is_ok();
     let _raw = interactive.then_some(RawModeGuard);
     if interactive {
-        out("space play/pause  <-/-> seek 5 s  +/- rate 1 %  0 reset  r reverse  s slip  q quit");
+        out(
+            "space play/pause  <-/-> seek 5 s  +/- rate 1 %  0 reset  k keylock  r reverse  \
+             s slip  q quit",
+        );
     } else {
         out("stdin is not a terminal: playing to the end without key control");
         handle.send_deck(DECK, DeckCommand::Play)?;
@@ -226,15 +229,25 @@ fn report(state: &DeckState, meter: &LoadMeter, source: &Source, rate: u32) {
             (true, false) => "slip on",
             (true, true) => "SLIPPING",
         },
+        match (
+            state.keylock_enabled.load(Ordering::Relaxed),
+            state.stretching.load(Ordering::Relaxed),
+        ) {
+            (false, _) => "keylock off",
+            (true, true) => "keylock on",
+            // Paused, reversing or at a rate the stretcher does not play: resampler.
+            (true, false) => "keylock bypassed",
+        },
     ];
     let mut line = format!(
-        "{} / {}  rate {:+.2} %  {} {} {}  load avg {:4.1} % peak {:4.1} % ({} cb)",
+        "{} / {}  rate {:+.2} %  {} {} {} {}  load avg {:4.1} % peak {:4.1} % ({} cb)",
         clock(state.position.load() / sr),
         clock(state.length.load() / sr),
         (state.rate.load() - 1.0) * 100.0,
         flags[0],
         flags[1],
         flags[2],
+        flags[3],
         load.average * 100.0,
         load.peak * 100.0,
         load.callbacks,
@@ -311,6 +324,7 @@ impl Controls {
                 self.rate_steps = 0;
                 self.rate()
             }
+            KeyCode::Char('k') => DeckCommand::ToggleKeylock,
             KeyCode::Char('r') => DeckCommand::ToggleReverse,
             KeyCode::Char('s') => DeckCommand::ToggleSlip,
             _ => return Action::None,

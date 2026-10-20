@@ -1,6 +1,7 @@
 //! Offline render bench: ns per output frame for one deck through `Engine::process`, at the
 //! block size the Pi will run (128 frames). Run it on the Mac and on a Pi 5 and compare the
-//! per-block time against the 1.3 ms half-budget from docs/research/engine.md.
+//! per-block time against the 1.3 ms half-budget from docs/research/engine.md. Each iteration
+//! starts with a seek, so the keylock case includes one stretcher prime per second.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -19,7 +20,12 @@ fn bench_render(c: &mut Criterion) {
     let mut group = c.benchmark_group("offline_render");
     group.throughput(Throughput::Elements(FRAMES as u64));
 
-    for (name, rate) in [("rate_1.0", 1.0), ("rate_1.08", 1.08), ("reverse", -1.0)] {
+    for (name, rate, keylock) in [
+        ("rate_1.0", 1.0, false),
+        ("rate_1.08", 1.08, false),
+        ("reverse", -1.0, false),
+        ("keylock_1.08", 1.08, true),
+    ] {
         let (mut engine, mut handle) = Engine::new(EngineConfig {
             sample_rate: SR,
             channels: 2,
@@ -27,6 +33,9 @@ fn bench_render(c: &mut Criterion) {
         });
         handle
             .send_deck(0, DeckCommand::Load(Arc::clone(&source)))
+            .unwrap();
+        handle
+            .send_deck(0, DeckCommand::SetKeylock(keylock))
             .unwrap();
         handle.send_deck(0, DeckCommand::Play).unwrap();
         let mut out = vec![0.0f32; BLOCK * 2];

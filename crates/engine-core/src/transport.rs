@@ -13,6 +13,12 @@
 //! the beatgrid exists.
 //!
 //! A seek is not slip-able: it moves both playheads and ends any active slip.
+//!
+//! # Keylock
+//!
+//! Keylock is a flag here and changes nothing about how the playheads move:
+//! the rate is the speed either way. The deck reads it to choose between the resampler and the
+//! time-stretcher.
 
 /// Actions that the shadow playhead slides underneath while slip is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +48,7 @@ pub struct Transport {
     slip_enabled: bool,
     shadow: f64,
     slip_held: u8,
+    keylock: bool,
 }
 
 impl Default for Transport {
@@ -62,6 +69,7 @@ impl Transport {
             slip_enabled: false,
             shadow: 0.0,
             slip_held: 0,
+            keylock: false,
         }
     }
 
@@ -97,6 +105,15 @@ impl Transport {
     /// True while at least one slip-able action is held and the shadow runs separately.
     pub fn is_slip_active(&self) -> bool {
         self.slip_held != 0
+    }
+
+    /// Keylock: rate changes speed but not pitch.
+    pub fn is_keylock_enabled(&self) -> bool {
+        self.keylock
+    }
+
+    pub fn set_keylock(&mut self, enabled: bool) {
+        self.keylock = enabled;
     }
 
     /// Playhead movement in frames per output frame: signed, 0 when paused.
@@ -432,6 +449,17 @@ mod tests {
         assert_eq!(t.shadow_position(), 5000.0);
         t.set_reverse(false);
         assert_eq!(t.position(), 5000.0);
+    }
+
+    #[test]
+    fn keylock_does_not_change_movement() {
+        let mut t = playing();
+        t.set_rate(1.08);
+        let mut k = t;
+        k.set_keylock(true);
+        assert!(k.is_keylock_enabled() && !t.is_keylock_enabled());
+        assert_eq!(t.advance(1000), k.advance(1000));
+        assert_eq!(t.position(), k.position());
     }
 
     #[test]

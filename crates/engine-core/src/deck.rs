@@ -1,8 +1,13 @@
-//! `Deck`: one player, tying a [`Source`], a [`Transport`] and a [`Scaler`] together.
+//! `Deck`: one player, tying a [`Source`], a [`Transport`] and its two scalers together.
+//!
+//! Each block plays through one of two paths: the [`Scaler`] (resampler: pitch follows rate,
+//! any direction) or, with keylock on and a forward rate it can play, the [`Keylock`]
+//! time-stretcher. A change of path crossfades like a jump does.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::keylock::Keylock;
 use crate::scaler::Scaler;
 use crate::source::{CHANNELS, Source};
 use crate::state::DeckState;
@@ -12,8 +17,9 @@ use crate::transport::Transport;
 /// buffers into blocks of at most this many frames, so the deck's scratch space is fixed.
 pub const MAX_BLOCK_FRAMES: usize = 1024;
 
-/// Length of the crossfade applied when the playhead jumps (seek, play/pause, slip snap-back).
-/// Shorter blocks fade over the whole block.
+/// Length of the crossfade applied when the playhead jumps (seek, play/pause, slip snap-back)
+/// or the deck switches between resampler and stretcher. Shorter blocks fade over the whole
+/// block.
 pub const DECLICK_FRAMES: usize = 128;
 
 /// Operations on one deck, sent into the callback as part of a [`crate::Command`].
@@ -37,6 +43,9 @@ pub enum DeckCommand {
     ToggleReverse,
     SetSlip(bool),
     ToggleSlip,
+    /// Keylock: rate changes speed, not pitch. Kept across track loads.
+    SetKeylock(bool),
+    ToggleKeylock,
 }
 
 /// What the deck did with the last block.
@@ -55,6 +64,10 @@ pub struct Deck {
     source: Option<Arc<Source>>,
     transport: Transport,
     scaler: Scaler,
+    /// `None` if no stretcher backend is compiled in; keylock then has no effect.
+    keylock: Option<Keylock>,
+    /// The last rendered block went through the stretcher.
+    stretching: bool,
     state: Arc<DeckState>,
     /// Transport as it was before the first command of the current block, if any.
     fade_from: Option<Transport>,
@@ -63,12 +76,21 @@ pub struct Deck {
 }
 
 impl Deck {
-    /// Create an empty deck. Allocates its scratch space; call off the audio thread.
-    pub fn new(state: Arc<DeckState>) -> Self {
+    /// Create an empty deck for an engine running at `sample_rate`, with the default
+    /// stretcher. Allocates its scratch space and stretcher; call off the audio thread.
+    pub fn new(state: Arc<DeckState>, sample_rate: u32) -> Self {
+        let stretcher = engine_stretch::default_stretcher(CHANNELS, sample_rate);
+        Self::with_keylock(state, stretcher.map(Keylock::new))
+    }
+
+    /// Create an empty deck with an explicit keylock path (or none).
+    pub fn with_keylock(state: Arc<DeckState>, keylock: Option<Keylock>) -> Self {
         Self {
             source: None,
             transport: Transport::default(),
             scaler: Scaler::new(),
+            keylock,
+            stretching: false,
             state,
             fade_from: None,
             declick: true,
@@ -98,8 +120,13 @@ impl Deck {
     /// on the audio thread. The new track starts paused at frame 0.
     pub fn swap_source(&mut self, source: Option<Arc<Source>>) -> Option<Arc<Source>> {
         let length = source.as_ref().map_or(0.0, |s| s.len_frames() as f64);
+        let keylock = self.transport.is_keylock_enabled();
         self.transport = Transport::new(length);
+        self.transport.set_keylock(keylock);
         self.fade_from = None;
+        if let Some(k) = &mut self.keylock {
+            k.invalidate();
+        }
         std::mem::replace(&mut self.source, source)
     }
 
@@ -123,7 +150,16 @@ impl Deck {
             DeckCommand::ToggleReverse => t.set_reverse(!t.is_reverse()),
             DeckCommand::SetSlip(on) => t.set_slip(on),
             DeckCommand::ToggleSlip => t.set_slip(!t.is_slip_enabled()),
+            DeckCommand::SetKeylock(on) => t.set_keylock(on),
+            DeckCommand::ToggleKeylock => t.set_keylock(!t.is_keylock_enabled()),
         }
+    }
+
+    /// True if a block of `transport` goes through the stretcher.
+    fn uses_keylock(&self, transport: &Transport) -> bool {
+        self.keylock.is_some()
+            && transport.is_keylock_enabled()
+            && Keylock::handles(transport.velocity())
     }
 
     /// Render `out.len() / 2` interleaved stereo frames (at most [`MAX_BLOCK_FRAMES`]),
@@ -131,14 +167,16 @@ impl Deck {
     ///
     /// Real-time safe. If the block would read a chunk that is not loaded yet, the block is
     /// silent, the transport does not move (so no audio is skipped) and the outcome is
-    /// [`BlockOutcome::Starved`]. If a command made the playhead jump, the first
-    /// [`DECLICK_FRAMES`] frames crossfade from where the old playhead would have gone.
+    /// [`BlockOutcome::Starved`]. If a command made the playhead jump or switched between
+    /// resampler and stretcher, the first [`DECLICK_FRAMES`] frames crossfade from what the
+    /// old state would have played.
     pub fn render(&mut self, out: &mut [f32]) -> BlockOutcome {
         let frames = out.len() / CHANNELS;
         assert!(frames <= MAX_BLOCK_FRAMES, "block too long");
         let fade_from = self.fade_from.take();
         let Some(source) = self.source.as_deref() else {
             out.fill(0.0);
+            self.stretching = false;
             return BlockOutcome::Empty;
         };
         let length = source.len_frames() as f64;
@@ -149,33 +187,63 @@ impl Deck {
         let mut next = self.transport;
         let segment = next.advance(frames);
         let audible = self.transport.is_playing();
+        let stretch = self.uses_keylock(&self.transport);
+        let fade = fade_from.filter(|old| {
+            self.declick
+                && (old.position() != segment.start
+                    || old.is_playing() != audible
+                    || self.uses_keylock(old) != stretch)
+        });
+
+        // The outgoing audio first: if it came from the stretcher, it has to be rendered
+        // before the stretcher is primed at the new position.
+        let fade_len = frames.min(DECLICK_FRAMES);
+        if let Some(mut old) = fade {
+            let old_stretch = self.uses_keylock(&old);
+            let old_audible = old.is_playing();
+            let old_segment = old.advance(fade_len);
+            let scratch = &mut self.scratch[..fade_len * CHANNELS];
+            let (first, last) = Scaler::span(old_segment, fade_len);
+            let rendered = match &mut self.keylock {
+                Some(k) if old_stretch && k.is_aligned(old_segment.start) => {
+                    k.render(source, old_segment, scratch)
+                }
+                _ if old_audible && source.range_ready(first, last) => {
+                    self.scaler.render(source, old_segment, scratch);
+                    true
+                }
+                _ => false,
+            };
+            if !rendered {
+                scratch.fill(0.0);
+            }
+        }
+
         if audible {
-            let (first, last) = Scaler::span(segment, frames);
-            if !source.range_ready(first, last) {
+            let ready = match &mut self.keylock {
+                Some(k) if stretch => k.render(source, segment, out),
+                _ => {
+                    let (first, last) = Scaler::span(segment, frames);
+                    let ready = source.range_ready(first, last);
+                    if ready {
+                        self.scaler.render(source, segment, out);
+                    }
+                    ready
+                }
+            };
+            if !ready {
                 out.fill(0.0);
                 return BlockOutcome::Starved;
             }
-            self.scaler.render(source, segment, out);
         } else {
             out.fill(0.0);
         }
         self.transport = next;
+        self.stretching = audible && stretch;
 
-        if let Some(mut old) = fade_from
-            && self.declick
-            && (old.position() != segment.start || old.is_playing() != audible)
-        {
-            let fade = frames.min(DECLICK_FRAMES);
-            let scratch = &mut self.scratch[..fade * CHANNELS];
-            let old_audible = old.is_playing();
-            let old_segment = old.advance(fade);
-            let (first, last) = Scaler::span(old_segment, fade);
-            if old_audible && source.range_ready(first, last) {
-                self.scaler.render(source, old_segment, scratch);
-            } else {
-                scratch.fill(0.0);
-            }
-            let inv = 1.0 / fade as f32;
+        if fade.is_some() {
+            let scratch = &self.scratch[..fade_len * CHANNELS];
+            let inv = 1.0 / fade_len as f32;
             for (k, (o, s)) in out
                 .chunks_exact_mut(CHANNELS)
                 .zip(scratch.chunks_exact(CHANNELS))
@@ -199,6 +267,9 @@ impl Deck {
         s.reverse.store(t.is_reverse(), Ordering::Relaxed);
         s.slip_enabled.store(t.is_slip_enabled(), Ordering::Relaxed);
         s.slip_active.store(t.is_slip_active(), Ordering::Relaxed);
+        s.keylock_enabled
+            .store(t.is_keylock_enabled(), Ordering::Relaxed);
+        s.stretching.store(self.stretching, Ordering::Relaxed);
         s.position.store(t.position());
         s.shadow_position.store(t.shadow_position());
         s.rate.store(t.rate());
