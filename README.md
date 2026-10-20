@@ -4,7 +4,7 @@ An open-source standalone DJ player inspired by the Pioneer XDJ-700 and XDJ-1000
 
 ## Run it on macOS
 
-Install Rust with [rustup](https://rustup.rs), then:
+Install Rust with [rustup](https://rustup.rs) and the Xcode command line tools (`xcode-select --install`; the time-stretcher is C++ and its bindings need libclang), then:
 
 ```sh
 cargo run -p engined --release -- <file>
@@ -17,6 +17,7 @@ Any MP3, AAC/M4A, ALAC, FLAC, WAV, AIFF or Ogg file works. Keys: space play/paus
 | Crate | What it holds |
 | --- | --- |
 | `crates/engine-core` | Source, Transport (with slip), Scaler, Deck, Engine; no I/O, no threads |
+| `crates/engine-stretch` | `Stretcher` trait for keylock; Signalsmith Stretch (C++, built with `cc` and bindgen) |
 | `crates/engine-media` | Symphonia decode and load-time resample on a loader thread |
 | `crates/engine-io` | `AudioBackend` trait and its cpal implementation |
 | `crates/engined` | The engine binary; for now a terminal player |

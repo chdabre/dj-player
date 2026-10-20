@@ -12,9 +12,11 @@ rust-version = "1.87"
 engine-core = { path = "crates/engine-core" }
 engine-media = { path = "crates/engine-media" }
 engine-io = { path = "crates/engine-io" }
+engine-stretch = { path = "crates/engine-stretch" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"
+signalsmith-stretch = "0.1.3"
 cpal = "0.18"
 assert_no_alloc = "1.1"
 hound = "3.5"
