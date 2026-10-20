@@ -1,0 +1,19 @@
+[package]
+name = "engine-media"
+description = "Track loading: Symphonia decode, load-time resample (rubato), chunked fill of a resident Source."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+engine-core.workspace = true
+symphonia = { workspace = true, features = ["all-codecs", "all-formats", "opt-simd"] }
+rubato.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+
+[lints]
+workspace = true
