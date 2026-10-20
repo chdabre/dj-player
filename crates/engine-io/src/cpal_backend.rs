@@ -46,7 +46,7 @@ impl CpalBackend {
         format!("{:?}", self.host.id())
     }
 
-    /// Names of the output devices on the default host.
+    /// "<id>: <name>" of every output device on the default host.
     pub fn output_device_names(&self) -> Result<Vec<String>, BackendError> {
         let devices = self.host.output_devices().map_err(err)?;
         Ok(devices.map(|d| device_name(&d)).collect())
@@ -98,10 +98,19 @@ fn err(e: impl std::fmt::Display) -> BackendError {
     BackendError::new(e.to_string())
 }
 
+/// "<id>: <description>", e.g. "alsa:hw:CARD=Device,DEV=0: USB Audio" or the CoreAudio
+/// device UID and name. `--device` matches against this whole string.
 fn device_name(d: &Device) -> String {
-    d.description()
+    let id = d.id().map(|id| id.to_string()).unwrap_or_default();
+    let name = d
+        .description()
         .map(|desc| desc.name().to_string())
-        .unwrap_or_else(|_| "<unknown>".into())
+        .unwrap_or_else(|_| "<unknown>".into());
+    if id.is_empty() {
+        name
+    } else {
+        format!("{id}: {name}")
+    }
 }
 
 impl AudioBackend for CpalBackend {

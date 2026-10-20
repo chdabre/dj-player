@@ -22,7 +22,7 @@ pub struct StreamFormat {
 /// What to open.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamRequest {
-    /// Substring of the output device name; `None` = default output device.
+    /// Case-insensitive substring of the output device id or name; `None` = default device.
     pub device: Option<String>,
     /// Requested buffer size in frames; `None` = the device default.
     pub buffer_frames: Option<u32>,

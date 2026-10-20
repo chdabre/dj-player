@@ -1,0 +1,18 @@
+[package]
+name = "engined"
+description = "Engine daemon; for now a CLI that plays one file on one deck."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+engine-core.workspace = true
+engine-media.workspace = true
+engine-io.workspace = true
+assert_no_alloc.workspace = true
+crossterm.workspace = true
+
+[lints]
+workspace = true
