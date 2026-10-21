@@ -43,7 +43,15 @@ pub use stratum::Stratum;
 
 /// Decode a file for analysis, at its own sample rate.
 pub fn load(path: impl AsRef<std::path::Path>) -> Result<TrackAudio, engine_media::LoadError> {
-    let (stereo, sample_rate) = engine_media::decode_native(path)?;
+    load_until(path, &engine_media::Cancel::new())
+}
+
+/// [`load`], stopped once `cancel` is set.
+pub fn load_until(
+    path: impl AsRef<std::path::Path>,
+    cancel: &engine_media::Cancel,
+) -> Result<TrackAudio, engine_media::LoadError> {
+    let (stereo, sample_rate) = engine_media::decode_native_until(path, cancel)?;
     Ok(TrackAudio {
         sample_rate,
         stereo,

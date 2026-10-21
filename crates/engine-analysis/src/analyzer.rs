@@ -44,6 +44,11 @@ impl CancelFlag {
         Self::default()
     }
 
+    /// A flag set through `shared` (e.g. a track load's [`engine_media::Cancel`]).
+    pub fn from_shared(shared: Arc<AtomicBool>) -> Self {
+        Self(shared)
+    }
+
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }

@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use engine_core::{CHANNELS, Source, SourceWriter};
@@ -38,6 +39,8 @@ pub enum LoadError {
     Resample(String),
     /// The file opened and its stream looked valid, but not one frame decoded.
     NoAudio,
+    /// Stopped by its [`Cancel`] (the track was replaced before it finished).
+    Cancelled,
 }
 
 impl fmt::Display for LoadError {
@@ -49,6 +52,7 @@ impl fmt::Display for LoadError {
             LoadError::UnknownSampleRate => f.write_str("file does not state its sample rate"),
             LoadError::Resample(e) => write!(f, "resampler error: {e}"),
             LoadError::NoAudio => f.write_str("no audio could be decoded from the file"),
+            LoadError::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -93,12 +97,38 @@ pub struct TrackInfo {
     pub start_trim: u32,
 }
 
-/// A track being loaded: the source is usable right away; `thread` finishes the decode.
+/// Stops a decode between packets: the loader thread ends with [`LoadError::Cancelled`] and
+/// the source keeps what was decoded.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// The shared flag, for cancelling other work with the same token.
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+/// A track being loaded: the source is usable right away; `thread` finishes the decode, and
+/// `cancel` stops it early.
 #[derive(Debug)]
 pub struct Loading {
     pub info: TrackInfo,
     pub source: Arc<Source>,
     pub thread: JoinHandle<Result<(), LoadError>>,
+    pub cancel: Cancel,
 }
 
 /// Sees every chunk of interleaved stereo the loader writes into the source, at the engine
@@ -122,7 +152,9 @@ pub fn load_file_tapped(
     mut tap: Option<Tap>,
 ) -> Result<Loading, LoadError> {
     let path = path.as_ref().to_path_buf();
+    let cancel = Cancel::new();
     let mut decoding = Decoding::open(&path)?;
+    decoding.cancel = Some(cancel.clone());
     let info = TrackInfo {
         path: path.clone(),
         file_sample_rate: decoding.sample_rate,
@@ -149,6 +181,7 @@ pub fn load_file_tapped(
                 info,
                 source,
                 thread,
+                cancel,
             })
         }
         None => {
@@ -170,6 +203,7 @@ pub fn load_file_tapped(
                 info,
                 source,
                 thread,
+                cancel,
             })
         }
     }
@@ -192,7 +226,16 @@ pub fn probe(path: impl AsRef<Path>) -> Result<TrackInfo, LoadError> {
 /// Decode `path` completely at the file's own sample rate. Returns interleaved stereo and that
 /// rate. Analysis uses this, so its results do not depend on the device the engine runs on.
 pub fn decode_native(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32), LoadError> {
+    decode_native_until(path, &Cancel::new())
+}
+
+/// [`decode_native`], stopped with [`LoadError::Cancelled`] once `cancel` is set.
+pub fn decode_native_until(
+    path: impl AsRef<Path>,
+    cancel: &Cancel,
+) -> Result<(Vec<f32>, u32), LoadError> {
     let mut decoding = Decoding::open(path.as_ref())?;
+    decoding.cancel = Some(cancel.clone());
     let mut collected = Vec::new();
     decoding.run(&mut |s: &[f32]| collected.extend_from_slice(s))?;
     Ok((collected, decoding.sample_rate))
@@ -267,6 +310,7 @@ struct Decoding {
     channels: usize,
     frames: Option<u64>,
     start_trim: u32,
+    cancel: Option<Cancel>,
 }
 
 impl Decoding {
@@ -306,6 +350,7 @@ impl Decoding {
             channels,
             frames,
             start_trim,
+            cancel: None,
         })
     }
 
@@ -315,6 +360,9 @@ impl Decoding {
         let mut stereo: Vec<f32> = Vec::new();
         let mut decoded = 0usize;
         loop {
+            if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return Err(LoadError::Cancelled);
+            }
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => break,
@@ -647,6 +695,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_decode_stops() {
+        let path = tmp("cancel.wav");
+        write_wav(&path, 48_000, 1, &sine(48_000, 440.0, 48_000 * 60));
+        // Cancelled right away: the loader stops at its next packet (or has already finished).
+        let loading = load_file(&path, 48_000).unwrap();
+        loading.cancel.cancel();
+        assert!(matches!(
+            loading.thread.join().unwrap(),
+            Err(LoadError::Cancelled) | Ok(())
+        ));
+        let cancel = Cancel::new();
+        cancel.cancel();
+        assert!(matches!(
+            decode_native_until(&path, &cancel),
+            Err(LoadError::Cancelled)
+        ));
+    }
+
+    #[test]
     fn same_rate_stereo_load_is_exact() {
         let path = tmp("same.wav");
         let frames = 100_000;
@@ -790,4 +857,104 @@ mod tests {
         to_stereo(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, &mut out);
         assert_eq!(out, [1.0, 2.0, 4.0, 5.0]);
     }
+}
+
+/// What a file's tags say, for the browser. Every field is optional: plenty of files carry
+/// no tags at all.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+    /// Seconds, from the container's frame count.
+    pub duration: Option<f64>,
+    pub comment: Option<String>,
+    /// Stars, 0–5 (from the tag's rating, if it has one).
+    pub rating: Option<u8>,
+    /// The embedded picture: the front cover if there is one, else the first.
+    pub artwork: Option<Artwork>,
+}
+
+/// An embedded picture, still encoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Artwork {
+    /// MIME type, if the tag says (`image/jpeg`, `image/png`).
+    pub media_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// Read `path`'s tags and length without decoding audio. Tags come from a probe of the whole
+/// file (leading ID3v2 included); the length from [`probe`], which skips the ID3v2 tag as the
+/// loader does.
+pub fn tags(path: impl AsRef<Path>) -> Result<Tags, LoadError> {
+    use symphonia::core::meta::StandardTag as S;
+    let path = path.as_ref();
+    let info = probe(path)?;
+    let mut tags = Tags {
+        duration: info
+            .file_frames
+            .map(|f| f as f64 / f64::from(info.file_sample_rate)),
+        ..Tags::default()
+    };
+    let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    // A file whose tag trips the probe still has a length.
+    let Ok(mut format) = symphonia::default::get_probe().probe(
+        &hint,
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    ) else {
+        return Ok(tags);
+    };
+    let mut meta = format.metadata();
+    let Some(rev) = meta.skip_to_latest() else {
+        return Ok(tags);
+    };
+    let all = rev
+        .media
+        .tags
+        .iter()
+        .chain(rev.per_track.iter().flat_map(|t| &t.metadata.tags));
+    let text = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    let visuals = || {
+        rev.media
+            .visuals
+            .iter()
+            .chain(rev.per_track.iter().flat_map(|t| &t.metadata.visuals))
+    };
+    tags.artwork = visuals()
+        .find(|v| v.usage == Some(symphonia::core::meta::StandardVisualKey::FrontCover))
+        .or_else(|| visuals().next())
+        .map(|v| Artwork {
+            media_type: v.media_type.clone(),
+            data: v.data.to_vec(),
+        });
+    for tag in all {
+        match &tag.std {
+            Some(S::TrackTitle(s)) => tags.title = tags.title.take().or_else(|| text(s)),
+            Some(S::Artist(s)) => tags.artist = tags.artist.take().or_else(|| text(s)),
+            Some(S::Album(s)) => tags.album = tags.album.take().or_else(|| text(s)),
+            Some(S::Genre(s)) => tags.genre = tags.genre.take().or_else(|| text(s)),
+            Some(S::InitialKey(s)) => tags.key = tags.key.take().or_else(|| text(s)),
+            Some(S::Bpm(b)) if *b > 0 => tags.bpm = tags.bpm.or(Some(*b as f64)),
+            Some(S::Comment(s)) => tags.comment = tags.comment.take().or_else(|| text(s)),
+            // Parts per million of the scale.
+            Some(S::Rating(ppm)) => {
+                let stars = (f64::from(*ppm) / 1e6 * 5.0).round().clamp(0.0, 5.0) as u8;
+                tags.rating = tags.rating.or(Some(stars));
+            }
+            _ => {}
+        }
+    }
+    Ok(tags)
 }

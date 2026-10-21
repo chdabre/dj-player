@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 engine-core.workspace = true
-symphonia = { workspace = true, features = ["all-codecs", "all-formats", "opt-simd"] }
+symphonia = { workspace = true, features = ["all-codecs", "all-formats", "all-meta", "opt-simd"] }
 rubato.workspace = true
 
 [dev-dependencies]
