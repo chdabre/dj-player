@@ -215,8 +215,10 @@ impl Player {
         }
     }
 
-    /// Hand the record's cues to the deck.
-    fn restore_cues(&mut self, record: &Track) -> bool {
+    /// Hand the record's cues to the deck. `fill_only` keeps whatever the deck already has
+    /// (cues the DJ set before the library answered); the next [`Player::poll`] then writes
+    /// those to the library, since they differ from what it gave.
+    fn restore_cues(&mut self, record: &Track, fill_only: bool) -> bool {
         let sr = f64::from(self.format.sample_rate);
         let mut hot = [None; HOT_CUES];
         for (slot, h) in hot.iter_mut().zip(&record.hot_cues) {
@@ -230,6 +232,7 @@ impl Player {
                 (CueKind::Loop, Some(end)) => Some((c.at * sr, end * sr)),
                 _ => None,
             }),
+            fill_only,
         };
         let serial = self.lib.serial + 1;
         let sent = self.send(DeckCommand::SetCues {
@@ -250,11 +253,12 @@ impl Player {
         self.lib.track = Some(l.track);
         let hot = l.record.hot_cues.iter().flatten().count();
         let cues = l.record.cues.len();
-        // On a merge, the merged record's cues replace the deck's only if the DJ has not
-        // edited them since they were restored.
+        // The first restore only fills what the DJ hasn't set while the library was being
+        // read. On a merge, the merged record's cues replace the deck's only if the DJ has
+        // not edited them since they were restored.
         let untouched = self.lib.known == self.lib.restored;
         if (first || untouched) && (hot > 0 || cues > 0 || !first) {
-            if !self.restore_cues(&l.record) {
+            if !self.restore_cues(&l.record, first) {
                 lines.push("command ring full, stored cues dropped".into());
             } else if hot + cues > 0 {
                 lines.push(format!(

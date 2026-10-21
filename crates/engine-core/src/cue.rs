@@ -35,6 +35,10 @@ pub struct TrackCues {
     pub hot: [Option<f64>; HOT_CUES],
     /// A memory loop to store for RELOOP, not entered.
     pub stored_loop: Option<(f64, f64)>,
+    /// Only fill in what the deck doesn't have yet: empty hot cue slots, the cue point if it
+    /// is still at the track start, the stored loop if there is none. For the first restore
+    /// after a load, when the DJ may have set cues before the library answered; those stay.
+    pub fill_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

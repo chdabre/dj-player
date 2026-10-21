@@ -194,14 +194,23 @@ impl Deck {
             self.fade_from = Some(self.transport);
         }
         let t = &mut self.transport;
-        if let Some(cue) = cues.cue {
+        let fill = cues.fill_only;
+        if let Some(cue) = cues.cue
+            && (!fill || self.cues.cue == 0.0)
+        {
             self.cues.cue = cue.max(0.0);
             if !t.is_playing() && t.position() == 0.0 {
                 t.seek(self.cues.cue);
             }
         }
-        self.cues.hot = cues.hot;
-        if let Some((start, end)) = cues.stored_loop {
+        for (have, stored) in self.cues.hot.iter_mut().zip(cues.hot) {
+            if !fill || have.is_none() {
+                *have = stored;
+            }
+        }
+        if let Some((start, end)) = cues.stored_loop
+            && (!fill || t.stored_loop().is_none())
+        {
             t.store_loop(Loop { start, end });
         }
         self.cues_serial = serial;

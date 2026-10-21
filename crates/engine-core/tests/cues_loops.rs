@@ -236,6 +236,7 @@ fn stored_cues_restore_into_the_deck() {
         cue: Some(24_000.0),
         hot,
         stored_loop: Some((200_000.0, 248_000.0)),
+        fill_only: false,
     };
     // Cues of another track are ignored.
     r.send(DeckCommand::SetCues {
@@ -279,4 +280,52 @@ fn stored_cues_restore_into_the_deck() {
     r.render(BLOCK);
     assert!(r.handle.deck_state(0).looping.load(Ordering::Relaxed));
     assert_eq!(r.position(), 200_000.0);
+}
+
+#[test]
+fn a_first_restore_keeps_what_the_dj_set_meanwhile() {
+    let mut r = rig(false);
+    let id = r.engine.deck(0).source().unwrap().id();
+    // The DJ sets hot cue B before the library has answered.
+    r.send(DeckCommand::Seek(30_000.0));
+    r.render(BLOCK);
+    r.send(DeckCommand::HotCue(1));
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    let dj = st.hot_cue_positions[1].load();
+    assert!(!dj.is_nan());
+    let mut hot = [None; HOT_CUES];
+    hot[0] = Some(48_000.0);
+    hot[1] = Some(96_000.0);
+    let stored = TrackCues {
+        cue: Some(24_000.0),
+        hot,
+        stored_loop: None,
+        fill_only: true,
+    };
+    r.send(DeckCommand::SetCues {
+        source_id: id,
+        serial: 1,
+        cues: stored,
+    });
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    assert_eq!(st.cues_serial.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        st.hot_cue_positions[0].load(),
+        48_000.0,
+        "an empty slot is filled"
+    );
+    assert_eq!(st.hot_cue_positions[1].load(), dj, "the DJ's hot cue stays");
+    // A full restore (the record after a merge) replaces the slots.
+    r.send(DeckCommand::SetCues {
+        source_id: id,
+        serial: 2,
+        cues: TrackCues {
+            fill_only: false,
+            ..stored
+        },
+    });
+    r.render(BLOCK);
+    assert_eq!(r.handle.deck_state(0).hot_cue_positions[1].load(), 96_000.0);
 }
