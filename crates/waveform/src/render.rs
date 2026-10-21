@@ -13,6 +13,15 @@
 //! each one keeps its value; they don't shimmer (Mixxx snaps the same way). A column draws
 //! the band-wise max of the entries it touches, at least one.
 //!
+//! **For the GPU shader:** keep the column values fixed to the timeline, but don't snap the
+//! scroll to whole pixels. At 128 BPM, 20 beats over 703 px move about 1.25 px per 60 Hz
+//! frame, so whole-pixel steps go 1, 1, 1, 2 and judder. Instead render the columns as here
+//! and translate the image by the fractional pixel offset of the (per-frame interpolated)
+//! playhead, sampling with linear filtering: smooth scrolling without shimmer. This
+//! renderer draws one still frame, so it has no fractional offset.
+//!
+//! **Sizes:** the defaults are the main screen's (1024×600): zoom 703×211, overview 703×67.
+//!
 //! **Overview** ([`render_overview`]): the whole track, 3-band stacked, played part
 //! dimmed, 16-bar ticks along the bottom, cue triangles along the top, hot cue tags along
 //! the bottom, the loop region and the playhead.
@@ -197,8 +206,8 @@ pub struct ZoomView {
 impl Default for ZoomView {
     fn default() -> Self {
         ZoomView {
-            width: 1100,
-            height: 200,
+            width: 703,
+            height: 211,
             beats: 20.0,
         }
     }
@@ -214,8 +223,8 @@ pub struct OverviewView {
 impl Default for OverviewView {
     fn default() -> Self {
         OverviewView {
-            width: 1100,
-            height: 64,
+            width: 703,
+            height: 67,
         }
     }
 }
@@ -436,13 +445,14 @@ pub fn render_overview(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compute::{Params, Provenance};
+    use crate::compute::{Params, Provenance, Timeline};
 
     /// 10 s of constant entries, 120 BPM grid from 0 (bars every 2 s).
     fn fixture() -> (Waveform, Vec<GridBeat>) {
         let wf = Waveform {
             params: Params::default(),
             provenance: Provenance::Own,
+            timeline: Timeline::default(),
             duration: 10.0,
             entries: vec![
                 Entry {

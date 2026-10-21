@@ -4225,6 +4225,7 @@ name = "waveform"
 version = "0.1.0"
 dependencies = [
  "engine-analysis",
+ "engine-media",
  "png",
 ]
 

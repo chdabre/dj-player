@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use engine_analysis::{Analyzer, CancelFlag, Feature, FeatureSet, GridFit, TrackAudio, load};
-use waveform::compute::{Params, compute};
+use waveform::compute::{Builder, Origin, Params, Timeline, Waveform};
 use waveform::render::{
     Canvas, GridBeat, HotCue, Loop, Markers, OverviewView, ZoomView, render_overview, render_zoom,
     theme,
@@ -95,8 +95,16 @@ fn main() -> ExitCode {
 
 fn run(o: &Options) -> Result<()> {
     let started = Instant::now();
-    let (audio, name, default_bpm) = match &o.input {
-        Input::File(p) => (load(p)?, stem(p), None),
+    let (audio, name, default_bpm, timeline) = match &o.input {
+        Input::File(p) => {
+            let info = engine_media::probe(p)?;
+            let timeline = Timeline {
+                origin: Origin::Trimmed,
+                start_trim: info.start_trim,
+                file_rate: info.file_sample_rate,
+            };
+            (load(p)?, stem(p), None, timeline)
+        }
         Input::Synth(kind) => {
             let (stereo, bpm) = match kind.as_str() {
                 "track" => (synth::track(o.rate), None),
@@ -108,13 +116,26 @@ fn run(o: &Options) -> Result<()> {
                 sample_rate: o.rate,
                 stereo,
             };
-            (audio, format!("synth-{kind}"), bpm)
+            let timeline = Timeline {
+                origin: Origin::Trimmed,
+                start_trim: 0,
+                file_rate: o.rate,
+            };
+            (audio, format!("synth-{kind}"), bpm, timeline)
         }
     };
     let decode_s = started.elapsed().as_secs_f64();
 
     let started = Instant::now();
-    let wf = compute(&audio.stereo, audio.sample_rate, &Params::default());
+    // Chunk by chunk, as the loader will (1024 frames per chunk).
+    let mut builder = Builder::new(audio.sample_rate, &Params::default());
+    for chunk in audio.stereo.chunks(2048) {
+        builder.push(chunk);
+    }
+    let wf = Waveform {
+        timeline,
+        ..builder.finish()
+    };
     let compute_s = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let ov = wf.overview();
