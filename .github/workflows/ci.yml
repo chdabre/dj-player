@@ -37,7 +37,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config libclang-dev
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features engine-analysis/essentia -- -D warnings
       - run: cargo test --workspace
       - name: Bench compiles
         run: cargo bench --workspace --no-run
