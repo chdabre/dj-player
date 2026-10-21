@@ -1,0 +1,27 @@
+[package]
+name = "ui"
+description = "UI shell spike: the main playback screen in raw wgpu, driving one deck in-process."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dj-ui"
+path = "src/main.rs"
+
+[dependencies]
+engine-core.workspace = true
+engine-io.workspace = true
+engine-analysis.workspace = true
+engined = { path = "../engined" }
+assert_no_alloc.workspace = true
+wgpu = "30"
+winit = "0.30.13"
+glyphon = "0.12"
+pollster = "1"
+png = "0.18"
+
+[lints]
+workspace = true
