@@ -27,13 +27,39 @@ use crate::model::{
 const RATE: u32 = 44_100;
 const FRAME: usize = 4096;
 const HOP: usize = 4096;
+/// Essentia's defaults for the analysed frequency range.
 const MIN_HZ: f32 = 25.0;
 const MAX_HZ: f32 = 3500.0;
 const PEAK_THRESHOLD: f32 = 0.0001;
 const MAX_PEAKS: usize = 60;
 const HARMONICS: usize = 4;
 const REFERENCE_HZ: f32 = 440.0;
+/// Essentia's default gate on the averaged, peak-normalised PCP.
 const PCP_THRESHOLD: f32 = 0.2;
+
+/// What can be changed; the defaults are Essentia's `KeyExtractor` defaults (with the EDM
+/// profile), which reproduce its keys exactly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HpcpKeyConfig {
+    pub profile: Profile,
+    /// Spectral peaks below this are ignored (Essentia: 25 Hz).
+    pub min_hz: f32,
+    /// ... and above this (Essentia: 3500 Hz).
+    pub max_hz: f32,
+    /// PCP bins below this fraction of the strongest are zeroed (Essentia: 0.2).
+    pub pcp_threshold: f32,
+}
+
+impl Default for HpcpKeyConfig {
+    fn default() -> Self {
+        Self {
+            profile: Profile::Edma,
+            min_hz: MIN_HZ,
+            max_hz: MAX_HZ,
+            pcp_threshold: PCP_THRESHOLD,
+        }
+    }
+}
 const PCP: usize = 12;
 
 /// Major and minor key profiles, tonic first (Essentia's tables).
@@ -93,7 +119,7 @@ impl Profile {
 }
 
 pub struct HpcpKey {
-    profile: Profile,
+    config: HpcpKeyConfig,
     window: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
     /// (semitone offset, strength) per distinct harmonic, as Essentia's HPCP table.
@@ -102,12 +128,19 @@ pub struct HpcpKey {
 
 impl Default for HpcpKey {
     fn default() -> Self {
-        Self::new(Profile::Edma)
+        Self::with_config(HpcpKeyConfig::default())
     }
 }
 
 impl HpcpKey {
     pub fn new(profile: Profile) -> Self {
+        Self::with_config(HpcpKeyConfig {
+            profile,
+            ..HpcpKeyConfig::default()
+        })
+    }
+
+    pub fn with_config(config: HpcpKeyConfig) -> Self {
         // Symmetric Hann, then Essentia's normalisation: area 2.
         let mut window: Vec<f32> = (0..FRAME)
             .map(|i| {
@@ -119,7 +152,7 @@ impl HpcpKey {
             *w *= 2.0 / sum;
         }
         Self {
-            profile,
+            config,
             window,
             fft: FftPlanner::new().plan_fft_forward(FRAME),
             harmonics: harmonic_table(),
@@ -155,8 +188,8 @@ impl HpcpKey {
             for (s, c) in spectrum.iter_mut().zip(&buf) {
                 *s = c.norm();
             }
-            let (freqs, mags) = spectral_peaks(&spectrum);
-            let white = whiten(&spectrum, &freqs, &mags);
+            let (freqs, mags) = spectral_peaks(&spectrum, self.config.min_hz, self.config.max_hz);
+            let white = whiten(&spectrum, &freqs, &mags, self.config.max_hz);
             let hpcp = self.hpcp(&freqs, &white);
             for (s, h) in sum.iter_mut().zip(hpcp) {
                 *s += f64::from(h);
@@ -171,7 +204,7 @@ impl HpcpKey {
         // normalizePcpPeak, pcpGate, then shiftPcp (only a renormalisation at 12 bins).
         normalize_max(&mut avg);
         for a in &mut avg {
-            if *a < PCP_THRESHOLD {
+            if *a < self.config.pcp_threshold {
                 *a = 0.0;
             }
         }
@@ -182,7 +215,7 @@ impl HpcpKey {
     fn hpcp(&self, freqs: &[f32], mags: &[f32]) -> [f32; PCP] {
         let mut hpcp = [0.0f32; PCP];
         for (&freq, &mag) in freqs.iter().zip(mags) {
-            if !(MIN_HZ..=MAX_HZ).contains(&freq) {
+            if !(self.config.min_hz..=self.config.max_hz).contains(&freq) {
                 continue;
             }
             for &(semitone, strength) in &self.harmonics {
@@ -204,7 +237,7 @@ impl HpcpKey {
 
     /// Essentia's `Key::compute` on a 12-bin PCP: (tonic pitch class from A, major?, strength).
     fn key(&self, pcp: &[f32; PCP]) -> Option<(usize, bool, f32)> {
-        let (major, minor) = self.profile.tables();
+        let (major, minor) = self.config.profile.tables();
         let stats = |v: &[f32; PCP]| {
             let mean = v.iter().sum::<f32>() / PCP as f32;
             let std = v
@@ -279,7 +312,7 @@ fn normalize_max(v: &mut [f32]) {
 
 /// Essentia's `SpectralPeaks` (`PeakDetection` with interpolation, ordered by magnitude).
 /// Returns (frequencies, magnitudes).
-fn spectral_peaks(spectrum: &[f32]) -> (Vec<f32>, Vec<f32>) {
+fn spectral_peaks(spectrum: &[f32], min_hz: f32, max_hz: f32) -> (Vec<f32>, Vec<f32>) {
     let size = spectrum.len();
     let a = spectrum;
     let scale = (RATE as f32 / 2.0) / (size - 1) as f32;
@@ -288,7 +321,7 @@ fn spectral_peaks(spectrum: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let dx = 0.5 * ((l - r) / (l - 2.0 * m + r));
         (bin as f32 + dx, m - 0.25 * (l - r) * dx)
     };
-    let mut i = ((MIN_HZ / scale).ceil() as usize).min(size - 1);
+    let mut i = ((min_hz / scale).ceil() as usize).min(size - 1);
     if i + 1 < size && a[i] > a[i + 1] && a[i] > PEAK_THRESHOLD {
         peaks.push((i as f32 * scale, a[i]));
     }
@@ -310,7 +343,7 @@ fn spectral_peaks(spectrum: &[f32]) -> (Vec<f32>, Vec<f32>) {
                 interpolate(a[j - 1], a[j], a[j + 1], j)
             };
             let pos = bin * scale;
-            if pos > MAX_HZ {
+            if pos > max_hz {
                 break;
             }
             peaks.push((pos, val));
@@ -324,7 +357,7 @@ fn spectral_peaks(spectrum: &[f32]) -> (Vec<f32>, Vec<f32>) {
             break;
         }
     }
-    let pos = MAX_HZ / scale;
+    let pos = max_hz / scale;
     if ((size - 2) as f32) < pos
         && pos <= (size - 1) as f32
         && a[size - 1] > a[size - 2]
@@ -347,13 +380,13 @@ fn db2lin(x: f32) -> f32 {
 }
 
 /// Essentia's `SpectralWhitening` with `maxFrequency` 3500 Hz.
-fn whiten(spectrum: &[f32], freqs: &[f32], mags: &[f32]) -> Vec<f32> {
+fn whiten(spectrum: &[f32], freqs: &[f32], mags: &[f32], max_hz: f32) -> Vec<f32> {
     const BPF_RESOLUTION: f32 = 100.0;
     let n = mags.len();
     if n == 0 {
         return Vec::new();
     }
-    let max_freq = MAX_HZ * 1.2;
+    let max_freq = max_hz * 1.2;
     let range = RATE as f32 / 2.0;
     let mags_db: Vec<f32> = mags.iter().map(|&m| 2.0 * lin2db(m)).collect();
     let max_amp = freqs
@@ -439,10 +472,16 @@ impl Analyzer for HpcpKey {
         AnalyzerId {
             name: "hpcpkey".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            params: format!(
-                "essentia-keyextractor-defaults,profile={}",
-                self.profile.name()
-            ),
+            params: {
+                let c = &self.config;
+                format!(
+                    "keyextractor,profile={},range={}-{},gate={}",
+                    c.profile.name(),
+                    c.min_hz,
+                    c.max_hz,
+                    c.pcp_threshold
+                )
+            },
         }
     }
 

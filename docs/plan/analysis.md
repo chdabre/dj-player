@@ -79,7 +79,7 @@ Pick the best part for each feature, port it to Rust, and run everything in-proc
 
 1. ~~Tempo: TempoCNN in Rust~~ (done: `tempocnn`).
 2. ~~Grid: gridfit around the TempoCNN tempo~~ (done: `gridfit+tempocnn`).
-3. ~~Key: port Essentia's `KeyExtractor`~~ (done: `hpcpkey`). Next: raise it from 50 %: other profiles (bgate, Krumhansl, Temperley are in the port), libKeyFinder, or a key CNN.
+3. ~~Key: port Essentia's `KeyExtractor`~~ (done: `hpcpkey`). Key references are Rekordbox's own (not checked by ear), so results are *agreement with Rekordbox*. Tried on a 30-track tuning sample (MIREX, Essentia defaults 0.763): other profiles (bgate 0.717, Krumhansl 0.670, Temperley 0.397); analysed range from 60/120/250 Hz instead of 25 Hz (0.737/0.687/0.647); 5 kHz upper limit and no PCP gate (no change). key-cnn (Schreiber, `deepspec_k16`): 0.467 with current and with librosa 0.6.2 features alike; it calls an A minor chord C major and mostly answers the relative major, so it does not suit minor-heavy club music. Essentia's defaults stay. Still open: libKeyFinder.
 4. Essentia (Python worker) and stratum-dsp stay as reference backends for the scorer only.
 5. ~~A second, independent ground-truth set~~ (done: the Validation playlist).
 6. ~~BPM range setting~~ (done): `Settings::bpm_range`, `--bpm-range 88-176`. Tempos are folded by octaves into the range; `tempocnn` folds patch tempos before its vote, gridfit searches in the range and folds a hint. Default: no range (the network's choice). The nine 87/174-type misses on the validation set cannot all be fixed by one range: the reference itself has 80 and 85 on some and 180 and 185 on others (more than an octave apart).
