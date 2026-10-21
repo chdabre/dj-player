@@ -115,10 +115,25 @@ Rust vs C++, then in brackets the control: C++ vs C++ on input × (1 + 2⁻²⁰
 - **Timing is identical**: same read-ahead, alignment and 26.7 ms rate response, as the identical chunk tags predict.
 - **In the deck** (`cargo bench -p engine-core --bench render`, `keylock_1.08`, one second of output with one seek): 17.2 ms with Bungee vs 21.0 ms with the previous Signalsmith keylock on the same machine (rate 1.08 without keylock: 1.08 ms).
 
+### On the Mac (2026-10-21, M1 Max, after the merge)
+
+`bench --track "All The Things She Said - TEABOY Flip.mp3" --seconds 5`, release build, 44.1 kHz device rate:
+
+| candidate | rate | mean µs | p99 µs | max µs | mean % of budget | start µs | allocs start / run |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bungee | 0.92 / 1 / 1.08 | 33 | 150–157 | 217–456 | 2.5 % | 500–524 | 0 / 0 |
+| bungee | 0.1 / 2 / −1 | 31–33 | 142–157 | 197–257 | 2.4–2.5 % | 493–528 | 0 / 0 |
+| bungee-rust | 0.92 / 1 / 1.08 | 21–22 | 93–104 | 139–189 | 1.5–1.7 % | 335–369 | 0 / 0 |
+| bungee-rust | 0.1 / 2 / −1 | 21–24 | 93–112 | 156–181 | 1.5–1.8 % | 310–428 | 0 / 0 |
+
+- **The port's CPU lead holds on aarch64:** about two thirds of the C++'s mean and p99, with no allocations at start or while running, and no underruns.
+- **Timing is the same as before** for both: +0.0 ms alignment at 0.92, 1.08 and in reverse, and 26.7 ms rate response.
+- **`compare` on macOS aarch64:** request tags and frame counts equal in all 24 rows. Rust vs C++ SNR is as close as the C++ control, for example mix 1.08: 81.3 dB (control 85.6); chord 0.92: 72.3 dB (72.7). The sweep at non-unity speeds diverges in both, as on x86.
+
 ## Outstanding
 
 - The same `bench` on a Pi 5, built natively there, with RT priority, now with `bungee-rust` in it.
-- `bench` and `compare` on the Mac, to check the port's CPU lead holds on aarch64.
+- A listening pass on the deck through the port, after the merge.
 
 ## Raw results, macOS aarch64
 

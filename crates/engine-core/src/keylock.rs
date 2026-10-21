@@ -551,6 +551,48 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupted_fifo_head_re_primes_onto_the_playhead() {
+        // The safety net: if the audio queued at the FIFO head is implausibly far from the
+        // playhead (or NaN), the next block re-primes instead of playing it, and plays what a
+        // fresh keylock plays there.
+        let src = sine_source(10, 440.0);
+        for bad in [f64::NAN, 1.0e9] {
+            let mut k = Keylock::new(SR);
+            let mut fresh = Keylock::new(SR);
+            let mut out = vec![0.0; 128 * CHANNELS];
+            let mut pos = 48_000.0;
+            for _ in 0..20 {
+                let seg = Segment {
+                    start: pos,
+                    step: 1.0,
+                };
+                assert!(k.render(&src, seg, &mut out, false));
+                pos += 128.0;
+            }
+            assert!(k.is_aligned(pos));
+            let head = k.path.fifo.head;
+            k.path.fifo.position[head] = bad;
+            let seg = Segment {
+                start: pos,
+                step: 1.0,
+            };
+            let (mut a, mut b) = (vec![0.0; 128 * CHANNELS], vec![0.0; 128 * CHANNELS]);
+            assert!(k.render(&src, seg, &mut a, false));
+            assert!(fresh.render(&src, seg, &mut b, false));
+            let diff = a
+                .iter()
+                .zip(&b)
+                .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(
+                diff < 1e-6,
+                "head {bad}: differs from a fresh prime by {diff}"
+            );
+            let head = k.path.fifo.head_position().unwrap();
+            assert!((head - (pos + 128.0)).abs() < 1e-6, "head {bad}: {head}");
+        }
+    }
+
+    #[test]
     fn unloaded_frames_starve_without_touching_state() {
         let (src, _writer) = Source::new(SR, SR as usize);
         let mut k = Keylock::new(SR);
