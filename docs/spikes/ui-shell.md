@@ -26,6 +26,31 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
 - **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view marks the analysed beat grid with ticks along its top and bottom edges, drawn over the waveform: white for beats, solid red for downbeats. The loop, cue, slip shadow and centred playhead are drawn on top. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
 
+## Scrubbing the waveform
+
+Touching the zoom waveform (on either screen) takes the track; dragging moves it with the waveform under the finger (drag left to play forward); letting go releases it.
+
+- **Engine: a scratch mode in the transport** (`ScratchBegin` / `ScratchBy(frames)` / `ScratchEnd`), meant for the jog wheel too.
+  - The playhead is pulled to the hand's target by a critically damped spring (τ = 10 ms), solved exactly per block. Jittery touch updates play as smooth record movement, the track eases to a stop when the finger stops, and it never swings back past the target.
+  - Catching a playing track starts from its speed and brings it to rest without running backwards.
+  - Scratching plays through the resampler (the pitch follows the hand, like vinyl), even with keylock on, and a paused deck is audible while it is held. Taking and releasing the track is declicked.
+  - Letting go: a playing track plays on at its rate; with slip on it returns to the shadow. A paused track stays exactly where the finger left it.
+  - Tests (offline, under `assert_no_alloc`): following and settling, speed changes bounded by the spring, slip snap-back, play resuming, no click on take and release.
+- **UI:** the drag sends relative moves (frames = −Δx × frames per design pixel of the zoom). While scrubbing, the waveform shows the finger's position directly, so the picture has no lag; the audio trails it by about 2τ.
+- **Still to try on real hardware:** the feel at different zoom levels, and whether the spring time suits a jog wheel too.
+
+## Performance screen
+
+`p` or the PERFORM button switches between the main screen and the performance screen ("2 · Performance" and its three variants on the canvas, at 1024×600). The pads' logic is `perform::press`, a pure function from a touch to a deck command, tested without a window.
+
+- **HOT CUE:** four pads per bank. An empty pad stores the playhead (quantized); a set pad jumps there. Pads are tinted in their cue's colour, from the theme until the library carries colours. BANK pages through the hot cues four at a time (A–D, E–H).
+- **BEAT JUMP:** the pads jump ∓4 / ∓1 beats; BANK switches them to ∓32 / ∓16.
+- **DELETE:** arms deletion. Set pads show "✕ A, TAP TO DELETE" and delete on tap, until DELETE is tapped again or the mode changes. The canvas's CALL mode (stored hot cues to call up) waits for the library.
+- **BEAT LOOP:** 1/2 to 16 beats from the playhead; the active length is highlighted, and tapping it exits the loop.
+- **Waveform:** the zoom is drawn smaller (703×72), and both waveforms now show hot cues: a line and a lettered tag in the zoom, a small tag in the overview. The engine publishes each hot cue's position for this (`DeckState::hot_cue_positions`, NaN when empty).
+- **Shared with the main screen:** the rail's player number and SLIP, the phase meters (`screen::phase`), the cue column, the status band and the bottom strip are the same code, parametrised by position. The main screen renders byte-identically after that refactor.
+- **Screenshots:** `--perform`, `--pad-mode hotcue|beatjump|delete` and `--hot-cues 57,61,64` (seconds) set up the screen for `--screenshot`.
+
 ## Design tokens
 
 Every colour, font size, corner radius and line width the screen uses lives in one `Theme` (`crates/ui/src/theme.rs`), named by role: `button_edge`, `cue`, `readout`, `section_radius`, and so on. `screen.rs` asks the theme and has no colour literals; a test fails if a colour literal turns up in `screen.rs`, `main.rs` or `gfx.rs`. The frame's clear colour comes from the theme too.

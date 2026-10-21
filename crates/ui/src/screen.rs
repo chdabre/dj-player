@@ -37,6 +37,45 @@ pub enum Target {
     JumpSize,
     /// The overview: touching it seeks (needle search).
     Overview,
+    /// The zoom waveform: touching it takes the track, dragging scrubs it.
+    Waveform,
+    // Performance screen.
+    HotCueMode,
+    BeatJumpMode,
+    DeleteCall,
+    Bank,
+    /// One of the four pads (0..4, left to right).
+    Pad(u8),
+    /// One of the beat loop lengths ([`crate::perform::BEAT_LOOPS`] index).
+    BeatLoop(u8),
+}
+
+/// Which screen is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScreenKind {
+    #[default]
+    Main,
+    Performance,
+}
+
+/// What the performance pads do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PadMode {
+    #[default]
+    HotCue,
+    BeatJump,
+}
+
+/// The performance screen's own state (the UI's, not the deck's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PerfState {
+    pub mode: PadMode,
+    /// Hot cue bank: pads show cues `4 * bank ..`.
+    pub bank: usize,
+    /// Beat jump bank: false = 1 and 4 beats, true = 16 and 32.
+    pub jump_bank: bool,
+    /// DELETE armed: the next pad taps delete hot cues.
+    pub delete_armed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -88,6 +127,10 @@ pub struct View<'a> {
     pub debug: Option<&'a str>,
     /// The track's waveform so far, if any.
     pub wave: Option<Wave<'a>>,
+    /// Hot cue positions (frames), NaN where empty.
+    pub hot_cue_positions: [f64; engine_core::HOT_CUES],
+    pub screen: ScreenKind,
+    pub perf: PerfState,
 }
 
 /// A deck's waveform as the screen draws it.
@@ -100,16 +143,16 @@ pub struct Wave<'a> {
     pub style: waveform::display::Style,
 }
 
-struct Ui<'s> {
-    t: &'s Theme,
-    scene: &'s mut Scene,
-    hits: Vec<HitBox>,
-    pressed: Option<Target>,
+pub(crate) struct Ui<'s> {
+    pub(crate) t: &'s Theme,
+    pub(crate) scene: &'s mut Scene,
+    pub(crate) hits: Vec<HitBox>,
+    pub(crate) pressed: Option<Target>,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl Ui<'_> {
-    fn text(
+    pub(crate) fn text(
         &mut self,
         s: impl Into<String>,
         x: f32,
@@ -132,7 +175,7 @@ impl Ui<'_> {
     }
 
     /// A number readout: CSS `line-height: 1`.
-    fn digits(
+    pub(crate) fn digits(
         &mut self,
         s: impl Into<String>,
         x: f32,
@@ -153,7 +196,7 @@ impl Ui<'_> {
         });
     }
 
-    fn label(&mut self, s: &str, x: f32, y: f32, color: Rgba) {
+    pub(crate) fn label(&mut self, s: &str, x: f32, y: f32, color: Rgba) {
         self.text(
             s,
             x,
@@ -165,7 +208,7 @@ impl Ui<'_> {
         );
     }
 
-    fn section(&mut self, x: f32, y: f32, w: f32, h: f32) {
+    pub(crate) fn section(&mut self, x: f32, y: f32, w: f32, h: f32) {
         let t = self.t;
         self.scene.rounded(
             x,
@@ -180,13 +223,26 @@ impl Ui<'_> {
     }
 
     /// `.b`: a touch button with an optional second line.
-    fn button(
+    pub(crate) fn button(
+        &mut self,
+        target: Target,
+        rect: (f32, f32, f32, f32),
+        label: &str,
+        sub: Option<&str>,
+        on: bool,
+    ) {
+        self.button_sized(target, rect, label, sub, on, self.t.font.button);
+    }
+
+    /// [`Ui::button`] with its label at `size`.
+    pub(crate) fn button_sized(
         &mut self,
         target: Target,
         (x, y, w, h): (f32, f32, f32, f32),
         label: &str,
         sub: Option<&str>,
         on: bool,
+        size: f32,
     ) {
         let t = self.t;
         let pressed = self.pressed == Some(target);
@@ -205,7 +261,6 @@ impl Ui<'_> {
             t.shape.border,
             edge,
         );
-        let size = t.font.button;
         let lh = t.font.line_height;
         let block = size * lh + sub.map_or(0.0, |_| t.font.small * lh);
         let top = y + (h - block) * 0.5;
@@ -233,7 +288,7 @@ impl Ui<'_> {
     }
 
     /// `.f`: an outlined chip (indicator, sometimes touchable).
-    fn chip(
+    pub(crate) fn chip(
         &mut self,
         (x, y, w, h): (f32, f32, f32, f32),
         label: &str,
@@ -256,12 +311,12 @@ impl Ui<'_> {
         );
     }
 
-    fn hit(&mut self, target: Target, (x, y, w, h): (f32, f32, f32, f32)) {
+    pub(crate) fn hit(&mut self, target: Target, (x, y, w, h): (f32, f32, f32, f32)) {
         self.hits.push(HitBox { target, x, y, w, h });
     }
 
     /// A label centred in a horizontal rule (`CUE/LOOP`, `CALL`).
-    fn rule_label(&mut self, label: &str, x: f32, y: f32, w: f32) {
+    pub(crate) fn rule_label(&mut self, label: &str, x: f32, y: f32, w: f32) {
         let t = self.t;
         // Barlow Condensed caps at the label size are ~7/15 em wide; close enough to leave a gap.
         let text_w = label.len() as f32 * t.font.label * (7.0 / 15.0) + 12.0;
@@ -298,6 +353,11 @@ pub fn build(
     };
 
     let t = theme;
+    if view.screen == ScreenKind::Performance {
+        crate::perform::build(&mut ui, view, overview);
+        debug_line(&mut ui, view);
+        return ui.hits;
+    }
     // Frame: rail, tab row, info, status band, bottom strip, column dividers.
     ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
     ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
@@ -315,7 +375,31 @@ pub fn build(
     info(&mut ui, view);
     status(&mut ui, view);
     bottom(&mut ui, view, overview);
+    debug_line(&mut ui, view);
+    ui.hits
+}
 
+/// The colour of hot cue `i` (A = 0), until the library gives cues their own.
+pub(crate) fn hot_cue_color(t: &Theme, i: usize) -> Rgba {
+    t.color.hot_cue_colors[i % t.color.hot_cue_colors.len()]
+}
+
+/// Frames across the zoom view: `zoom_beats` beats of the grid (120 BPM until there is one).
+pub fn zoom_span(grid: Option<&DeckGrid>, zoom_beats: f64, sample_rate: f64) -> f64 {
+    match grid {
+        Some(g) => zoom_beats * g.period(),
+        None => zoom_beats * 0.5 * sample_rate,
+    }
+}
+
+/// Hot cue `i`'s pad letter: A, B, …
+pub(crate) fn hot_cue_letter(i: usize) -> char {
+    (b'A' + (i % 26) as u8) as char
+}
+
+/// The frame timing overlay, if on.
+fn debug_line(ui: &mut Ui, view: &View) {
+    let t = ui.t;
     if let Some(line) = view.debug.filter(|l| !l.is_empty()) {
         ui.scene.rounded(
             113.0,
@@ -337,11 +421,9 @@ pub fn build(
             Align::Left,
         );
     }
-    ui.hits
 }
 
 fn rail(ui: &mut Ui, v: &View) {
-    let t = ui.t;
     ui.button(
         Target::Library,
         (6.0, 16.0, 88.0, 117.0),
@@ -351,6 +433,12 @@ fn rail(ui: &mut Ui, v: &View) {
     );
     ui.button(Target::Link, (6.0, 138.0, 88.0, 124.0), "LINK", None, false);
     ui.button(Target::Usb, (6.0, 267.0, 88.0, 117.0), "USB", None, true);
+    rail_bottom(ui, v);
+}
+
+/// The rail's player number and SLIP, the same on every screen.
+pub(crate) fn rail_bottom(ui: &mut Ui, v: &View) {
+    let t = ui.t;
     ui.scene.rounded(
         6.0,
         410.0,
@@ -485,145 +573,12 @@ fn info(ui: &mut Ui, v: &View) {
         Align::Right,
     );
 
-    // Master badge and phase meters: bar in the 4-bar phrase, beat in the bar.
-    ui.text(
-        "MASTER",
-        262.0,
-        117.0,
-        t.font.caption,
-        Weight::Regular,
-        t.color.cue_text,
-        Align::Right,
-    );
-    ui.text(
-        "PLAYER",
-        262.0,
-        131.0,
-        t.font.caption,
-        Weight::Regular,
-        t.color.cue_text,
-        Align::Right,
-    );
-    ui.scene.rounded(
-        267.0,
-        122.0,
-        17.0,
-        23.0,
-        t.shape.chip_radius,
-        t.color.cue,
-        0.0,
-        t.color.background,
-    );
-    ui.digits(
-        "1",
-        275.5,
-        124.0,
-        t.font.badge,
-        t.color.on_badge,
-        Align::Center,
-    );
-    let (beat_in_bar, bar_in_phrase, bar, bars_left) = match v.grid {
-        Some(g) => {
-            let beat = g.beat_at(v.position).floor();
-            let in_bar = g.bar_position(v.position).max(1);
-            let bar_start = beat - f64::from(in_bar - 1);
-            let bar = (bar_start / 4.0).floor();
-            let left = ((g.beat_at(v.length) - g.beat_at(v.position)) / 4.0).max(0.0);
-            (
-                Some(in_bar),
-                Some(bar.rem_euclid(4.0) as u8 + 1),
-                Some((bar as i64 + 1, in_bar)),
-                Some(left),
-            )
-        }
-        None => (None, None, None, None),
-    };
-    meter(ui, 289.0, 123.0, bar_in_phrase, false);
-    meter(ui, 289.0, 148.0, beat_in_bar, true);
-    let (amber, blue) = match (bar, bars_left) {
-        (Some((b, beat)), Some(left)) => (
-            format!("{b:02}.{beat}"),
-            format!(
-                "{:02}.{}",
-                left.floor() as i64,
-                ((left.fract() * 4.0).floor() as i64) + 1
-            ),
-        ),
-        _ => ("--.-".into(), "--.-".into()),
-    };
-    ui.digits(
-        amber,
-        640.0,
-        118.0,
-        t.font.counter,
-        t.color.cue_text,
-        Align::Left,
-    );
-    ui.text(
-        "BARS",
-        690.0,
-        126.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.cue_text,
-        Align::Left,
-    );
-    ui.digits(
-        blue,
-        640.0,
-        144.0,
-        t.font.counter,
-        t.color.accent_text,
-        Align::Left,
-    );
-    ui.text(
-        "BARS LEFT",
-        690.0,
-        152.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.accent_text,
-        Align::Left,
-    );
+    phase(ui, v, 289.0, 338.0, 123.0);
 
-    zoom(ui, v);
+    zoom(ui, v, ZOOM);
 
     // Right column: cue/loop memory and call.
-    ui.rule_label("CUE/LOOP", 828.0, 159.0, 188.0);
-    ui.button(
-        Target::Delete,
-        (828.0, 180.0, 88.0, 58.0),
-        "DELETE",
-        None,
-        false,
-    );
-    ui.button(
-        Target::Memory,
-        (923.0, 180.0, 93.0, 58.0),
-        "MEMORY",
-        None,
-        false,
-    );
-    ui.rule_label("CALL", 828.0, 250.0, 188.0);
-    let (prev, next) = if v.looping {
-        ("◀ ½X", "2X ▶")
-    } else {
-        ("◀", "▶")
-    };
-    ui.button(
-        Target::CallPrev,
-        (828.0, 272.0, 88.0, 62.0),
-        prev,
-        None,
-        false,
-    );
-    ui.button(
-        Target::CallNext,
-        (923.0, 272.0, 93.0, 62.0),
-        next,
-        None,
-        false,
-    );
+    cue_column(ui, v, 159.0, 58.0, 62.0);
     let zoom_label = format!("ZOOM {}", v.zoom_beats);
     ui.chip(
         (828.0, 344.0, 88.0, 36.0),
@@ -645,10 +600,158 @@ fn info(ui: &mut Ui, v: &View) {
     ui.hit(Target::Grid, (923.0, 344.0, 93.0, 36.0));
 }
 
-/// Four segments; `active` is 1-based. `filled`: the beat meter fills, the bar meter outlines.
-fn meter(ui: &mut Ui, x: f32, y: f32, active: Option<u8>, filled: bool) {
+/// The master badge, the two phase meters (bar in the 4-bar phrase, beat in the bar) and the
+/// bar counters, with the meters at `mx` (width `mw`) and the first meter's top at `y`.
+pub(crate) fn phase(ui: &mut Ui, v: &View, mx: f32, mw: f32, y: f32) {
     let t = ui.t;
-    let (w, h, gap) = (338.0, 19.0, 5.0);
+    let (lx, bx, cx) = (mx - 27.0, mx - 22.0, mx + mw + 13.0);
+    ui.text(
+        "MASTER",
+        lx,
+        y - 6.0,
+        t.font.caption,
+        Weight::Regular,
+        t.color.cue_text,
+        Align::Right,
+    );
+    ui.text(
+        "PLAYER",
+        lx,
+        y + 8.0,
+        t.font.caption,
+        Weight::Regular,
+        t.color.cue_text,
+        Align::Right,
+    );
+    ui.scene.rounded(
+        bx,
+        y - 1.0,
+        17.0,
+        23.0,
+        t.shape.chip_radius,
+        t.color.cue,
+        0.0,
+        t.color.background,
+    );
+    ui.digits(
+        "1",
+        bx + 8.5,
+        y + 1.0,
+        t.font.badge,
+        t.color.on_badge,
+        Align::Center,
+    );
+    let (beat_in_bar, bar_in_phrase, bar, bars_left) = match v.grid {
+        Some(g) => {
+            let beat = g.beat_at(v.position).floor();
+            let in_bar = g.bar_position(v.position).max(1);
+            let bar_start = beat - f64::from(in_bar - 1);
+            let bar = (bar_start / 4.0).floor();
+            let left = ((g.beat_at(v.length) - g.beat_at(v.position)) / 4.0).max(0.0);
+            (
+                Some(in_bar),
+                Some(bar.rem_euclid(4.0) as u8 + 1),
+                Some((bar as i64 + 1, in_bar)),
+                Some(left),
+            )
+        }
+        None => (None, None, None, None),
+    };
+    meter(ui, mx, y, mw, bar_in_phrase, false);
+    meter(ui, mx, y + 25.0, mw, beat_in_bar, true);
+    let (amber, blue) = match (bar, bars_left) {
+        (Some((b, beat)), Some(left)) => (
+            format!("{b:02}.{beat}"),
+            format!(
+                "{:02}.{}",
+                left.floor() as i64,
+                ((left.fract() * 4.0).floor() as i64) + 1
+            ),
+        ),
+        _ => ("--.-".into(), "--.-".into()),
+    };
+    ui.digits(
+        amber,
+        cx,
+        y - 5.0,
+        t.font.counter,
+        t.color.cue_text,
+        Align::Left,
+    );
+    ui.text(
+        "BARS",
+        cx + 50.0,
+        y + 3.0,
+        t.font.small,
+        Weight::Regular,
+        t.color.cue_text,
+        Align::Left,
+    );
+    ui.digits(
+        blue,
+        cx,
+        y + 21.0,
+        t.font.counter,
+        t.color.accent_text,
+        Align::Left,
+    );
+    ui.text(
+        "BARS LEFT",
+        cx + 50.0,
+        y + 29.0,
+        t.font.small,
+        Weight::Regular,
+        t.color.accent_text,
+        Align::Left,
+    );
+}
+
+/// The right column's CUE/LOOP (DELETE, MEMORY) and CALL (◀ ▶) groups: rule labels at `rule`
+/// and above the call buttons, buttons `button_h` and `call_h` high.
+pub(crate) fn cue_column(ui: &mut Ui, v: &View, rule: f32, button_h: f32, call_h: f32) {
+    let button_y = rule + 21.0;
+    let call_y = rule + 113.0 + (button_h - 58.0);
+    ui.rule_label("CUE/LOOP", 828.0, rule, 188.0);
+    ui.button(
+        Target::Delete,
+        (828.0, button_y, 88.0, button_h),
+        "DELETE",
+        None,
+        false,
+    );
+    ui.button(
+        Target::Memory,
+        (923.0, button_y, 93.0, button_h),
+        "MEMORY",
+        None,
+        false,
+    );
+    ui.rule_label("CALL", 828.0, rule + 91.0 + button_h - 58.0, 188.0);
+    let (prev, next) = if v.looping {
+        ("◀ ½X", "2X ▶")
+    } else {
+        ("◀", "▶")
+    };
+    ui.button(
+        Target::CallPrev,
+        (828.0, call_y, 88.0, call_h),
+        prev,
+        None,
+        false,
+    );
+    ui.button(
+        Target::CallNext,
+        (923.0, call_y, 93.0, call_h),
+        next,
+        None,
+        false,
+    );
+}
+
+/// Four segments; `active` is 1-based. `filled`: the beat meter fills, the bar meter outlines.
+pub(crate) fn meter(ui: &mut Ui, x: f32, y: f32, w: f32, active: Option<u8>, filled: bool) {
+    let t = ui.t;
+    let (h, gap) = (19.0, 5.0);
     let seg = (w - 3.0 * gap) / 4.0;
     for i in 0..4u8 {
         let sx = x + f32::from(i) * (seg + gap);
@@ -674,7 +777,11 @@ fn meter(ui: &mut Ui, x: f32, y: f32, active: Option<u8>, filled: bool) {
 
 /// The panel behind a waveform: a gradient towards the waveform's baseline (the centre line
 /// for a mirrored view, the bottom for a bottom-aligned one).
-fn panel(ui: &mut Ui, (x, y, w, h): (f32, f32, f32, f32), align: Option<crate::waves::Align>) {
+pub(crate) fn panel(
+    ui: &mut Ui,
+    (x, y, w, h): (f32, f32, f32, f32),
+    align: Option<crate::waves::Align>,
+) {
     let t = ui.t;
     let wf = &t.waveform;
     let kind = match align {
@@ -694,17 +801,15 @@ fn panel(ui: &mut Ui, (x, y, w, h): (f32, f32, f32, f32), align: Option<crate::w
 }
 
 /// Zoomed view around the playhead: beat grid, loop, cue, hot cue strip, playhead.
-fn zoom(ui: &mut Ui, v: &View) {
+pub(crate) fn zoom(ui: &mut Ui, v: &View, area: (f32, f32, f32, f32)) {
     let t = ui.t;
     let wf = &t.waveform;
-    let (x0, y0, w, h) = ZOOM;
-    panel(ui, ZOOM, v.wave.map(|w| w.settings.zoom_align));
+    let (x0, y0, w, h) = area;
+    panel(ui, area, v.wave.map(|w| w.settings.zoom_align));
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
+    ui.hit(Target::Waveform, area);
     // Frames per design pixel.
-    let span = match v.grid {
-        Some(g) => v.zoom_beats * g.period(),
-        None => v.zoom_beats * 0.5 * v.sample_rate, // 120 BPM until the grid arrives
-    };
+    let span = zoom_span(v.grid, v.zoom_beats, v.sample_rate);
     let fpp = span / f64::from(w);
     let left = v.position - span * 0.5;
     let to_x = |pos: f64| x0 + ((pos - left) / fpp) as f32;
@@ -716,7 +821,7 @@ fn zoom(ui: &mut Ui, v: &View) {
             wave.entries_per_second,
             v.position / v.sample_rate,
             fpp / v.sample_rate,
-            ZOOM,
+            area,
             &wave.settings,
             &wave.style,
         );
@@ -761,6 +866,35 @@ fn zoom(ui: &mut Ui, v: &View) {
             ui.scene
                 .fill(x - width * 0.5, y0 + h - len, width, len, color);
         }
+    }
+    // Hot cues: a line in the pad's colour with its letter in a tag at the bottom.
+    for (i, &at) in v.hot_cue_positions.iter().enumerate() {
+        let x = to_x(at);
+        if !at.is_finite() || !visible(x) {
+            continue;
+        }
+        let c = hot_cue_color(t, i);
+        ui.scene.fill(x - 1.0, y0, 2.0, h, c);
+        let tag = t.font.caption + 4.0;
+        ui.scene.rounded(
+            x - 1.0,
+            y0 + h - tag,
+            tag,
+            tag,
+            t.shape.panel_radius,
+            c,
+            0.0,
+            c,
+        );
+        ui.text(
+            hot_cue_letter(i).to_string(),
+            x - 1.0 + tag * 0.5,
+            y0 + h - tag + 1.0,
+            t.font.caption,
+            Weight::SemiBold,
+            t.color.on_badge,
+            Align::Center,
+        );
     }
     let cue = to_x(v.cue);
     if visible(cue) {
@@ -813,7 +947,7 @@ fn clock(seconds: f64) -> (String, String) {
     )
 }
 
-fn status(ui: &mut Ui, v: &View) {
+pub(crate) fn status(ui: &mut Ui, v: &View) {
     let t = ui.t;
     ui.label("TRACK", 113.0, 398.0, t.color.label);
     ui.digits(
@@ -938,7 +1072,7 @@ fn status(ui: &mut Ui, v: &View) {
     );
 }
 
-fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
+pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let t = ui.t;
     let wf = &t.waveform;
     let (x0, y0, w, h) = OVERVIEW;
@@ -994,6 +1128,13 @@ fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
                     wf.overview_loop_fill_stored
                 }),
             );
+        }
+        for (i, &at) in v.hot_cue_positions.iter().enumerate() {
+            if at.is_finite() {
+                let c = hot_cue_color(t, i);
+                ui.scene
+                    .rounded(to_x(at) - 2.5, y0, 5.0, 7.0, 1.0, c, 0.0, c);
+            }
         }
         let cx = to_x(v.cue);
         ui.scene.fill(cx - 1.0, y0, 2.0, h, wf.cue);
@@ -1103,6 +1244,9 @@ mod tests {
             pressed: None,
             debug: None,
             wave: None,
+            hot_cue_positions: [f64::NAN; engine_core::HOT_CUES],
+            screen: ScreenKind::Main,
+            perf: PerfState::default(),
         }
     }
 
@@ -1138,6 +1282,69 @@ mod tests {
                 h.w,
                 h.h
             );
+        }
+    }
+
+    #[test]
+    fn performance_screen_fits_and_targets_do_not_overlap() {
+        let grid = DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap();
+        let variants = [
+            PerfState::default(),
+            PerfState {
+                mode: PadMode::BeatJump,
+                jump_bank: true,
+                ..PerfState::default()
+            },
+            PerfState {
+                delete_armed: true,
+                bank: 1,
+                ..PerfState::default()
+            },
+        ];
+        for perf in variants {
+            let mut v = view(Some(&grid));
+            v.screen = ScreenKind::Performance;
+            v.perf = perf;
+            v.hot_cue_positions[0] = 1_010_000.0;
+            let mut scene = Scene::default();
+            let hits = build(
+                &v,
+                &Theme::default(),
+                &mut OverviewCache::default(),
+                &mut scene,
+            );
+            for r in &scene.rects {
+                assert!(
+                    r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.5 && r.y + r.h <= 600.0,
+                    "{perf:?}: {r:?}"
+                );
+            }
+            for (i, a) in hits.iter().enumerate() {
+                for b in &hits[i + 1..] {
+                    let overlap =
+                        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+                    assert!(!overlap, "{perf:?}: {:?} overlaps {:?}", a.target, b.target);
+                }
+            }
+            for h in hits.iter().filter(|h| h.target != Target::Overview) {
+                assert!(
+                    h.w >= 36.0 && h.h >= 36.0,
+                    "{:?} is {}×{}",
+                    h.target,
+                    h.w,
+                    h.h
+                );
+            }
+            let pads = hits
+                .iter()
+                .filter(|h| matches!(h.target, Target::Pad(_)))
+                .count();
+            assert_eq!(pads, crate::perform::PADS, "{perf:?}");
+            let loops = hits
+                .iter()
+                .filter(|h| matches!(h.target, Target::BeatLoop(_)))
+                .count();
+            assert_eq!(loops, engine_core::BEAT_LOOPS.len());
         }
     }
 

@@ -5,13 +5,15 @@
 //! overview to seek. Keys as in `engined`, plus a real CUE hold (the window sees key
 //! releases): space play/pause, c cue, 1–8 hot cues (shift: delete), i/o/l loop,
 //! b 4-beat loop, [ ] loop ½X / 2X, , . beat jump, ←/→ seek ±5 s, +/- rate, 0 reset,
-//! k keylock, r reverse, s slip, m memory cue, z quantize, w waveform mode (3-band / RGB / single colour),
-//! d timing overlay, f fullscreen, q quit.
+//! k keylock, r reverse, s slip, m memory cue, z quantize, w waveform mode (3-band / RGB /
+//! single colour), p performance screen (hot cue / beat jump pads, beat loops), d timing
+//! overlay, f fullscreen, q quit.
 //!
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
 
 mod clock;
 mod gfx;
+mod perform;
 mod scene;
 mod screen;
 mod stats;
@@ -37,7 +39,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::clock::PlayheadClock;
 use crate::gfx::Gfx;
 use crate::scene::Scene;
-use crate::screen::{HitBox, OVERVIEW, Target, View};
+use crate::screen::{HitBox, OVERVIEW, PerfState, ScreenKind, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveSettings};
@@ -49,7 +51,8 @@ use waveform::display::{Mode, TrackGain};
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] \
-                     [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--at <seconds>] [--play] [--run-for <seconds>] \
+                     [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--perform] [--pad-mode hotcue|beatjump|delete] \
+                     [--hot-cues <s,s,…>] [--at <seconds>] [--play] [--run-for <seconds>] \
                      [--screenshot <out.png>] [--library <dir> | --no-library]";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
@@ -66,6 +69,9 @@ struct Args {
     theme: Theme,
     wave_mode: Mode,
     library: LibraryChoice,
+    perform: Option<PerfState>,
+    /// Hot cues to set at start (seconds), for screenshots and demos.
+    hot_cues: Vec<f64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -77,6 +83,8 @@ fn parse_args() -> Result<Args, String> {
     let mut wave_theme: Option<String> = None;
     let mut wave_mode = Mode::ThreeBand;
     let mut library = LibraryChoice::Auto;
+    let mut perform: Option<PerfState> = None;
+    let mut hot_cues: Vec<f64> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -110,6 +118,33 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or(format!(
                         "unknown waveform mode {name:?} (3band, rgb, single)"
                     ))?;
+            }
+            "--perform" => {
+                perform.get_or_insert_with(PerfState::default);
+            }
+            "--pad-mode" => {
+                let p = perform.get_or_insert_with(PerfState::default);
+                match args.next().as_deref() {
+                    Some("hotcue") => {}
+                    Some("beatjump") => p.mode = screen::PadMode::BeatJump,
+                    Some("delete") => p.delete_armed = true,
+                    other => {
+                        return Err(format!("bad pad mode {other:?} (hotcue, beatjump, delete)"));
+                    }
+                }
+            }
+            "--hot-cues" => {
+                let list = args
+                    .next()
+                    .ok_or("--hot-cues needs seconds, comma-separated")?;
+                hot_cues = list
+                    .split(',')
+                    .map(|x| {
+                        x.trim()
+                            .parse::<f64>()
+                            .map_err(|_| format!("bad time {x:?}"))
+                    })
+                    .collect::<Result<_, _>>()?;
             }
             "--play" => play = true,
             "--theme" => {
@@ -157,6 +192,8 @@ fn parse_args() -> Result<Args, String> {
         theme,
         wave_mode,
         library,
+        perform,
+        hot_cues,
     })
 }
 
@@ -192,6 +229,11 @@ fn main() -> ExitCode {
             .map_or("default".into(), |n| format!("{n} frames")),
         player.device_name()
     );
+    let sr = f64::from(player.format.sample_rate);
+    for (i, &at) in args.hot_cues.iter().enumerate().take(engine_core::HOT_CUES) {
+        player.send(DeckCommand::Seek(at * sr));
+        player.send(DeckCommand::HotCue(i));
+    }
     if let Some(at) = args.at {
         player.send(DeckCommand::Seek(at * f64::from(player.format.sample_rate)));
     }
@@ -213,6 +255,7 @@ fn main() -> ExitCode {
     let mut app = App {
         clock: PlayheadClock::new(player.format.sample_rate),
         last_shown: None,
+        scrub: None,
         player,
         title,
         fullscreen: args.fullscreen,
@@ -222,6 +265,12 @@ fn main() -> ExitCode {
         gfx: None,
         theme: args.theme,
         scene: Scene::default(),
+        screen: if args.perform.is_some() {
+            ScreenKind::Performance
+        } else {
+            ScreenKind::Main
+        },
+        perf: args.perform.unwrap_or_default(),
         wave: Vec::new(),
         wave_complete: false,
         wave_settings: WaveSettings {
@@ -255,6 +304,13 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Scrub {
+    last_x: f32,
+    frames_per_px: f64,
+    shown: f64,
+}
+
 struct App {
     player: Player,
     title: String,
@@ -265,6 +321,8 @@ struct App {
     gfx: Option<Gfx>,
     theme: Theme,
     scene: Scene,
+    screen: ScreenKind,
+    perf: PerfState,
     wave: Vec<Entry>,
     wave_complete: bool,
     wave_settings: WaveSettings,
@@ -281,6 +339,9 @@ struct App {
     zoom: usize,
     debug: bool,
     clock: PlayheadClock,
+    /// The hand on the zoom waveform: where the finger was (design x), the frames one design
+    /// pixel covers, and the playhead the finger has moved the track to.
+    scrub: Option<Scrub>,
     last_shown: Option<(Instant, f64)>,
     stats: FrameStats,
     overlay: String,
@@ -303,6 +364,24 @@ impl App {
         self.pressed = Some(hit.target);
         let looping = self.player.state().looping.load(Ordering::Relaxed);
         match hit.target {
+            Target::Perform => {
+                self.screen = match self.screen {
+                    ScreenKind::Main => ScreenKind::Performance,
+                    ScreenKind::Performance => ScreenKind::Main,
+                };
+            }
+            Target::HotCueMode
+            | Target::BeatJumpMode
+            | Target::DeleteCall
+            | Target::Bank
+            | Target::Pad(_)
+            | Target::BeatLoop(_) => {
+                let hot = self.player.state().hot_cues.load(Ordering::Relaxed);
+                let beats = self.loop_beats();
+                if let Some(cmd) = perform::press(&mut self.perf, hit.target, hot, beats) {
+                    self.send(cmd);
+                }
+            }
             Target::Slip => self.send(DeckCommand::ToggleSlip),
             Target::CallPrev if looping => self.send(DeckCommand::LoopResize(0.5)),
             Target::CallNext if looping => self.send(DeckCommand::LoopResize(2.0)),
@@ -310,16 +389,75 @@ impl App {
             Target::CallNext => self.send(DeckCommand::BeatJump(4.0)),
             Target::Zoom => self.zoom = (self.zoom + 1) % ZOOM_STEPS.len(),
             Target::Overview => self.seek_overview(dx),
+            Target::Waveform => {
+                let st = self.player.state();
+                let sr = f64::from(self.player.format.sample_rate);
+                let grid = self
+                    .player
+                    .analysed
+                    .as_ref()
+                    .and_then(|a| a.grid.as_deref());
+                let span = screen::zoom_span(grid, ZOOM_STEPS[self.zoom], sr);
+                let shown = self.last_shown.map_or(st.position.load(), |(_, p)| p);
+                self.scrub = Some(Scrub {
+                    last_x: dx,
+                    frames_per_px: span / f64::from(hit.w),
+                    shown,
+                });
+                self.send(DeckCommand::ScratchBegin);
+            }
             _ => {}
         }
     }
 
+    /// The active loop's length in beats, as the performance screen shows it.
+    fn loop_beats(&self) -> Option<f64> {
+        let st = self.player.state();
+        let (a, b) = (st.loop_start.load(), st.loop_end.load());
+        if !st.looping.load(Ordering::Relaxed) || b <= a {
+            return None;
+        }
+        let grid = self
+            .player
+            .analysed
+            .as_ref()
+            .and_then(|x| x.grid.as_deref());
+        Some(match grid {
+            Some(g) => g.beat_at(b) - g.beat_at(a),
+            None => {
+                (b - a) / f64::from(self.player.format.sample_rate) * engine_core::FALLBACK_BPM
+                    / 60.0
+            }
+        })
+    }
+
     fn drag(&mut self, x: f64, y: f64) {
+        if let (Some(mut scrub), Some(gfx)) = (self.scrub, &self.gfx) {
+            let (dx, _) = gfx.to_design(x, y);
+            // The waveform moves with the finger: dragging left plays forward.
+            let frames = -f64::from(dx - scrub.last_x) * scrub.frames_per_px;
+            let length = self.player.state().length.load();
+            scrub.shown = (scrub.shown + frames).clamp(0.0, length);
+            scrub.last_x = dx;
+            self.scrub = Some(scrub);
+            if frames != 0.0 {
+                self.send(DeckCommand::ScratchBy(frames));
+            }
+            return;
+        }
         if self.pressed == Some(Target::Overview)
             && let Some(gfx) = &self.gfx
         {
             let (dx, _) = gfx.to_design(x, y);
             self.seek_overview(dx);
+        }
+    }
+
+    /// The finger or button came up.
+    fn release(&mut self) {
+        self.pressed = None;
+        if self.scrub.take().is_some() {
+            self.send(DeckCommand::ScratchEnd);
         }
     }
 
@@ -364,6 +502,13 @@ impl App {
                     }
                     "m" => {
                         eprintln!("{}", self.player.memory());
+                        return;
+                    }
+                    "p" => {
+                        self.screen = match self.screen {
+                            ScreenKind::Main => ScreenKind::Performance,
+                            ScreenKind::Performance => ScreenKind::Main,
+                        };
                         return;
                     }
                     "w" => {
@@ -436,7 +581,12 @@ impl App {
         } else {
             0.0
         };
-        let position = self.clock.update(now, st.position.load(), speed);
+        let mut position = self.clock.update(now, st.position.load(), speed);
+        if let Some(scrub) = self.scrub {
+            // Under the finger the picture follows the hand at once; the audio trails it by the
+            // scratch spring's few milliseconds.
+            position = scrub.shown;
+        }
         if let Some((t, p)) = self.last_shown
             && speed != 0.0
         {
@@ -480,6 +630,9 @@ impl App {
             zoom_beats: ZOOM_STEPS[self.zoom],
             pressed: self.pressed,
             debug: self.debug.then_some(self.overlay.as_str()),
+            hot_cue_positions: std::array::from_fn(|i| st.hot_cue_positions[i].load()),
+            screen: self.screen,
+            perf: self.perf,
             wave: (!self.wave.is_empty()).then_some(screen::Wave {
                 entries: &self.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),
@@ -614,14 +767,14 @@ impl ApplicationHandler for App {
                 ..
             } => match state {
                 ElementState::Pressed => self.press(self.cursor.0, self.cursor.1),
-                ElementState::Released => self.pressed = None,
+                ElementState::Released => self.release(),
             },
             WindowEvent::Touch(Touch {
                 phase, location, ..
             }) => match phase {
                 TouchPhase::Started => self.press(location.x, location.y),
                 TouchPhase::Moved => self.drag(location.x, location.y),
-                TouchPhase::Ended | TouchPhase::Cancelled => self.pressed = None,
+                TouchPhase::Ended | TouchPhase::Cancelled => self.release(),
             },
             _ => {}
         }
