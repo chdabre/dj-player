@@ -73,6 +73,8 @@ pub struct Text {
     pub weight: Weight,
     pub color: Rgba,
     pub align: Align,
+    /// Longest the line may be (design pixels); longer text ends in an ellipsis.
+    pub max_width: Option<f32>,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +86,19 @@ pub struct Scene {
     /// waveform sits on its panel and grid and under its overlays.
     pub waves: Vec<(usize, WaveDraw)>,
     pub texts: Vec<Text>,
+    /// Pictures, drawn over every rectangle and waveform and under the text.
+    pub images: Vec<Image>,
+}
+
+/// A picture (artwork) in a rounded rectangle, design pixels.
+#[derive(Debug, Clone)]
+pub struct Image {
+    pub picture: std::sync::Arc<engined::browse::Thumb>,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub radius: f32,
 }
 
 impl Scene {
@@ -91,6 +106,7 @@ impl Scene {
         self.rects.clear();
         self.waves.clear();
         self.texts.clear();
+        self.images.clear();
     }
 
     pub fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgba) {

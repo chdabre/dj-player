@@ -20,6 +20,7 @@
 
 use engine_core::{DeckCommand, HOT_CUES};
 
+use crate::browse::Nav;
 use crate::scene::{Align, Rgba, Scene, Text, Weight};
 
 /// The shell's design size.
@@ -117,7 +118,11 @@ pub enum Control {
     Play,
     Back,
     TagTrack,
+    /// The browse knob: push loads, turning (a vertical drag, or the wheel) scrolls.
     Browse,
+    /// The knob's ▲ and ▼: one step.
+    BrowseUp,
+    BrowseDown,
     F1,
     F2,
     Fader,
@@ -151,7 +156,15 @@ enum Held {
         angle: f32,
         base: f64,
     },
+    /// The browse knob, grabbed at `y`; `turned` once a drag stepped it.
+    Knob {
+        y: f32,
+        turned: bool,
+    },
 }
+
+/// Vertical drag on the knob per step.
+const KNOB_STEP: f32 = 18.0;
 
 /// The stand-in's state: fader range, jog mode, what is held.
 pub struct Standin {
@@ -165,6 +178,8 @@ pub struct Standin {
     bend_base: f64,
     /// Jog angle travelled since the last tick, for the bend speed.
     bend_angle: f32,
+    /// Browse requests since the last [`Standin::take_nav`].
+    nav: Vec<Nav>,
 }
 
 fn angle_of(x: f32, y: f32) -> f32 {
@@ -188,6 +203,25 @@ impl Standin {
             bend: 0.0,
             bend_base: 1.0,
             bend_angle: 0.0,
+            nav: Vec::new(),
+        }
+    }
+
+    /// The browse requests since the last call.
+    pub fn take_nav(&mut self) -> Vec<Nav> {
+        std::mem::take(&mut self.nav)
+    }
+
+    /// The wheel turned by `steps` (positive = down) over (`x`, `y`): over the browse knob,
+    /// it turns the knob.
+    pub fn wheel(&mut self, x: f32, y: f32, steps: i32) {
+        if matches!(
+            self.control_at(x, y),
+            Some(Control::Browse | Control::BrowseUp | Control::BrowseDown)
+        ) {
+            let step = if steps > 0 { Nav::Down } else { Nav::Up };
+            self.nav
+                .extend(std::iter::repeat_n(step, steps.unsigned_abs() as usize));
         }
     }
 
@@ -305,12 +339,23 @@ impl Standin {
                     }
                 }
             }
-            // Present but not wired yet: no browser, no time mode, no shortcuts.
+            Control::Back => {
+                self.nav.push(Nav::Back);
+                Held::Button(control)
+            }
+            Control::BrowseUp => {
+                self.nav.push(Nav::Up);
+                Held::Button(control)
+            }
+            Control::BrowseDown => {
+                self.nav.push(Nav::Down);
+                Held::Button(control)
+            }
+            Control::Browse => Held::Knob { y, turned: false },
+            // Present but not wired yet: no time mode, tags or shortcuts.
             Control::TimeMode
             | Control::TrackNext
-            | Control::Back
             | Control::TagTrack
-            | Control::Browse
             | Control::F1
             | Control::F2 => Held::Button(control),
         };
@@ -336,6 +381,19 @@ impl Standin {
                 self.held = Some(Held::Bend { angle: a, base });
                 Vec::new()
             }
+            Some(Held::Knob { y: from, .. }) => {
+                let steps = ((y - from) / KNOB_STEP).trunc();
+                if steps != 0.0 {
+                    let step = if steps > 0.0 { Nav::Down } else { Nav::Up };
+                    self.nav
+                        .extend(std::iter::repeat_n(step, steps.abs() as usize));
+                    self.held = Some(Held::Knob {
+                        y: from + steps * KNOB_STEP,
+                        turned: true,
+                    });
+                }
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -348,6 +406,10 @@ impl Standin {
             Some(Held::Bend { base, .. }) => {
                 self.bend = 0.0;
                 vec![DeckCommand::SetRate(base)]
+            }
+            Some(Held::Knob { turned: false, .. }) => {
+                self.nav.push(Nav::Push);
+                Vec::new()
             }
             _ => Vec::new(),
         }
@@ -388,6 +450,7 @@ impl Standin {
             }
             Some(Held::Fader) => control == Control::Fader,
             Some(Held::Scratch { .. } | Held::Bend { .. }) => control == Control::Jog,
+            Some(Held::Knob { .. }) => control == Control::Browse,
             None => false,
         }
     }
@@ -532,12 +595,19 @@ impl Standin {
         d.scene
             .rounded(1312.0, 110.0, 152.0, 186.0, 14.0, BUTTON_BOTTOM, 1.0, EDGE);
         d.label("▲", 1388.0, 116.0, SUB, 12.0, Align::Center);
+        let knob_fill = if self.is_down(Control::Browse) {
+            BUTTON_DOWN
+        } else {
+            BUTTON_TOP
+        };
         d.scene.rounded(
-            1332.0, 146.0, 112.0, 112.0, 56.0, BUTTON_TOP, 2.0, EDGE_LIGHT,
+            1332.0, 146.0, 112.0, 112.0, 56.0, knob_fill, 2.0, EDGE_LIGHT,
         );
         d.scene
             .rounded(1358.0, 172.0, 60.0, 60.0, 30.0, KNOB, 0.0, KNOB);
         d.hit(Control::Browse, (1332.0, 146.0, 112.0, 112.0));
+        d.hit(Control::BrowseUp, (1312.0, 110.0, 152.0, 36.0));
+        d.hit(Control::BrowseDown, (1312.0, 258.0, 152.0, 38.0));
         d.label("▼", 1388.0, 268.0, SUB, 12.0, Align::Center);
         d.label(
             "BROWSE · TURN: SCROLL · PUSH: LOAD",
@@ -801,6 +871,7 @@ impl Draw<'_> {
             },
             color,
             align,
+            max_width: None,
         });
     }
 
@@ -912,6 +983,34 @@ mod tests {
         let mut s = Standin::new(48_000);
         s.build(&ShellView::default(), &mut Scene::default());
         s
+    }
+
+    #[test]
+    fn the_browse_knob_pushes_turns_and_back_goes_up() {
+        let mut s = shell();
+        let v = ShellView::default();
+        // A push without turning loads.
+        s.press(1388.0, 202.0, false, &v);
+        s.release();
+        assert_eq!(s.take_nav(), [Nav::Push]);
+        // A turn (vertical drag) steps and does not push.
+        s.press(1388.0, 202.0, false, &v);
+        s.drag(1388.0, 202.0 + 2.5 * KNOB_STEP);
+        s.drag(1388.0, 202.0 + 0.9 * KNOB_STEP);
+        s.release();
+        assert_eq!(s.take_nav(), [Nav::Down, Nav::Down, Nav::Up]);
+        s.press(1388.0, 120.0, false, &v);
+        s.release();
+        s.press(1388.0, 280.0, false, &v);
+        s.release();
+        s.wheel(1388.0, 202.0, -2);
+        s.wheel(700.0, 300.0, 3); // not over the knob
+        s.press(1340.0, 60.0, false, &v);
+        s.release();
+        assert_eq!(
+            s.take_nav(),
+            [Nav::Up, Nav::Down, Nav::Up, Nav::Up, Nav::Back]
+        );
     }
 
     #[test]

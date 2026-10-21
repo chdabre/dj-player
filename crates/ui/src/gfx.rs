@@ -12,12 +12,14 @@
 //! device layer never knows about the shell, so a device build simply drops it.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use glyphon::cosmic_text::{Ellipsize, EllipsizeHeightLimit};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -211,6 +213,71 @@ fn transform(w: u32, h: u32, (dw, dh): (f32, f32)) -> (f32, f32, f32) {
     (s, (w - dw * s) * 0.5, (h - dh * s) * 0.5)
 }
 
+/// Pictures (artwork thumbnails): one instance per picture, its texture in group 1, with the
+/// rect shader's rounded-corner coverage.
+const IMAGE_SHADER: &str = r#"
+struct View { xform: vec4<f32>, size: vec4<f32> };
+@group(0) @binding(0) var<uniform> view: View;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var smp: sampler;
+
+struct Inst {
+    @location(0) rect: vec4<f32>,
+    @location(1) params: vec4<f32>,   // radius, opacity
+};
+struct Out {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) half: vec2<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) params: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> Out {
+    let corner = vec2<f32>(f32(vi & 1u), f32(vi >> 1u));
+    let s = view.xform.x;
+    let p0 = i.rect.xy * s + view.xform.yz;
+    let size = i.rect.zw * s;
+    let p = p0 + corner * size;
+    var o: Out;
+    o.pos = vec4(p.x / view.size.x * 2.0 - 1.0, 1.0 - p.y / view.size.y * 2.0, 0.0, 1.0);
+    o.local = p - (p0 + size * 0.5);
+    o.half = size * 0.5;
+    o.uv = corner;
+    o.params = vec2(i.params.x * s, i.params.y);
+    return o;
+}
+
+fn sd_round_box(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half + vec2(r);
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+@fragment
+fn fs(o: Out) -> @location(0) vec4<f32> {
+    let r = min(o.params.x, min(o.half.x, o.half.y));
+    let coverage = clamp(0.5 - sd_round_box(o.local, o.half, r), 0.0, 1.0);
+    let c = textureSample(tex, smp, o.uv);
+    let a = c.a * o.params.y * coverage;
+    return vec4(c.rgb * a, a);
+}
+"#;
+
+const IMAGE_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+const IMAGE_INSTANCE_BYTES: u64 = 8 * 4;
+/// Pictures per frame (the browse list shows seven).
+const MAX_IMAGES: usize = 64;
+/// A picture's texture is dropped after this many frames unused.
+const IMAGE_KEEP_FRAMES: u64 = 600;
+
+/// A picture on the GPU.
+struct ImageTex {
+    bind: wgpu::BindGroup,
+    used: u64,
+}
+
 /// Copies the device layer's offscreen texture into the shell's display slot.
 const BLIT_SHADER: &str = r#"
 struct Rect { clip: vec4<f32> };  // left, top, right, bottom in clip space
@@ -339,7 +406,7 @@ pub struct FrameTiming {
 
 /// Cached shaped text, reused while its content is unchanged.
 struct TextSlot {
-    key: (String, u32, Weight, u32),
+    key: (String, u32, Weight, u32, Option<u32>),
     buffer: Buffer,
     width: f32,
 }
@@ -367,6 +434,11 @@ pub struct Gfx {
     wave_bind: wgpu::BindGroup,
     wave_instances: wgpu::Buffer,
     wave_bytes: Vec<u8>,
+    image_pipeline: wgpu::RenderPipeline,
+    image_layout: wgpu::BindGroupLayout,
+    image_instances: wgpu::Buffer,
+    images: HashMap<u64, ImageTex>,
+    frame_no: u64,
 
     fonts: FontSystem,
     swash: SwashCache,
@@ -558,6 +630,75 @@ impl Gfx {
             mapped_at_creation: false,
         });
 
+        let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("image"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(IMAGE_SHADER)),
+        });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                bind_group_layouts: &[Some(&view_layout), Some(&image_layout)],
+                ..Default::default()
+            });
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("image"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: IMAGE_INSTANCE_BYTES,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &IMAGE_ATTRS,
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+        let image_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image instances"),
+            size: MAX_IMAGES as u64 * IMAGE_INSTANCE_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blit"),
             entries: &[
@@ -667,6 +808,11 @@ impl Gfx {
             wave_bind,
             wave_instances,
             wave_bytes: Vec::new(),
+            image_pipeline,
+            image_layout,
+            image_instances,
+            images: HashMap::new(),
+            frame_no: 0,
             fonts,
             swash: SwashCache::new(),
             atlas,
@@ -945,11 +1091,11 @@ impl Gfx {
         h: u32,
         xform: (f32, f32, f32),
     ) -> wgpu::CommandBuffer {
-        // Waveforms belong to the device screen.
-        let waves = if which == Which::Device {
-            self.upload_waves(scene)
+        // Waveforms and pictures belong to the device screen.
+        let (waves, images) = if which == Which::Device {
+            (self.upload_waves(scene), self.upload_images(scene))
         } else {
-            0
+            (0, 0)
         };
         let srgb = self.srgb;
         let layer = match which {
@@ -1048,11 +1194,98 @@ impl Gfx {
                     pass.draw(0..4, k as u32..k as u32 + 1);
                 }
             }
+            if images > 0 {
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &layer.view_bind, &[]);
+                pass.set_vertex_buffer(0, self.image_instances.slice(..));
+                for (k, img) in scene.images.iter().take(images).enumerate() {
+                    if let Some(t) = self.images.get(&img.picture.id) {
+                        pass.set_bind_group(1, &t.bind, &[]);
+                        pass.draw(0..4, k as u32..k as u32 + 1);
+                    }
+                }
+            }
             if let Err(e) = layer.text.render(&self.atlas, &layer.viewport, &mut pass) {
                 eprintln!("text render: {e}");
             }
         }
         encoder.finish()
+    }
+
+    /// Make textures for the scene's pictures not on the GPU yet, drop those unused for a
+    /// while, and write the instances; returns how many pictures to draw.
+    fn upload_images(&mut self, scene: &Scene) -> usize {
+        self.frame_no += 1;
+        let now = self.frame_no;
+        let n = scene.images.len().min(MAX_IMAGES);
+        let mut bytes: Vec<u8> = Vec::with_capacity(n * IMAGE_INSTANCE_BYTES as usize);
+        for img in scene.images.iter().take(n) {
+            let pic = &img.picture;
+            if let Some(t) = self.images.get_mut(&pic.id) {
+                t.used = now;
+            } else if pic.width > 0 && pic.rgba.len() == (pic.width * pic.height * 4) as usize {
+                let format = if self.srgb {
+                    wgpu::TextureFormat::Rgba8UnormSrgb
+                } else {
+                    wgpu::TextureFormat::Rgba8Unorm
+                };
+                let size = wgpu::Extent3d {
+                    width: pic.width,
+                    height: pic.height,
+                    depth_or_array_layers: 1,
+                };
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("picture"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &pic.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(pic.width * 4),
+                        rows_per_image: Some(pic.height),
+                    },
+                    size,
+                );
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("picture"),
+                    layout: &self.image_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+                self.images.insert(pic.id, ImageTex { bind, used: now });
+            }
+            for v in [img.x, img.y, img.w, img.h, img.radius, 1.0, 0.0, 0.0] {
+                bytes.extend_from_slice(&v.to_ne_bytes());
+            }
+        }
+        self.images
+            .retain(|_, t| now.saturating_sub(t.used) <= IMAGE_KEEP_FRAMES);
+        if n > 0 {
+            self.queue.write_buffer(&self.image_instances, 0, &bytes);
+        }
+        n
     }
 
     /// Write the scene's waveform columns into the column texture and their instances;
@@ -1164,6 +1397,7 @@ fn prepare_text(
             t.size.to_bits(),
             t.weight,
             t.line_height.to_bits(),
+            t.max_width.map(f32::to_bits),
         );
         if layer.slots.get(i).is_some_and(|slot| slot.key == key) {
             continue;
@@ -1183,7 +1417,12 @@ fn prepare_text(
         }
         let slot = &mut layer.slots[i];
         slot.buffer.set_metrics(metrics);
-        slot.buffer.set_size(None, None);
+        slot.buffer.set_size(t.max_width, None);
+        slot.buffer.set_wrap(Wrap::None);
+        slot.buffer.set_ellipsize(match t.max_width {
+            Some(_) => Ellipsize::End(EllipsizeHeightLimit::Lines(1)),
+            None => Ellipsize::None,
+        });
         slot.buffer
             .set_text(&t.text, &attrs, Shaping::Advanced, None);
         slot.buffer.shape_until_scroll(fonts, false);

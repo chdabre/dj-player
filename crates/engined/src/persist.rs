@@ -2,16 +2,17 @@
 //! edits and blobs back. Nothing here touches the audio thread; the deck gets the stored
 //! cues through [`engine_core::DeckCommand::SetCues`] from [`crate::Player::poll`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use library::{
-    AnalysisRef, AudioHash, ContentHasher, DeviceId, Edit, FileHash, FileIdentity, Library,
-    MountOptions, Persistence, Track, TrackRef, WaveformRef,
+    AnalysisRef, AudioHash, ContentHasher, DeviceId, Edit, FileHash, FileIdentity, Library, Listed,
+    MountOptions, Persistence, Track, TrackRef, TrackTags, WaveformRef,
 };
 use waveform::compute::Waveform;
 
@@ -39,6 +40,8 @@ pub enum LibraryChoice {
 /// What a load found in the library.
 #[derive(Debug, Clone)]
 pub struct Loaded {
+    /// The [`LibraryWorker::open`] this answers.
+    pub serial: u64,
     pub track: TrackRef,
     pub file_hash: FileHash,
     pub record: Track,
@@ -46,6 +49,20 @@ pub struct Loaded {
     pub waveform: Option<Waveform>,
     /// Stored analysis results by analyzer name, with their blobs.
     pub analysis: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
+}
+
+/// The library's tracks by path (relative to the stick's root, as stored).
+pub type Listing = HashMap<String, Listed>;
+
+/// What the batch job computed for one file, to store with its record (made if missing).
+#[derive(Debug, Clone)]
+pub struct BatchResult {
+    pub file: PathBuf,
+    pub waveform: Waveform,
+    pub fresh: Vec<FreshAnalysis>,
+    pub audio_hash: Option<AudioHash>,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
 }
 
 /// A fresh analysis result to store.
@@ -58,6 +75,16 @@ pub struct FreshAnalysis {
 }
 
 enum Request {
+    Open {
+        serial: u64,
+        file: PathBuf,
+    },
+    Store(Box<BatchResult>),
+    Scan,
+    Analysed {
+        bpm: Option<f64>,
+        key: Option<String>,
+    },
     Edit(Edit),
     AudioHash(AudioHash),
     Waveform(Box<Waveform>),
@@ -72,11 +99,18 @@ pub enum Reply {
     Loaded(Box<Loaded>),
     /// The library could not be mounted; nothing will be stored or restored.
     Failed(String),
+    /// The opened file got no record (it can't be read); its edits are not stored.
+    Unrecorded { serial: u64, reason: String },
     /// Whether edits reach the store, whenever it changes.
     Status(Persistence),
+    /// Every track the library knows, by path relative to the stick's root: after the mount,
+    /// and again when tracks or their tags change.
+    Listing(Arc<Listing>),
+    /// A scan's progress, files done of `total`.
+    Scan { done: usize, total: usize },
 }
 
-/// The library worker of one loaded track.
+/// The library worker: one mounted library, and the track the deck has loaded in it.
 pub struct LibraryWorker {
     tx: Option<Sender<Request>>,
     rx: Receiver<Reply>,
@@ -84,7 +118,21 @@ pub struct LibraryWorker {
 }
 
 impl LibraryWorker {
-    /// Mount the chosen library and look up `file` on a new thread.
+    /// Start a worker for the chosen library; it mounts on the first [`LibraryWorker::open`].
+    pub fn start(device: Option<DeviceId>, choice: LibraryChoice) -> std::io::Result<Self> {
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (replies, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("library".into())
+            .spawn(move || run(device, choice, &requests, &replies))?;
+        Ok(Self {
+            tx: Some(tx),
+            rx,
+            thread: Some(thread),
+        })
+    }
+
+    /// Mount the chosen library and look up `file` (serial 0) on a new thread.
     pub fn spawn(choice: LibraryChoice, file: PathBuf) -> std::io::Result<Self> {
         Self::spawn_as(None, choice, file)
     }
@@ -95,16 +143,16 @@ impl LibraryWorker {
         choice: LibraryChoice,
         file: PathBuf,
     ) -> std::io::Result<Self> {
-        let (tx, requests) = std::sync::mpsc::channel();
-        let (replies, rx) = std::sync::mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name("library".into())
-            .spawn(move || run(device, choice, &file, &requests, &replies))?;
-        Ok(Self {
-            tx: Some(tx),
-            rx,
-            thread: Some(thread),
-        })
+        let w = Self::start(device, choice)?;
+        w.open(0, file);
+        Ok(w)
+    }
+
+    /// The deck loaded `file`: find or make its record, answered by a [`Reply::Loaded`] (or
+    /// [`Reply::Unrecorded`]) with this `serial`. Audio hash, waveform and analysis requests
+    /// from now on are for this track.
+    pub fn open(&self, serial: u64, file: PathBuf) {
+        self.send(Request::Open { serial, file });
     }
 
     pub fn try_recv(&self) -> Option<Reply> {
@@ -128,6 +176,23 @@ impl LibraryWorker {
 
     pub fn waveform(&self, w: Waveform) {
         self.send(Request::Waveform(Box::new(w)));
+    }
+
+    /// Scan every audio file under the stick's root: records and tags, a file at a time
+    /// between other requests, reported as [`Reply::Scan`].
+    pub fn scan(&self) {
+        self.send(Request::Scan);
+    }
+
+    /// Store a batch result with its file's record; the loaded track stays the one requests
+    /// without a file go to.
+    pub fn store(&self, result: BatchResult) {
+        self.send(Request::Store(Box::new(result)));
+    }
+
+    /// The loaded track's analysed BPM and key, for the tag cache.
+    pub fn analysed(&self, bpm: Option<f64>, key: Option<String>) {
+        self.send(Request::Analysed { bpm, key });
     }
 
     pub fn analysis(&self, fresh: Vec<FreshAnalysis>) {
@@ -155,10 +220,27 @@ struct Located {
     what: String,
 }
 
+/// The track requests apply to: the last one opened.
+struct Current {
+    track: library::TrackId,
+    identity: FileHash,
+    serial: u64,
+}
+
+/// A scan of the stick under way: the files still to do.
+struct Scan {
+    files: Vec<PathBuf>,
+    total: usize,
+    /// When progress was last reported.
+    reported: Instant,
+}
+
+/// How often a running scan reports progress and publishes the listing.
+const SCAN_REPORT: Duration = Duration::from_millis(500);
+
 fn run(
     device: Option<DeviceId>,
     choice: LibraryChoice,
-    file: &Path,
     requests: &Receiver<Request>,
     replies: &Sender<Reply>,
 ) {
@@ -172,14 +254,362 @@ fn run(
         }
         device
     });
-    let started = Instant::now();
-    let mut loc = match locate(&choice, file, device) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = replies.send(Reply::Failed(e));
-            return;
-        }
+    let mut status = Status {
+        replies: replies.clone(),
+        last: None,
     };
+    // A chosen folder (or RAM) mounts now, so the browser can list it before anything loads;
+    // the automatic choice waits for the first open: it needs a file to find its stick.
+    let mut loc: Option<Located> = None;
+    if choice != LibraryChoice::Auto {
+        match mount(&choice, Path::new(""), device, &say) {
+            Ok(mut l) => {
+                report(&mut l.lib, &say, &mut status);
+                publish(&l.lib, replies);
+                loc = Some(l);
+            }
+            Err(e) => {
+                let _ = replies.send(Reply::Failed(e));
+                return;
+            }
+        }
+    }
+    let mut current: Option<Current> = None;
+    let mut scan: Option<Scan> = None;
+    // The listing changed since it was last published.
+    let mut listing_stale = false;
+    let mut deadline: Option<Instant> = None;
+    loop {
+        // While scanning, look for requests without waiting; a request always comes first.
+        let wait = match (&scan, deadline) {
+            (Some(_), _) => Some(Duration::ZERO),
+            (None, Some(d)) => Some(d.saturating_duration_since(Instant::now())),
+            (None, None) => None,
+        };
+        let req = match wait {
+            Some(w) => match requests.recv_timeout(w) {
+                Ok(r) => Some(r),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match requests.recv() {
+                Ok(r) => Some(r),
+                Err(_) => break,
+            },
+        };
+        let Some(req) = req else {
+            if let Some(l) = loc.as_mut() {
+                if let Some(sc) = scan.as_mut() {
+                    scan_one(l, sc, &say);
+                    listing_stale = true;
+                    deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+                    let finished = sc.files.is_empty();
+                    if finished || sc.reported.elapsed() >= SCAN_REPORT {
+                        sc.reported = Instant::now();
+                        let _ = replies.send(Reply::Scan {
+                            done: sc.total - sc.files.len(),
+                            total: sc.total,
+                        });
+                        publish(&l.lib, replies);
+                        listing_stale = false;
+                    }
+                    if finished {
+                        say(format!("library: scan done, {} files", sc.total));
+                        scan = None;
+                        l.lib.flush();
+                        report(&mut l.lib, &say, &mut status);
+                    }
+                }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    l.lib.flush();
+                    check(&mut l.lib, &say);
+                    report(&mut l.lib, &say, &mut status);
+                    deadline = None;
+                    if listing_stale {
+                        publish(&l.lib, replies);
+                        listing_stale = false;
+                    }
+                }
+            } else {
+                deadline = None;
+            }
+            continue;
+        };
+        if let Request::Open { serial, file } = req {
+            if loc.is_none() {
+                match mount(&choice, &file, device, &say) {
+                    Ok(l) => {
+                        publish(&l.lib, replies);
+                        loc = Some(l);
+                    }
+                    Err(e) => {
+                        let _ = replies.send(Reply::Failed(e));
+                        return;
+                    }
+                }
+            }
+            let loc = loc.as_mut().expect("just mounted");
+            current = None;
+            match open(loc, &file, &say) {
+                Ok((track, identity, new_location)) => {
+                    let tags_changed = refresh_tags(&mut loc.lib, track, &file, &say);
+                    let _ = replies.send(Reply::Loaded(Box::new(loaded(
+                        &mut loc.lib,
+                        track,
+                        identity,
+                        serial,
+                    ))));
+                    current = Some(Current {
+                        track,
+                        identity,
+                        serial,
+                    });
+                    report(&mut loc.lib, &say, &mut status);
+                    // After an unclean close: the record is out, so the check doesn't hold
+                    // up the load.
+                    check(&mut loc.lib, &say);
+                    // A new record or location is committed like an edit.
+                    if new_location || tags_changed {
+                        listing_stale = true;
+                        deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+                    }
+                }
+                Err(reason) => {
+                    let _ = replies.send(Reply::Unrecorded { serial, reason });
+                }
+            }
+            continue;
+        }
+        let Some(loc) = loc.as_mut() else {
+            continue;
+        };
+        match req {
+            Request::Open { .. } => unreachable!("handled above"),
+            Request::Scan => {
+                if scan.is_none() {
+                    let files = loc
+                        .root
+                        .as_deref()
+                        .map(crate::browse::walk)
+                        .unwrap_or_default();
+                    say(format!("library: scanning {} files", files.len()));
+                    let _ = replies.send(Reply::Scan {
+                        done: 0,
+                        total: files.len(),
+                    });
+                    scan = Some(Scan {
+                        total: files.len(),
+                        // Taken from the end: reverse, so the scan goes in path order.
+                        files: files.into_iter().rev().collect(),
+                        reported: Instant::now(),
+                    });
+                }
+            }
+            Request::Store(r) => match open(loc, &r.file, &say) {
+                Ok((mut track, _, _)) => {
+                    refresh_tags(&mut loc.lib, track, &r.file, &say);
+                    if let Some(h) = r.audio_hash {
+                        match loc.lib.set_audio_hash(track, h) {
+                            Ok(survivor) => track = survivor,
+                            Err(e) => say(format!("library: {e}")),
+                        }
+                    }
+                    store_analysis(&mut loc.lib, track, r.fresh, &say);
+                    store_waveform(&mut loc.lib, track, &r.waveform, &say);
+                    store_bpm_key(&mut loc.lib, track, r.bpm, r.key, &say);
+                    loc.lib.flush();
+                    listing_stale = true;
+                    // Publishes the listing within the second.
+                    deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+                }
+                Err(e) => say(format!("library: {e}")),
+            },
+            Request::Edit(e) => {
+                if let Err(e) = loc.lib.apply(e) {
+                    say(format!("library: {e}"));
+                }
+                deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+            }
+            Request::Analysed { bpm, key } => {
+                let Some(cur) = &current else {
+                    continue;
+                };
+                if store_bpm_key(&mut loc.lib, cur.track, bpm, key, &say) {
+                    listing_stale = true;
+                    deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+                }
+            }
+            Request::AudioHash(h) => {
+                let Some(cur) = current.as_mut() else {
+                    continue;
+                };
+                let survivor = match loc.lib.set_audio_hash(cur.track, h) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        say(format!("library: {e}"));
+                        cur.track
+                    }
+                };
+                deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+                if survivor != cur.track {
+                    say(format!(
+                        "library: same audio as track {survivor}: merged into it"
+                    ));
+                    cur.track = survivor;
+                    listing_stale = true;
+                    let _ = replies.send(Reply::Loaded(Box::new(loaded(
+                        &mut loc.lib,
+                        cur.track,
+                        cur.identity,
+                        cur.serial,
+                    ))));
+                }
+            }
+            Request::Waveform(w) => {
+                let Some(cur) = &current else {
+                    continue;
+                };
+                store_waveform(&mut loc.lib, cur.track, &w, &say);
+                loc.lib.flush();
+            }
+            Request::Analysis(fresh) => {
+                let Some(cur) = &current else {
+                    continue;
+                };
+                store_analysis(&mut loc.lib, cur.track, fresh, &say);
+                loc.lib.flush();
+            }
+        }
+        report(&mut loc.lib, &say, &mut status);
+    }
+    if let Some(loc) = loc.as_mut() {
+        loc.lib.flush();
+        report(&mut loc.lib, &say, &mut status);
+    }
+}
+
+fn store_waveform(lib: &mut Library, track: library::TrackId, w: &Waveform, say: &dyn Fn(String)) {
+    let detail = w.to_blob();
+    let overview = w.overview().to_blob(&w.params, w.provenance);
+    let r = WaveformRef::new(lib.put_blob(&detail), lib.put_blob(&overview));
+    if let Err(e) = lib.apply(Edit::SetWaveform(track, r)) {
+        say(format!("library: {e}"));
+    }
+}
+
+fn store_analysis(
+    lib: &mut Library,
+    track: library::TrackId,
+    fresh: Vec<FreshAnalysis>,
+    say: &dyn Fn(String),
+) {
+    for f in fresh {
+        let a = AnalysisRef {
+            version: f.version,
+            params: f.params,
+            blob: lib.put_blob(&f.blob),
+            created: library::rfc3339(library::system_ms()),
+        };
+        if let Err(e) = lib.apply(Edit::SetAnalysis(track, f.name, a)) {
+            say(format!("library: {e}"));
+        }
+    }
+}
+
+/// Put our analysed BPM and key in the track's tag cache; true if it changed.
+fn store_bpm_key(
+    lib: &mut Library,
+    track: library::TrackId,
+    bpm: Option<f64>,
+    key: Option<String>,
+    say: &dyn Fn(String),
+) -> bool {
+    let Ok(Some(t)) = lib.track(track) else {
+        return false;
+    };
+    let tags = TrackTags {
+        bpm: bpm.or(t.tags.bpm),
+        key: key.or(t.tags.key.clone()),
+        ..t.tags.clone()
+    };
+    if tags == t.tags {
+        return false;
+    }
+    if let Err(e) = lib.apply(Edit::SetTags(track, tags)) {
+        say(format!("library: {e}"));
+        return false;
+    }
+    true
+}
+
+/// Scan the next file: its record and its tags.
+fn scan_one(loc: &mut Located, scan: &mut Scan, say: &dyn Fn(String)) {
+    let Some(file) = scan.files.pop() else {
+        return;
+    };
+    match open(loc, &file, &|_| {}) {
+        Ok((track, _, _)) => {
+            refresh_tags(&mut loc.lib, track, &file, say);
+        }
+        Err(e) => say(format!("library: scan: {e}")),
+    }
+}
+
+/// Fill the track's tag cache from `file`'s tags. The BPM and key stay as our analysis set
+/// them once the track has been analysed. True if the cache changed.
+fn refresh_tags(
+    lib: &mut Library,
+    track: library::TrackId,
+    file: &Path,
+    say: &dyn Fn(String),
+) -> bool {
+    let Ok(Some(record)) = lib.track(track) else {
+        return false;
+    };
+    let Ok(read) = engine_media::tags(file) else {
+        return false;
+    };
+    let analysed = !record.analysis.is_empty();
+    let tags = TrackTags {
+        title: read.title,
+        artist: read.artist,
+        album: read.album,
+        genre: read.genre,
+        bpm: if analysed { record.tags.bpm } else { read.bpm },
+        key: if analysed {
+            record.tags.key.clone()
+        } else {
+            read.key
+        },
+        duration: read.duration,
+    };
+    if tags == record.tags {
+        return false;
+    }
+    if let Err(e) = lib.apply(Edit::SetTags(track, tags)) {
+        say(format!("library: {e}"));
+        return false;
+    }
+    true
+}
+
+/// Send the library's listing to the player.
+fn publish(lib: &Library, replies: &Sender<Reply>) {
+    if let Ok(rows) = lib.listing() {
+        let listing: Listing = rows.into_iter().map(|l| (l.path.clone(), l)).collect();
+        let _ = replies.send(Reply::Listing(Arc::new(listing)));
+    }
+}
+
+/// Mount the chosen library (the automatic choice: on `file`'s stick) and say what it is.
+fn mount(
+    choice: &LibraryChoice,
+    file: &Path,
+    device: DeviceId,
+    say: &dyn Fn(String),
+) -> Result<Located, String> {
+    let started = Instant::now();
+    let mut loc = locate(choice, file, device)?;
     let stats = loc.lib.stats().clone();
     say(format!(
         "library: {} ({} tracks, opened in {:.0} ms{})",
@@ -197,26 +627,24 @@ fn run(
     for w in loc.lib.take_warnings() {
         say(format!("library: {w}"));
     }
+    Ok(loc)
+}
 
-    let (identity, size) = match hash_file(file) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = replies.send(Reply::Failed(format!("can't read {}: {e}", file.display())));
-            return;
-        }
-    };
+/// Find or make `file`'s record: its track, file hash, and whether the record or the
+/// location is new.
+fn open(
+    loc: &mut Located,
+    file: &Path,
+    say: &dyn Fn(String),
+) -> Result<(library::TrackId, FileHash, bool), String> {
+    let (identity, size) =
+        hash_file(file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
     let path = stored_path(file, loc.root.as_deref());
-    let found = match loc
+    let found = loc
         .lib
         .find_or_create(FileIdentity::new(path, size, identity))
-    {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = replies.send(Reply::Failed(e.to_string()));
-            return;
-        }
-    };
-    let mut track = found.track;
+        .map_err(|e| e.to_string())?;
+    let track = found.track;
     if found.created {
         say(format!("library: new track {track}"));
     } else if found.new_location {
@@ -224,96 +652,7 @@ fn run(
             "library: track {track} (known file at a new location)"
         ));
     }
-    let _ = replies.send(Reply::Loaded(Box::new(loaded(
-        &mut loc.lib,
-        track,
-        identity,
-    ))));
-
-    let mut status = Status {
-        replies: replies.clone(),
-        last: None,
-    };
-    report(&mut loc.lib, &say, &mut status);
-    // After an unclean close: the record is out, so the check doesn't hold up the load.
-    check(&mut loc.lib, &say);
-    // A new record or location is committed like an edit.
-    let mut deadline = found.new_location.then(|| Instant::now() + FLUSH_AFTER);
-    loop {
-        let req = match deadline {
-            Some(d) => match requests.recv_timeout(d.saturating_duration_since(Instant::now())) {
-                Ok(r) => Some(r),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
-            None => match requests.recv() {
-                Ok(r) => Some(r),
-                Err(_) => break,
-            },
-        };
-        let Some(req) = req else {
-            loc.lib.flush();
-            check(&mut loc.lib, &say);
-            deadline = None;
-            report(&mut loc.lib, &say, &mut status);
-            continue;
-        };
-        match req {
-            Request::Edit(e) => {
-                if let Err(e) = loc.lib.apply(e) {
-                    say(format!("library: {e}"));
-                }
-                deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
-            }
-            Request::AudioHash(h) => {
-                let survivor = match loc.lib.set_audio_hash(track, h) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        say(format!("library: {e}"));
-                        track
-                    }
-                };
-                deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
-                if survivor != track {
-                    say(format!(
-                        "library: same audio as track {survivor}: merged into it"
-                    ));
-                    track = survivor;
-                    let _ = replies.send(Reply::Loaded(Box::new(loaded(
-                        &mut loc.lib,
-                        track,
-                        identity,
-                    ))));
-                }
-            }
-            Request::Waveform(w) => {
-                let detail = w.to_blob();
-                let overview = w.overview().to_blob(&w.params, w.provenance);
-                let r = WaveformRef::new(loc.lib.put_blob(&detail), loc.lib.put_blob(&overview));
-                if let Err(e) = loc.lib.apply(Edit::SetWaveform(track, r)) {
-                    say(format!("library: {e}"));
-                }
-                loc.lib.flush();
-            }
-            Request::Analysis(fresh) => {
-                for f in fresh {
-                    let a = AnalysisRef {
-                        version: f.version,
-                        params: f.params,
-                        blob: loc.lib.put_blob(&f.blob),
-                        created: library::rfc3339(library::system_ms()),
-                    };
-                    if let Err(e) = loc.lib.apply(Edit::SetAnalysis(track, f.name, a)) {
-                        say(format!("library: {e}"));
-                    }
-                }
-                loc.lib.flush();
-            }
-        }
-        report(&mut loc.lib, &say, &mut status);
-    }
-    loc.lib.flush();
-    report(&mut loc.lib, &say, &mut status);
+    Ok((track, identity, found.new_location))
 }
 
 /// Run the library's integrity check if it wants one, and say what it found.
@@ -341,7 +680,7 @@ struct Status {
 }
 
 /// The record of `track`, with its stored waveform and analysis blobs read.
-fn loaded(lib: &mut Library, track: library::TrackId, file_hash: FileHash) -> Loaded {
+fn loaded(lib: &mut Library, track: library::TrackId, file_hash: FileHash, serial: u64) -> Loaded {
     let record = lib
         .track(track)
         .ok()
@@ -361,6 +700,7 @@ fn loaded(lib: &mut Library, track: library::TrackId, file_hash: FileHash) -> Lo
         })
         .collect();
     Loaded {
+        serial,
         track: lib.track_ref(record.id),
         file_hash,
         record,
@@ -388,7 +728,7 @@ fn hash_file(path: &Path) -> std::io::Result<(FileHash, u64)> {
 
 /// `file` relative to `root`, `/`-separated and NFC; a file outside the root keeps its
 /// absolute path (a hint only: identity is the hash).
-fn stored_path(file: &Path, root: Option<&Path>) -> String {
+pub fn stored_path(file: &Path, root: Option<&Path>) -> String {
     let abs = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     let rel = root
         .and_then(|r| r.canonicalize().ok())

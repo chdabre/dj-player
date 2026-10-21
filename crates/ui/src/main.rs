@@ -9,12 +9,21 @@
 //! single colour), p performance screen (hot cue / beat jump pads, beat loops), d timing
 //! overlay, f fullscreen, q quit.
 //!
+//! Browsing: `LIBRARY_DIR=<dir>` makes a folder act as the root of a USB stick: the browse
+//! screen lists its folders and tracks, or its library's tracks (`browse.rs`), and its
+//! library is `<dir>/DJPLAYER` unless `--library`/`--no-library` say otherwise. A stick with
+//! no library asks once whether to scan it. Without a file the app starts on the browse
+//! screen. Tab (or the BROWSE tab, or the stand-in's knob) opens it; ↑/↓ or the wheel move,
+//! Enter loads or opens, Esc / Backspace goes up, `/` searches (type the query; Esc ends it),
+//! `i` (or the INFO tab) shows the selected track's details.
+//!
 //! With the `standin` feature (on by default) the window also shows the hardware stand-in:
 //! the player's physical controls drawn around the device screen (`standin.rs`), as a
 //! separate layer. `--no-standin` shows the device screen alone, as on the Pi.
 //!
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
 
+mod browse;
 mod clock;
 mod gfx;
 mod perform;
@@ -26,7 +35,7 @@ mod stats;
 mod theme;
 mod waves;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -34,14 +43,18 @@ use std::time::{Duration, Instant};
 
 use engine_core::DeckCommand;
 use engine_io::{CpalBackend, StreamRequest};
+use engined::browse::{Browser, Entered, Kind, Sort, Source};
 use engined::{AutoCue, LibraryChoice, Options, Persistence, Player};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, Touch, TouchPhase, WindowEvent};
+use winit::event::{
+    ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::browse::{BrowseView, InfoView, Nav, ROW_H, ROWS, Row, RowKind};
 use crate::clock::PlayheadClock;
 use crate::gfx::Gfx;
 use crate::scene::Scene;
@@ -59,13 +72,16 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] [--no-standin] \
                      [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--perform] [--pad-mode hotcue|beatjump|delete] \
                      [--hot-cues <s,s,…>] [--at <seconds>] [--play] [--run-for <seconds>] \
-                     [--screenshot <out.png>] [--library <dir> | --no-library] [--auto-cue off|<dB>]";
+                     [--screenshot <out.png>] [--library <dir> | --no-library] [--auto-cue off|<dB>] \
+                     [--browse] [--source usb|library] [--sort name|title|artist|bpm|key|time] \
+                     [--search <query>] [--scan] [--info] [--info-screen] [--analyze-all]\n\
+                     LIBRARY_DIR=<dir> browses <dir> as a USB stick's root; the file is then optional.";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
 const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
 
 struct Args {
-    file: PathBuf,
+    file: Option<PathBuf>,
     request: StreamRequest,
     fullscreen: bool,
     /// Draw the hardware stand-in around the device screen (feature `standin`).
@@ -77,9 +93,24 @@ struct Args {
     run_for: Option<f64>,
     theme: Theme,
     wave_mode: Mode,
-    library: LibraryChoice,
+    /// `--library` / `--no-library`, if given.
+    library: Option<LibraryChoice>,
     auto_cue: AutoCue,
     perform: Option<PerfState>,
+    /// Start on the browse screen.
+    browse: bool,
+    /// Browse screen set-up, for screenshots.
+    source: Option<Source>,
+    sort: Option<Sort>,
+    search: Option<String>,
+    /// Answer "scan this stick?" with yes (or scan anyway).
+    scan: bool,
+    /// Start with the browser's info panel up.
+    info: bool,
+    /// Start on the INFO screen.
+    info_screen: bool,
+    /// Start ANALYZE ALL once the library has said what it has.
+    analyze_all: bool,
     /// Hot cues to set at start (seconds), for screenshots and demos.
     hot_cues: Vec<f64>,
 }
@@ -93,7 +124,10 @@ fn parse_args() -> Result<Args, String> {
     let mut theme = Theme::default();
     let mut wave_theme: Option<String> = None;
     let mut wave_mode = Mode::ThreeBand;
-    let mut library = LibraryChoice::Auto;
+    let mut library = None;
+    let mut browse = false;
+    let (mut source, mut sort, mut search, mut scan) = (None, None, None, false);
+    let (mut info, mut info_screen, mut analyze_all) = (false, false, false);
     let mut auto_cue = AutoCue::default();
     let mut perform: Option<PerfState> = None;
     let mut hot_cues: Vec<f64> = Vec::new();
@@ -168,11 +202,48 @@ fn parse_args() -> Result<Args, String> {
                 })?;
             }
             "--library" => {
-                library = LibraryChoice::Folder(PathBuf::from(
+                library = Some(LibraryChoice::Folder(PathBuf::from(
                     args.next().ok_or("--library needs a folder")?,
-                ))
+                )))
             }
-            "--no-library" => library = LibraryChoice::Ram,
+            "--no-library" => library = Some(LibraryChoice::Ram),
+            "--browse" => browse = true,
+            "--source" => {
+                source = Some(match args.next().as_deref() {
+                    Some("usb") => Source::Folders,
+                    Some("library") => Source::Library,
+                    other => return Err(format!("bad source {other:?} (usb, library)")),
+                });
+                browse = true;
+            }
+            "--sort" => {
+                let name = args.next().unwrap_or_default();
+                sort = Some(
+                    Sort::ALL
+                        .into_iter()
+                        .find(|s| s.label().eq_ignore_ascii_case(&name))
+                        .ok_or(format!("bad sort {name:?}"))?,
+                );
+                browse = true;
+            }
+            "--info" => {
+                info = true;
+                browse = true;
+            }
+            "--info-screen" => info_screen = true,
+            "--analyze-all" => {
+                analyze_all = true;
+                source = Some(Source::Library);
+                browse = true;
+            }
+            "--scan" => {
+                scan = true;
+                browse = true;
+            }
+            "--search" => {
+                search = Some(args.next().ok_or("--search needs a query")?);
+                browse = true;
+            }
             "--auto-cue" => {
                 let v = args.next().ok_or("--auto-cue needs off or a level in dB")?;
                 auto_cue = AutoCue::parse(&v).ok_or(format!("bad auto cue {v:?}"))?;
@@ -199,7 +270,7 @@ fn parse_args() -> Result<Args, String> {
         })?;
     }
     Ok(Args {
-        file: file.ok_or("no file given")?,
+        file,
         request,
         fullscreen,
         standin,
@@ -212,6 +283,14 @@ fn parse_args() -> Result<Args, String> {
         library,
         auto_cue,
         perform,
+        browse,
+        source,
+        sort,
+        search,
+        scan,
+        info,
+        info_screen,
+        analyze_all,
         hot_cues,
     })
 }
@@ -227,13 +306,38 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // On the dev host a folder stands in for the stick: its root, with our library in it.
+    let root = std::env::var_os("LIBRARY_DIR").map(PathBuf::from);
+    if let Some(r) = &root
+        && !r.is_dir()
+    {
+        eprintln!("dj-ui: LIBRARY_DIR {} is not a folder", r.display());
+        return ExitCode::from(2);
+    }
+    if args.file.is_none() && root.is_none() {
+        eprintln!("dj-ui: no file given, and LIBRARY_DIR is not set");
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    let library = match (args.library.clone(), &root) {
+        (Some(choice), _) => choice,
+        (None, Some(r)) => LibraryChoice::Folder(r.join(engined::persist::LIBRARY_DIR)),
+        (None, None) => LibraryChoice::Auto,
+    };
+    // A stick with no library is asked about once, before mounting makes one.
+    let ask_scan = args.library.is_none()
+        && root.as_ref().is_some_and(|r| {
+            !r.join(engined::persist::LIBRARY_DIR)
+                .join("library.db")
+                .exists()
+        });
     let backend = CpalBackend::new();
     let options = Options {
-        library: args.library.clone(),
+        library,
         auto_cue: args.auto_cue,
         ..Options::default()
     };
-    let mut player = match Player::open_with(&backend, &args.request, &args.file, options) {
+    let mut player = match Player::start(&backend, &args.request, options) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("dj-ui: {e}");
@@ -249,21 +353,39 @@ fn main() -> ExitCode {
             .map_or("default".into(), |n| format!("{n} frames")),
         player.device_name()
     );
-    let sr = f64::from(player.format.sample_rate);
-    for (i, &at) in args.hot_cues.iter().enumerate().take(engine_core::HOT_CUES) {
-        player.send(DeckCommand::Seek(at * sr));
-        player.send(DeckCommand::HotCue(i));
+    if args.scan {
+        player.scan();
     }
-    if let Some(at) = args.at {
-        player.send(DeckCommand::Seek(at * f64::from(player.format.sample_rate)));
-    }
-    if args.play {
-        player.send(DeckCommand::Play);
+    if let Some(file) = &args.file {
+        if let Err(e) = player.load(file) {
+            eprintln!("dj-ui: {}: {e}", file.display());
+            return ExitCode::FAILURE;
+        }
+        let sr = f64::from(player.format.sample_rate);
+        for (i, &at) in args.hot_cues.iter().enumerate().take(engine_core::HOT_CUES) {
+            player.send(DeckCommand::Seek(at * sr));
+            player.send(DeckCommand::HotCue(i));
+        }
+        if let Some(at) = args.at {
+            player.send(DeckCommand::Seek(at * sr));
+        }
+        if args.play {
+            player.send(DeckCommand::Play);
+        }
     }
     let title = args
         .file
-        .file_stem()
-        .map_or("[TRACK]".into(), |s| s.to_string_lossy().into_owned());
+        .as_deref()
+        .map_or(String::new(), |f| track_title(f, None));
+    let mut browser = root.map(|r| Browser::new(r, ROWS));
+    if let Some(b) = browser.as_mut() {
+        if let Some(s) = args.sort {
+            b.set_sort(s);
+        }
+        if let Some(s) = args.source {
+            b.set_source(s);
+        }
+    }
     let event_loop = match EventLoop::new() {
         Ok(l) => l,
         Err(e) => {
@@ -286,6 +408,17 @@ fn main() -> ExitCode {
         scrub: None,
         player,
         title,
+        browser,
+        // Applied once the library's listing is in (a library search needs it).
+        pending_search: args.search.clone(),
+        keyboard: args.search.is_some(),
+        side: args.info,
+        pending_analyze_all: args.analyze_all,
+        unanalysed_cache: std::cell::RefCell::new(None),
+        loaded_tags: args.file.as_deref().map(LoadedTags::read),
+        ask_scan: ask_scan && !args.scan,
+        list_drag: None,
+        wheel: 0.0,
         fullscreen: args.fullscreen,
         screenshot: args.screenshot,
         run_for: args.run_for.map(Duration::from_secs_f64),
@@ -295,6 +428,10 @@ fn main() -> ExitCode {
         scene: Scene::default(),
         screen: if args.perform.is_some() {
             ScreenKind::Performance
+        } else if args.info_screen {
+            ScreenKind::Info
+        } else if args.browse || args.file.is_none() {
+            ScreenKind::Browse
         } else {
             ScreenKind::Main
         },
@@ -345,8 +482,40 @@ enum PointerOn {
     Shell,
 }
 
+/// A finger on the browse list: where it went down (design y, row), how far the list has
+/// scrolled under it, and whether it moved enough to be a drag rather than a tap.
+#[derive(Debug, Clone, Copy)]
+struct ListDrag {
+    y: f32,
+    row: usize,
+    scrolled: isize,
+    moved: bool,
+}
+
+/// Finger travel (design pixels) before a touch on the list counts as a drag.
+const DRAG_SLOP: f32 = 8.0;
+
 struct App {
     player: Player,
+    /// The stick's folder tree, when there is a stick (`LIBRARY_DIR`).
+    browser: Option<Browser>,
+    /// A `--search` query still to start.
+    pending_search: Option<String>,
+    /// The search keyboard is up.
+    keyboard: bool,
+    /// The browser's info panel is up beside the list.
+    side: bool,
+    /// `--analyze-all` still to start.
+    pending_analyze_all: bool,
+    /// The unanalysed track count, and the listing it was counted from.
+    unanalysed_cache: std::cell::RefCell<Option<(Arc<engined::persist::Listing>, usize)>>,
+    /// The loaded track's tags and large artwork, for the INFO screen.
+    loaded_tags: Option<LoadedTags>,
+    /// Ask whether to scan this stick (it had no library).
+    ask_scan: bool,
+    list_drag: Option<ListDrag>,
+    /// Wheel travel not yet turned into whole rows.
+    wheel: f64,
     pointer_on: PointerOn,
     #[cfg(feature = "standin")]
     standin: Option<standin::Standin>,
@@ -412,6 +581,7 @@ impl App {
             for c in cmds {
                 self.send(c);
             }
+            self.drain_nav();
             return;
         }
         let _ = alt;
@@ -430,6 +600,7 @@ impl App {
             for c in cmds {
                 self.send(c);
             }
+            self.drain_nav();
             return;
         }
         self.drag(x, y);
@@ -446,6 +617,7 @@ impl App {
             for c in cmds {
                 self.send(c);
             }
+            self.drain_nav();
             self.pointer_on = PointerOn::Device;
             return;
         }
@@ -479,9 +651,52 @@ impl App {
         match hit.target {
             Target::Perform => {
                 self.screen = match self.screen {
-                    ScreenKind::Main => ScreenKind::Performance,
                     ScreenKind::Performance => ScreenKind::Main,
+                    _ => ScreenKind::Performance,
                 };
+            }
+            Target::Browse if self.browser.is_some() => {
+                self.screen = match self.screen {
+                    ScreenKind::Browse => ScreenKind::Main,
+                    _ => ScreenKind::Browse,
+                };
+            }
+            Target::BrowseBack => self.nav(Nav::Back),
+            Target::Library | Target::Usb if self.browser.is_some() => {
+                let source = if hit.target == Target::Library {
+                    Source::Library
+                } else {
+                    Source::Folders
+                };
+                if let Some(b) = self.browser.as_mut() {
+                    b.set_source(source);
+                }
+                self.keyboard = false;
+                self.screen = ScreenKind::Browse;
+            }
+            Target::Sort => {
+                if let Some(b) = self.browser.as_mut() {
+                    b.set_sort(b.sort().next());
+                }
+            }
+            Target::Search => self.search(),
+            Target::Info => self.toggle_info(),
+            Target::Scan => self.player.scan(),
+            Target::AnalyzeAll => self.analyze_all(),
+            Target::ScanYes => self.answer_scan(true),
+            Target::ScanNo => self.answer_scan(false),
+            Target::Key(i) => {
+                if let Some(c) = browse::key_char(i) {
+                    self.type_char(c);
+                }
+            }
+            Target::Row(row) => {
+                self.list_drag = Some(ListDrag {
+                    y: dy,
+                    row: usize::from(row),
+                    scrolled: 0,
+                    moved: false,
+                });
             }
             Target::HotCueMode
             | Target::BeatJumpMode
@@ -507,8 +722,8 @@ impl App {
                 let sr = f64::from(self.player.format.sample_rate);
                 let grid = self
                     .player
-                    .analysed
-                    .as_ref()
+                    .loaded()
+                    .and_then(|d| d.analysed.as_ref())
                     .and_then(|a| a.grid.as_deref());
                 let span = screen::zoom_span(grid, ZOOM_STEPS[self.zoom], sr);
                 let shown = self.last_shown.map_or(st.position.load(), |(_, p)| p);
@@ -532,8 +747,8 @@ impl App {
         }
         let grid = self
             .player
-            .analysed
-            .as_ref()
+            .loaded()
+            .and_then(|d| d.analysed.as_ref())
             .and_then(|x| x.grid.as_deref());
         Some(match grid {
             Some(g) => g.beat_at(b) - g.beat_at(a),
@@ -558,6 +773,24 @@ impl App {
             }
             return;
         }
+        if let (Some(mut d), Some(gfx)) = (self.list_drag, &self.gfx) {
+            let (_, dy) = gfx.to_design(x, y);
+            let travel = dy - d.y;
+            d.moved |= travel.abs() > DRAG_SLOP;
+            if d.moved {
+                // The list moves with the finger: dragging up shows later rows.
+                let want = (-travel / ROW_H).round() as isize;
+                if want != d.scrolled
+                    && let Some(b) = self.browser.as_mut()
+                {
+                    b.scroll_by(want - d.scrolled);
+                    d.scrolled = want;
+                }
+                self.pressed = None;
+            }
+            self.list_drag = Some(d);
+            return;
+        }
         if self.pressed == Some(Target::Overview)
             && let Some(gfx) = &self.gfx
         {
@@ -572,6 +805,422 @@ impl App {
         if self.scrub.take().is_some() {
             self.send(DeckCommand::ScratchEnd);
         }
+        if let Some(d) = self.list_drag.take()
+            && !d.moved
+        {
+            self.tap_row(d.row);
+        }
+    }
+
+    /// A tap on shown row `row`: a folder opens; a track is selected, and loads if it was
+    /// selected already.
+    fn tap_row(&mut self, row: usize) {
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        let i = b.level().top + row;
+        let Some(entry) = b.level().entries.get(i) else {
+            return;
+        };
+        let open = entry.kind == Kind::Folder || b.level().cursor == i;
+        b.select(i);
+        if open {
+            self.enter();
+        }
+    }
+
+    /// Open the selected folder, or load the selected track.
+    fn enter(&mut self) {
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        if let Entered::Track(path) = b.enter() {
+            self.load(&path);
+        }
+    }
+
+    /// A browse control: knob turn / push, BACK.
+    fn nav(&mut self, n: Nav) {
+        if self.screen == ScreenKind::Info && n == Nav::Back {
+            self.screen = ScreenKind::Main;
+            return;
+        }
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        if self.screen != ScreenKind::Browse {
+            // Pushing the knob (or BROWSE) elsewhere opens the browser.
+            if n == Nav::Push {
+                self.screen = ScreenKind::Browse;
+            }
+            return;
+        }
+        match n {
+            Nav::Up => b.move_by(-1),
+            Nav::Down => b.move_by(1),
+            Nav::Push => self.enter(),
+            Nav::Back if self.side => self.side = false,
+            Nav::Back => {
+                if !b.back() {
+                    self.screen = ScreenKind::Main;
+                }
+                if b.search_query().is_none() {
+                    self.keyboard = false;
+                }
+            }
+        }
+    }
+
+    /// Load `path` onto the deck and show the main screen.
+    fn load(&mut self, path: &Path) {
+        if let Err(e) = self.player.load(path) {
+            eprintln!("can't load {}: {e}", path.display());
+            return;
+        }
+        let tags = self.browser.as_ref().and_then(|b| b.info(path));
+        self.title = track_title(path, tags.as_ref());
+        self.keyboard = false;
+        self.loaded_tags = Some(LoadedTags::read(path));
+        self.wave.clear();
+        self.wave_complete = false;
+        self.track_gain = (1.0, 0);
+        self.overview = OverviewCache::default();
+        self.scrub = None;
+        self.last_shown = None;
+        self.clock = PlayheadClock::new(self.player.format.sample_rate);
+        self.screen = ScreenKind::Main;
+        eprintln!("loaded {}", path.display());
+    }
+
+    /// The wheel turned `rows` (positive = down) at window pixels (`x`, `y`).
+    fn wheel(&mut self, x: f64, y: f64, rows: i32) {
+        #[cfg(feature = "standin")]
+        if self.standin.is_some()
+            && let Some(gfx) = &self.gfx
+            && !gfx.on_device(x, y)
+        {
+            if let (Some((sx, sy)), Some(s)) = (gfx.to_shell(x, y), self.standin.as_mut()) {
+                s.wheel(sx, sy, rows);
+            }
+            self.drain_nav();
+            return;
+        }
+        let _ = (x, y);
+        if self.screen == ScreenKind::Browse
+            && let Some(b) = self.browser.as_mut()
+        {
+            b.scroll_by(rows as isize);
+        }
+    }
+
+    /// Act on the stand-in's browse controls.
+    #[cfg(feature = "standin")]
+    fn drain_nav(&mut self) {
+        let navs = self
+            .standin
+            .as_mut()
+            .map(standin::Standin::take_nav)
+            .unwrap_or_default();
+        for n in navs {
+            self.nav(n);
+        }
+    }
+
+    /// ANALYZE ALL: analyse every library track without our analysis, in a batch; or stop.
+    fn analyze_all(&mut self) {
+        if self.player.batch_progress().is_some() {
+            self.player.stop_analyze_all();
+            return;
+        }
+        let files = self.unanalysed();
+        if !self.player.analyze_all(files) {
+            eprintln!("analyze all: nothing to analyse (or no library)");
+        }
+    }
+
+    /// The library's tracks without our analysis, one file each, in path order.
+    fn unanalysed(&self) -> Vec<PathBuf> {
+        let (Some(b), Some(listing)) = (&self.browser, self.player.listing()) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut rows: Vec<_> = listing.values().filter(|l| !l.analysed).collect();
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        rows.into_iter()
+            .filter(|l| seen.insert(l.track))
+            .map(|l| b.root().join(&l.path))
+            .collect()
+    }
+
+    /// How many library tracks lack our analysis, counted once per listing.
+    fn unanalysed_count(&self) -> usize {
+        let Some(listing) = self.player.listing() else {
+            return 0;
+        };
+        if let Some((l, n)) = &*self.unanalysed_cache.borrow()
+            && Arc::ptr_eq(l, listing)
+        {
+            return *n;
+        }
+        let n = self.unanalysed().len();
+        *self.unanalysed_cache.borrow_mut() = Some((Arc::clone(listing), n));
+        n
+    }
+
+    /// The answer to "scan this stick?": a scan shows the library filling in.
+    fn answer_scan(&mut self, scan: bool) {
+        self.ask_scan = false;
+        if scan {
+            self.player.scan();
+            if let Some(b) = self.browser.as_mut() {
+                b.set_source(Source::Library);
+            }
+        }
+    }
+
+    /// INFO: in the browser, the selected track's details beside the list (or not); on
+    /// any other screen, the INFO screen of the loaded track (or back to the main screen).
+    fn toggle_info(&mut self) {
+        match self.screen {
+            ScreenKind::Browse => {
+                self.side = !self.side;
+                if self.side {
+                    self.keyboard = false;
+                }
+            }
+            ScreenKind::Info => self.screen = ScreenKind::Main,
+            _ => self.screen = ScreenKind::Info,
+        }
+    }
+
+    /// SEARCH: start a search with the keyboard up, or show / hide the keyboard of the one
+    /// under way.
+    fn search(&mut self) {
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        self.screen = ScreenKind::Browse;
+        self.side = false;
+        if b.search_query().is_some() {
+            self.keyboard = !self.keyboard;
+        } else {
+            b.search_begin();
+            self.keyboard = true;
+        }
+    }
+
+    /// A key typed into the search (on-screen keyboard or a real one).
+    fn type_char(&mut self, c: char) {
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        let Some(q) = b.search_query() else {
+            return;
+        };
+        let mut q = q.to_string();
+        match c {
+            browse::BACKSPACE => {
+                q.pop();
+            }
+            browse::CLEAR => q.clear(),
+            browse::DONE => self.keyboard = false,
+            c if !c.is_control() => q.push(c),
+            _ => {}
+        }
+        b.set_query(&q);
+    }
+
+    /// What the browse screen shows of the browser.
+    fn browse_view(&self) -> Option<BrowseView> {
+        let b = self.browser.as_ref()?;
+        let l = b.level();
+        let loaded = self.player.loaded().map(|d| d.file());
+        let rows = l
+            .entries
+            .iter()
+            .skip(l.top)
+            .take(ROWS)
+            .map(|e| match e.kind {
+                Kind::Folder => Row {
+                    kind: RowKind::Folder,
+                    title: e.name.clone(),
+                    artist: String::new(),
+                    detail: String::new(),
+                    loaded: false,
+                    art: None,
+                },
+                Kind::Track => {
+                    let tags = b.info(&e.path);
+                    let tags = tags.as_ref();
+                    let detail = [
+                        tags.and_then(|t| t.bpm).map(|b| format!("{b:.1}")),
+                        tags.and_then(|t| t.key.clone()),
+                        tags.and_then(|t| t.duration).map(browse::length),
+                    ];
+                    Row {
+                        kind: RowKind::Track,
+                        title: track_title(&e.path, tags),
+                        artist: tags.and_then(|t| t.artist.clone()).unwrap_or_default(),
+                        detail: detail.into_iter().flatten().collect::<Vec<_>>().join("   "),
+                        loaded: loaded == Some(e.path.as_path()),
+                        art: b.art(&e.path),
+                    }
+                }
+            })
+            .collect();
+        let library = b.source() == Source::Library;
+        let top = if library {
+            "LIBRARY".to_string()
+        } else {
+            b.root()
+                .file_name()
+                .map_or("USB".into(), |n| n.to_string_lossy().into_owned())
+        };
+        let mut header = std::iter::once(top.as_str())
+            .chain(b.trail())
+            .collect::<Vec<_>>()
+            .join("  /  ");
+        let query = b.search_query();
+        if let Some(q) = query {
+            header = format!("{header}:  {q}{}", if self.keyboard { "▏" } else { "" });
+        }
+        let empty = match (&l.error, l.entries.is_empty()) {
+            (Some(e), _) => Some(format!("Can't read this folder: {e}")),
+            (None, true) if query.is_some() => Some("Nothing matches".into()),
+            (None, true) if library => Some(
+                "No tracks in the library yet: scan the USB, or load tracks from its folders"
+                    .into(),
+            ),
+            (None, true) => Some("No folders or tracks here".into()),
+            _ => None,
+        };
+        let scan = self
+            .player
+            .scan_progress()
+            .filter(|&(done, total)| done < total || total == 0);
+        let side = self.side.then(|| self.info_view(b, library)).flatten();
+        Some(BrowseView {
+            side,
+            info: None,
+            header,
+            at_root: b.at_root(),
+            library,
+            sort: b.sort().label(),
+            searching: query.is_some(),
+            keyboard: self.keyboard && query.is_some(),
+            scan,
+            can_scan: self.player.listing().is_some(),
+            unanalysed: if library { self.unanalysed_count() } else { 0 },
+            analyzing: self
+                .player
+                .batch_progress()
+                .map(|p| (p.done, p.total, p.stopping)),
+            ask_scan: self.ask_scan,
+            rows,
+            selected: l.cursor.checked_sub(l.top).filter(|&r| r < ROWS),
+            first: l.top,
+            total: l.entries.len(),
+            empty,
+            has_tracks: l.entries.iter().any(|e| e.kind == Kind::Track),
+        })
+    }
+
+    /// The info panel's view of the selected entry.
+    fn info_view(&self, b: &Browser, library: bool) -> Option<InfoView> {
+        let l = b.level();
+        let e = l.selected()?;
+        let source = if library { "LIBRARY" } else { "USB" };
+        let position = format!("TRACK {:03}/{:03}", l.cursor + 1, l.entries.len());
+        if e.kind == Kind::Folder {
+            return Some(InfoView {
+                source,
+                position,
+                folder: true,
+                fields: vec![("FOLDER", e.name.clone())],
+                ..InfoView::default()
+            });
+        }
+        let tags = b.info(&e.path).unwrap_or_default();
+        Some(InfoView {
+            source,
+            position,
+            folder: false,
+            fields: info_fields(&e.path, &tags),
+            rating: tags.rating,
+            // The list's thumbnail stands in until the large picture is read.
+            art: b.large_art(&e.path).unwrap_or_else(|| b.art(&e.path)),
+            comment: tags.comment.clone(),
+            loaded: self.player.loaded().map(|d| d.file()) == Some(e.path.as_path()),
+        })
+    }
+
+    /// The INFO screen's view: the loaded track, from its own tags, the library's listing
+    /// and the analysis (ours win).
+    fn info_screen_view(&self) -> BrowseView {
+        let loaded = self.player.loaded();
+        let info = match (loaded, &self.loaded_tags) {
+            (Some(d), Some(lt)) => {
+                let path = d.file();
+                let mut tags = self
+                    .browser
+                    .as_ref()
+                    .and_then(|b| b.info(path))
+                    .unwrap_or_else(|| lt.tags.clone());
+                if let Some(a) = &d.analysed {
+                    tags.bpm = a.bpm.or(tags.bpm);
+                    tags.key = a.key.clone().or(tags.key);
+                }
+                tags.duration = tags.duration.or(lt.tags.duration);
+                tags.comment = tags.comment.or_else(|| lt.tags.comment.clone());
+                InfoView {
+                    source: "USB",
+                    position: "ON DECK".into(),
+                    folder: false,
+                    fields: info_fields(path, &tags),
+                    rating: tags.rating,
+                    art: lt.art.clone(),
+                    comment: tags.comment.clone(),
+                    loaded: true,
+                }
+            }
+            _ => InfoView {
+                source: "USB",
+                position: "NO TRACK".into(),
+                fields: vec![("TITLE", "No track loaded".into())],
+                ..InfoView::default()
+            },
+        };
+        BrowseView {
+            info: Some(info),
+            ..BrowseView::default()
+        }
+    }
+
+    /// The shown rows' tags have all been read, and a scan asked for is done (for
+    /// screenshots).
+    fn browse_settled(&self) -> bool {
+        let Some(b) = &self.browser else {
+            return true;
+        };
+        if self.pending_search.is_some()
+            || (b.source() == Source::Library && self.player.listing().is_none())
+            || self
+                .player
+                .scan_progress()
+                .is_some_and(|(done, total)| done < total || total == 0)
+        {
+            return false;
+        }
+        let l = b.level();
+        let info_ready = !self.side
+            || l.selected()
+                .is_none_or(|e| e.kind == Kind::Folder || b.large_art(&e.path).is_some());
+        info_ready
+            && l.entries
+                .iter()
+                .skip(l.top)
+                .take(ROWS)
+                .all(|e| e.kind == Kind::Folder || b.is_read(&e.path))
     }
 
     fn seek_overview(&mut self, x: f32) {
@@ -600,11 +1249,67 @@ impl App {
             return;
         }
         let sr = f64::from(self.player.format.sample_rate);
+        let browsing = self.screen == ScreenKind::Browse;
+        if browsing && self.ask_scan {
+            match &key.logical_key {
+                Key::Named(NamedKey::Enter) => self.answer_scan(true),
+                Key::Named(NamedKey::Escape) => self.answer_scan(false),
+                _ => {}
+            }
+            return;
+        }
+        // While the search keyboard is up, the keyboard types.
+        if browsing && self.keyboard {
+            match &key.logical_key {
+                Key::Named(NamedKey::Backspace) => return self.type_char(browse::BACKSPACE),
+                Key::Named(NamedKey::Space) => return self.type_char(' '),
+                Key::Character(c) => {
+                    for ch in c.chars() {
+                        self.type_char(ch);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.screen == ScreenKind::Info
+            && let Key::Character(c) = &key.logical_key
+            && c == "i"
+        {
+            return self.toggle_info();
+        }
+        if browsing && let Key::Character(c) = &key.logical_key {
+            match c.as_str() {
+                "/" => return self.search(),
+                "i" => return self.toggle_info(),
+                _ => {}
+            }
+        }
+        let nav = match &key.logical_key {
+            Key::Named(NamedKey::ArrowUp) if browsing => Some(Nav::Up),
+            Key::Named(NamedKey::ArrowDown) if browsing => Some(Nav::Down),
+            Key::Named(NamedKey::Enter) if browsing => Some(Nav::Push),
+            Key::Named(NamedKey::Escape | NamedKey::Backspace) => Some(Nav::Back),
+            Key::Named(NamedKey::Tab) => {
+                if self.browser.is_some() {
+                    self.screen = if browsing {
+                        ScreenKind::Main
+                    } else {
+                        ScreenKind::Browse
+                    };
+                }
+                return;
+            }
+            _ => None,
+        };
+        if let Some(n) = nav {
+            self.nav(n);
+            return;
+        }
         let cmd = match &key.logical_key {
             Key::Named(NamedKey::Space) => DeckCommand::TogglePlay,
             Key::Named(NamedKey::ArrowLeft) => DeckCommand::SeekRelative(-SEEK_SECONDS * sr),
             Key::Named(NamedKey::ArrowRight) => DeckCommand::SeekRelative(SEEK_SECONDS * sr),
-            Key::Named(NamedKey::Escape) => return event_loop.exit(),
             Key::Character(c) => {
                 let c = c.as_str();
                 match c {
@@ -619,8 +1324,8 @@ impl App {
                     }
                     "p" => {
                         self.screen = match self.screen {
-                            ScreenKind::Main => ScreenKind::Performance,
                             ScreenKind::Performance => ScreenKind::Main,
+                            _ => ScreenKind::Performance,
                         };
                         return;
                     }
@@ -716,8 +1421,10 @@ impl App {
                 .record_playhead((position - p - expected) / sr * 1e3);
         }
         self.last_shown = Some((now, position));
-        if !self.wave_complete {
-            self.wave_complete = self.player.waveform().update(&mut self.wave);
+        if !self.wave_complete
+            && let Some(d) = self.player.loaded()
+        {
+            self.wave_complete = d.waveform().update(&mut self.wave);
         }
         // Auto gain over what has decoded so far; it settles as the track fills in.
         let n = self.wave.len();
@@ -726,8 +1433,39 @@ impl App {
         }
         let mut wave_style = self.theme.waveform.style;
         wave_style.track_gain = self.track_gain.0;
-        let analysed = self.player.analysed.as_ref();
-        let source = &self.player.source;
+        let mut pending_analyze = false;
+        if let Some(b) = self.browser.as_mut() {
+            if let Some(l) = self.player.listing() {
+                b.set_listing(Arc::clone(l));
+                if std::mem::take(&mut self.pending_analyze_all) {
+                    pending_analyze = true;
+                }
+                // `--search` starts once the library has said what it has.
+                if let Some(q) = self.pending_search.take() {
+                    b.search_begin();
+                    b.set_query(&q);
+                }
+            }
+            b.refresh();
+        }
+        if pending_analyze {
+            self.analyze_all();
+        }
+        // Judged before the scene is built, so a screenshot shows everything it waited for.
+        let ready =
+            self.player.loaded().is_none_or(|d| {
+                d.analysed.is_some() && d.source.is_complete() && self.wave_complete
+            }) && (self.screen != ScreenKind::Browse || self.browse_settled());
+        let loaded = self.player.loaded();
+        let analysed = loaded.and_then(|d| d.analysed.as_ref());
+        let loaded_fraction = loaded.map_or(0.0, |d| {
+            d.source.chunks_ready() as f64 / d.source.chunk_count().max(1) as f64
+        });
+        let browse = match self.screen {
+            ScreenKind::Browse => self.browse_view(),
+            ScreenKind::Info => Some(self.info_screen_view()),
+            _ => None,
+        };
         let view = View {
             title: &self.title,
             key: analysed.and_then(|a| a.key.as_deref()),
@@ -735,7 +1473,7 @@ impl App {
             position,
             shadow_position: st.shadow_position.load(),
             length: st.length.load(),
-            loaded_fraction: source.chunks_ready() as f64 / source.chunk_count().max(1) as f64,
+            loaded_fraction,
             rate,
             slip_enabled: st.slip_enabled.load(Ordering::Relaxed),
             slip_active: st.slip_active.load(Ordering::Relaxed),
@@ -747,7 +1485,7 @@ impl App {
             loop_start: st.loop_start.load(),
             loop_end: st.loop_end.load(),
             grid: analysed.and_then(|a| a.grid.as_deref()),
-            analysing: analysed.is_none(),
+            analysing: loaded.is_some() && analysed.is_none(),
             zoom_beats: ZOOM_STEPS[self.zoom],
             pressed: self.pressed,
             debug: self.debug.then_some(self.overlay.as_str()),
@@ -759,6 +1497,7 @@ impl App {
                 Persistence::Pending => SaveState::Saving,
                 Persistence::Unsaved { .. } => SaveState::Unsaved,
             }),
+            browse: browse.as_ref(),
             wave: (!self.wave.is_empty()).then_some(screen::Wave {
                 entries: &self.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),
@@ -787,18 +1526,15 @@ impl App {
         let Some(gfx) = &mut self.gfx else {
             return false;
         };
-        if let Some(path) = &self.screenshot {
-            let ready = self.player.analysed.is_some()
-                && self.player.source.is_complete()
-                && self.wave_complete;
-            if ready || self.started.elapsed() > Duration::from_secs(30) {
-                let (w, h, pixels) = gfx.screenshot(&self.scene, shell);
-                match write_png(path, w, h, &pixels) {
-                    Ok(()) => eprintln!("wrote {}", path.display()),
-                    Err(e) => self.error = Some(format!("screenshot: {e}")),
-                }
-                return true;
+        if let Some(path) = &self.screenshot
+            && (ready || self.started.elapsed() > Duration::from_secs(30))
+        {
+            let (w, h, pixels) = gfx.screenshot(&self.scene, shell);
+            match write_png(path, w, h, &pixels) {
+                Ok(()) => eprintln!("wrote {}", path.display()),
+                Err(e) => self.error = Some(format!("screenshot: {e}")),
             }
+            return true;
         }
         if let Some(timing) = gfx.render(&self.scene, shell) {
             self.stats.record(now, build, timing);
@@ -814,6 +1550,46 @@ impl App {
         }
         self.run_for.is_some_and(|d| self.started.elapsed() >= d)
     }
+}
+
+/// The info panels' fields of a track.
+fn info_fields(path: &Path, tags: &engined::browse::Tags) -> Vec<(&'static str, String)> {
+    let or_dash = |v: Option<String>| v.unwrap_or_else(|| "–".into());
+    vec![
+        ("TITLE", track_title(path, Some(tags))),
+        ("ARTIST", or_dash(tags.artist.clone())),
+        ("ALBUM", or_dash(tags.album.clone())),
+        ("TIME", or_dash(tags.duration.map(browse::length))),
+        ("BPM", or_dash(tags.bpm.map(|b| format!("{b:.1}")))),
+        ("KEY", or_dash(tags.key.clone())),
+        ("GENRE", or_dash(tags.genre.clone())),
+    ]
+}
+
+/// The loaded track's tags and artwork, read once when it loads (the INFO screen).
+struct LoadedTags {
+    tags: engined::browse::Tags,
+    art: Option<Arc<engined::browse::Thumb>>,
+}
+
+impl LoadedTags {
+    fn read(path: &Path) -> Self {
+        let mut tags = engined::browse::read_tags(path).unwrap_or_default();
+        let art = tags
+            .artwork
+            .take()
+            .and_then(|a| engined::browse::thumbnail(&a.data, engined::browse::LARGE_SIZE))
+            .map(Arc::new);
+        Self { tags, art }
+    }
+}
+
+/// A track's title: its tag, else the file name without extension.
+fn track_title(path: &Path, tags: Option<&engined::browse::Tags>) -> String {
+    tags.and_then(|t| t.title.clone()).unwrap_or_else(|| {
+        path.file_stem()
+            .map_or("[TRACK]".into(), |s| s.to_string_lossy().into_owned())
+    })
 }
 
 /// The digit keys 1–8 (by position, so shift and layout do not matter) are hot cues A–H.
@@ -912,6 +1688,18 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Rows: a notch is one; a trackpad scrolls a row per row height of travel.
+                self.wheel -= match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    MouseScrollDelta::PixelDelta(p) => p.y / f64::from(ROW_H),
+                };
+                let rows = self.wheel.trunc();
+                if rows != 0.0 {
+                    self.wheel -= rows;
+                    self.wheel(self.cursor.0, self.cursor.1, rows as i32);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => self.key(event_loop, &event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);

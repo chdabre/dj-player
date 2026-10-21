@@ -127,7 +127,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut player = Player::open_with(&backend, &args.request, &file, args.options)?;
-    let (format, info) = (player.format, &player.info);
+    let format = player.format;
+    let loaded = player.loaded().expect("just loaded");
+    let (info, source) = (loaded.info.clone(), Arc::clone(&loaded.source));
     println!(
         "{} output: {} Hz, {} channels, buffer {}",
         backend.host_name(),
@@ -163,7 +165,6 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state = Arc::clone(player.state());
-    let source = Arc::clone(&player.source);
     let mut controls = Controls::new(format.sample_rate);
     let mut next_report = Instant::now() + Duration::from_secs(1);
     loop {

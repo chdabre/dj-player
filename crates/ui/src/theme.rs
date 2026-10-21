@@ -77,6 +77,10 @@ pub struct Colors {
     pub danger_text: Rgba,
     /// Behind the timing overlay.
     pub overlay: Rgba,
+    /// The browse list: the cursor's row, the rule under each row, folder icons.
+    pub row_selected: Rgba,
+    pub row_rule: Rgba,
+    pub folder: Rgba,
 }
 
 /// Font sizes by role, in design pixels (Barlow Condensed).
@@ -114,6 +118,8 @@ pub struct TypeScale {
     pub badge: f32,
     /// A unit after a readout (%).
     pub unit: f32,
+    /// Browse list rows and their header.
+    pub row: f32,
 }
 
 /// Corner radii and line widths.
@@ -224,6 +230,9 @@ impl Theme {
                 danger_fill: Rgba::hex(0x3a1a20),
                 danger_text: Rgba::hex(0xf0a0ab),
                 overlay: Rgba::hex(0x000000).alpha(0.75),
+                row_selected: accent.alpha(0.09),
+                row_rule: Rgba::hex(0x2c2e33),
+                folder: Rgba::hex(0x7a7e84),
             },
             font: TypeScale {
                 line_height: 1.2,
@@ -244,6 +253,7 @@ impl Theme {
                 counter: 27.0,
                 badge: 19.0,
                 unit: 22.0,
+                row: 20.0,
             },
             shape: Shape {
                 section_radius: 6.0,
@@ -309,6 +319,8 @@ mod tests {
             ("screen.rs", include_str!("screen.rs")),
             ("main.rs", include_str!("main.rs")),
             ("gfx.rs", include_str!("gfx.rs")),
+            ("perform.rs", include_str!("perform.rs")),
+            ("browse.rs", include_str!("browse.rs")),
         ] {
             let code = src.split("#[cfg(test)]").next().unwrap_or(src);
             for pattern in ["Rgba::hex(", "Rgba(["] {

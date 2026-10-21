@@ -30,6 +30,7 @@ hound = "3.5"
 criterion = "0.8"
 crossterm = "0.29"
 png = "0.18"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 blake3 = { version = "1", default-features = false, features = ["std"] }
 sha2 = "0.10"
 getrandom = "0.3"

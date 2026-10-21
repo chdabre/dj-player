@@ -48,6 +48,22 @@ pub enum Target {
     Pad(u8),
     /// One of the beat loop lengths ([`crate::perform::BEAT_LOOPS`] index).
     BeatLoop(u8),
+    // Browse screen.
+    /// A shown row of the list (0 = top).
+    Row(u8),
+    /// The list header: up a level.
+    BrowseBack,
+    /// Header chips: the sort order, search, scan the stick.
+    Sort,
+    Search,
+    Scan,
+    /// ANALYZE ALL (or STOP while it runs).
+    AnalyzeAll,
+    /// The "scan this stick?" question's answers.
+    ScanYes,
+    ScanNo,
+    /// A key of the on-screen keyboard ([`crate::browse::KEYS`] index).
+    Key(u8),
 }
 
 /// Which screen is up.
@@ -56,6 +72,9 @@ pub enum ScreenKind {
     #[default]
     Main,
     Performance,
+    Browse,
+    /// INFO: the loaded track's details.
+    Info,
 }
 
 /// What the performance pads do.
@@ -133,6 +152,8 @@ pub struct View<'a> {
     pub perf: PerfState,
     /// Whether the library is saving edits; `None` until it says.
     pub save: Option<SaveState>,
+    /// The browse screen's list, when there is something to browse.
+    pub browse: Option<&'a crate::browse::BrowseView>,
 }
 
 /// What the status band says about the library.
@@ -194,6 +215,7 @@ impl Ui<'_> {
             weight,
             color,
             align,
+            max_width: None,
         });
     }
 
@@ -216,6 +238,7 @@ impl Ui<'_> {
             weight: Weight::SemiBold,
             color,
             align,
+            max_width: None,
         });
     }
 
@@ -381,6 +404,13 @@ pub fn build(
         debug_line(&mut ui, view);
         return ui.hits;
     }
+    if matches!(view.screen, ScreenKind::Browse | ScreenKind::Info)
+        && let Some(b) = view.browse
+    {
+        // No timing overlay here: it would cover the list.
+        crate::browse::build(&mut ui, view, b, overview);
+        return ui.hits;
+    }
     // Frame: rail, tab row, info, status band, bottom strip, column dividers.
     ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
     ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
@@ -393,8 +423,8 @@ pub fn build(
     ui.scene.fill(822.0, 400.0, 1.0, 89.0, t.color.section_edge);
     ui.scene.fill(822.0, 502.0, 1.0, 90.0, t.color.section_edge);
 
-    rail(&mut ui, view);
-    tabs(&mut ui);
+    rail(&mut ui, view, Target::Usb);
+    tabs(&mut ui, None);
     info(&mut ui, view);
     status(&mut ui, view);
     bottom(&mut ui, view, overview);
@@ -446,16 +476,23 @@ fn debug_line(ui: &mut Ui, view: &View) {
     }
 }
 
-fn rail(ui: &mut Ui, v: &View) {
+/// The rail with the source `lit` (LIBRARY or USB) on.
+pub(crate) fn rail(ui: &mut Ui, v: &View, lit: Target) {
     ui.button(
         Target::Library,
         (6.0, 16.0, 88.0, 117.0),
         "LIBRARY",
         None,
-        false,
+        lit == Target::Library,
     );
     ui.button(Target::Link, (6.0, 138.0, 88.0, 124.0), "LINK", None, false);
-    ui.button(Target::Usb, (6.0, 267.0, 88.0, 117.0), "USB", None, true);
+    ui.button(
+        Target::Usb,
+        (6.0, 267.0, 88.0, 117.0),
+        "USB",
+        None,
+        lit == Target::Usb,
+    );
     rail_bottom(ui, v);
 }
 
@@ -504,7 +541,8 @@ pub(crate) fn rail_bottom(ui: &mut Ui, v: &View) {
     }
 }
 
-fn tabs(ui: &mut Ui) {
+/// The tab row, with `active` (a tab's target) lit.
+pub(crate) fn tabs(ui: &mut Ui, active: Option<Target>) {
     let y = 7.0;
     let h = 54.0;
     ui.button(
@@ -512,35 +550,35 @@ fn tabs(ui: &mut Ui) {
         (113.0, y, 171.0, h),
         "BROWSE",
         Some("– SEARCH"),
-        false,
+        active == Some(Target::Browse),
     );
     ui.button(
         Target::TagList,
         (289.0, y, 171.0, h),
         "TAG LIST",
         None,
-        false,
+        active == Some(Target::TagList),
     );
     ui.button(
         Target::Info,
         (464.0, y, 171.0, h),
         "INFO",
         Some("– LINK INFO"),
-        false,
+        active == Some(Target::Info),
     );
     ui.button(
         Target::Menu,
         (640.0, y, 171.0, h),
         "MENU",
         Some("– UTILITY"),
-        false,
+        active == Some(Target::Menu),
     );
     ui.button(
         Target::Perform,
         (841.0, y, 175.0, h),
         "PERFORM",
         None,
-        false,
+        active == Some(Target::Perform),
     );
 }
 
@@ -1279,6 +1317,210 @@ mod tests {
             screen: ScreenKind::Main,
             perf: PerfState::default(),
             save: Some(SaveState::Unsaved),
+            browse: None,
+        }
+    }
+
+    #[test]
+    fn browse_screen_fits_and_targets_do_not_overlap() {
+        use crate::browse::{BrowseView, InfoView, KEYS, ROWS, Row, RowKind};
+        let rows: Vec<Row> = (0..ROWS)
+            .map(|i| Row {
+                kind: if i < 2 {
+                    RowKind::Folder
+                } else {
+                    RowKind::Track
+                },
+                title: "A title far too long for its column ".repeat(4),
+                artist: "Artist".into(),
+                detail: "128.0   8A   5:12".into(),
+                loaded: i == 3,
+                art: None,
+            })
+            .collect();
+        let base = BrowseView {
+            header: "DJ  /  UKG".into(),
+            at_root: false,
+            sort: "TITLE",
+            rows,
+            selected: Some(3),
+            first: 10,
+            total: 40,
+            has_tracks: true,
+            ..BrowseView::default()
+        };
+        let variants = [
+            base.clone(),
+            BrowseView {
+                library: true,
+                can_scan: true,
+                ..base.clone()
+            },
+            BrowseView {
+                library: true,
+                can_scan: true,
+                scan: Some((120, 586)),
+                ..base.clone()
+            },
+            BrowseView {
+                library: true,
+                can_scan: true,
+                unanalysed: 12,
+                ..base.clone()
+            },
+            BrowseView {
+                library: true,
+                can_scan: true,
+                unanalysed: 12,
+                analyzing: Some((3, 12, false)),
+                ..base.clone()
+            },
+            BrowseView {
+                searching: true,
+                keyboard: true,
+                ..base.clone()
+            },
+            BrowseView {
+                has_tracks: false,
+                ..base.clone()
+            },
+            BrowseView {
+                ask_scan: true,
+                at_root: true,
+                ..base.clone()
+            },
+            BrowseView {
+                side: Some(InfoView {
+                    source: "USB",
+                    fields: vec![
+                        ("TITLE", "A title far too long for its column ".repeat(4)),
+                        ("ARTIST", "Artist".into()),
+                        ("GENRE", "uk garage".into()),
+                    ],
+                    rating: Some(3),
+                    comment: Some("word ".repeat(80)),
+                    ..InfoView::default()
+                }),
+                ..base.clone()
+            },
+            BrowseView {
+                library: true,
+                info: Some(InfoView {
+                    source: "USB",
+                    position: "TRACK 004/040".into(),
+                    fields: vec![
+                        ("TITLE", "A title far too long for its column ".repeat(4)),
+                        ("ARTIST", "Artist".into()),
+                        ("ALBUM", "Album".into()),
+                        ("TIME", "5:12".into()),
+                        ("BPM", "128.0".into()),
+                        ("KEY", "8A".into()),
+                    ],
+                    rating: Some(3),
+                    comment: Some("word ".repeat(80)),
+                    ..InfoView::default()
+                }),
+                ..base.clone()
+            },
+        ];
+        for b in &variants {
+            let mut v = view(None);
+            v.screen = ScreenKind::Browse;
+            v.browse = Some(b);
+            let mut scene = Scene::default();
+            let hits = build(
+                &v,
+                &Theme::default(),
+                &mut OverviewCache::default(),
+                &mut scene,
+            );
+            for r in &scene.rects {
+                assert!(
+                    r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
+                    "{r:?}"
+                );
+            }
+            for (i, a) in hits.iter().enumerate() {
+                for c in &hits[i + 1..] {
+                    let overlap =
+                        a.x < c.x + c.w && c.x < a.x + a.w && a.y < c.y + c.h && c.y < a.y + a.h;
+                    assert!(!overlap, "{:?} overlaps {:?}", a.target, c.target);
+                }
+            }
+            for h in hits.iter().filter(|h| h.target != Target::Overview) {
+                assert!(
+                    h.w >= 36.0 && h.h >= 36.0,
+                    "{:?} is {}×{}",
+                    h.target,
+                    h.w,
+                    h.h
+                );
+            }
+            let has = |t: Target| hits.iter().any(|h| h.target == t);
+            let rows = hits
+                .iter()
+                .filter(|h| matches!(h.target, Target::Row(_)))
+                .count();
+            let listing = b.info.is_none();
+            assert_eq!(rows, if b.ask_scan || !listing { 0 } else { ROWS });
+            assert_eq!(has(Target::BrowseBack), !b.at_root && listing);
+            assert_eq!(has(Target::Scan), b.library && b.scan.is_none() && listing);
+            assert_eq!(has(Target::ScanYes), b.ask_scan);
+            let analyze = listing
+                && b.library
+                && b.scan.is_none()
+                && (b.unanalysed > 0 || b.analyzing.is_some());
+            assert_eq!(has(Target::AnalyzeAll), analyze);
+            if b.analyzing.is_some() {
+                assert!(scene.texts.iter().any(|t| t.text == "ANALYZING 3 / 12"));
+            }
+            let keys = hits
+                .iter()
+                .filter(|h| matches!(h.target, Target::Key(_)))
+                .count();
+            let all_keys: usize = KEYS.iter().map(|r| r.len()).sum();
+            assert_eq!(keys, if b.keyboard { all_keys } else { 0 });
+            assert_eq!(
+                has(Target::Overview),
+                !b.keyboard,
+                "the keyboard covers the overview"
+            );
+            // The title column's divider: only with tracks (or beside the info panel).
+            let divider = scene
+                .rects
+                .iter()
+                .any(|r| r.x == 559.0 && r.y == 103.0 && r.w == 1.0);
+            if b.info.is_none() && !b.ask_scan {
+                assert_eq!(divider, b.has_tracks || b.side.is_some());
+            }
+            if b.side.is_some() {
+                // The list keeps its jacket and title columns; the panel is beside it.
+                for h in hits.iter().filter(|h| matches!(h.target, Target::Row(_))) {
+                    assert!(h.x + h.w <= 560.0, "{h:?}");
+                }
+                assert!(!scene.texts.iter().any(|t| t.text == "128.0   8A   5:12"));
+                assert!(scene.texts.iter().any(|t| t.text == "★★★☆☆"));
+                assert!(scene.texts.iter().any(|t| t.text == "uk garage"));
+            }
+            if let Some(info) = &b.info {
+                let stars = scene.texts.iter().any(|t| t.text == "★★★☆☆");
+                assert!(stars, "the rating shows as stars");
+                let title = &info.fields[0].1;
+                assert!(
+                    scene
+                        .texts
+                        .iter()
+                        .any(|t| &t.text == title && t.max_width.is_some())
+                );
+            }
+            // Row text is ellipsized to its column.
+            assert!(
+                scene
+                    .texts
+                    .iter()
+                    .filter(|t| t.text.starts_with("A title"))
+                    .all(|t| t.max_width.is_some())
+            );
         }
     }
 

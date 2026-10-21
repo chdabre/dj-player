@@ -10,6 +10,8 @@
 //! new waveforms, analysis results and cue edits back, collects retired objects off the
 //! audio thread and reports loader and stream errors.
 
+pub mod batch;
+pub mod browse;
 pub mod persist;
 mod stored;
 
@@ -81,24 +83,83 @@ impl AutoCue {
 
 pub struct Player {
     pub format: StreamFormat,
-    pub info: engine_media::TrackInfo,
-    pub source: Arc<Source>,
     handle: EngineHandle,
     /// `None` only while dropping: the stream goes first, so the engine and its sources are
     /// dropped off the audio thread before the retire ring is drained.
     stream: Option<CpalStream>,
-    loader: Option<JoinHandle<Result<(), engine_media::LoadError>>>,
-    file: PathBuf,
     settings: engine_analysis::Settings,
+    library: Option<LibraryWorker>,
+    auto_cue: AutoCue,
+    persistence: Option<Persistence>,
+    /// The track on the deck, if one was loaded.
+    loaded: Option<LoadedTrack>,
+    /// Serial of the last load; library answers for earlier loads are stale.
+    loads: u64,
+    /// Serial of the last [`DeckCommand::SetCues`] sent, across tracks: the deck's applied
+    /// serial is compared against it.
+    cue_serial: u64,
+    /// The library's tracks, as last published.
+    listing: Option<Arc<persist::Listing>>,
+    /// The last scan's progress (done, total).
+    scan: Option<(usize, usize)>,
+    /// ANALYZE ALL under way, and how far it is.
+    batch: Option<batch::Batch>,
+    batch_progress: Option<BatchProgress>,
+    /// Set while the deck's own track decodes or analyses: the batch job waits.
+    deck_busy: Arc<AtomicBool>,
+}
+
+/// How far ANALYZE ALL is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchProgress {
+    /// Files finished (analysed or failed) of `total`.
+    pub done: usize,
+    pub total: usize,
+    pub failed: usize,
+    /// The file under way.
+    pub current: Option<String>,
+    /// Asked to stop; finishing the file under way.
+    pub stopping: bool,
+}
+
+/// The track on the deck: its source and decode, waveform, analysis and library record.
+pub struct LoadedTrack {
+    pub info: engine_media::TrackInfo,
+    pub source: Arc<Source>,
+    loader: Option<JoinHandle<Result<(), engine_media::LoadError>>>,
+    /// Stops the decode and the analysis when the track is replaced.
+    cancel: engine_media::Cancel,
+    file: PathBuf,
+    /// The load serial the library answers with.
+    serial: u64,
     /// Started once the library said what it has for the track.
     analysis: Option<Receiver<Result<Analysed, String>>>,
     /// The analysis result, once it arrived.
     pub analysed: Option<Analysed>,
     waveform: Arc<LiveWaveform>,
-    library: Option<LibraryWorker>,
     lib: LibState,
-    auto_cue: AutoCue,
-    persistence: Option<Persistence>,
+}
+
+impl Drop for LoadedTrack {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl LoadedTrack {
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// The track's waveform, growing while the track decodes (or the stored one).
+    pub fn waveform(&self) -> &Arc<LiveWaveform> {
+        &self.waveform
+    }
+
+    /// The track in its library, once the library found or made its record.
+    pub fn track(&self) -> Option<TrackRef> {
+        self.lib.track
+    }
 }
 
 /// What the player knows about the track's library record.
@@ -115,7 +176,7 @@ struct LibState {
     records: [Option<HotCue>; HOT_CUES],
     /// The waveform is stored, or was sent to be stored.
     waveform_stored: bool,
-    /// Memory cues in the record, once the library answered.
+    /// Memory cues in the record, once the library answered (0 if there is no record).
     memory_cues: Option<usize>,
     /// The load-time cue point is decided (a memory cue, the first sound, or none).
     cue_decided: bool,
@@ -137,32 +198,33 @@ impl Player {
         Self::open_with(backend, request, file, options)
     }
 
+    /// [`Player::start`], then [`Player::load`] `file`.
     pub fn open_with(
         backend: &CpalBackend,
         request: &StreamRequest,
         file: &Path,
         options: Options,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut player = Self::start(backend, request, options)?;
+        player.load(file)?;
+        Ok(player)
+    }
+
+    /// Open the output with an empty deck and start the library worker (it mounts on the
+    /// first load).
+    pub fn start(
+        backend: &CpalBackend,
+        request: &StreamRequest,
+        options: Options,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // The device decides the engine rate; tracks are resampled to it at load.
         let format = backend.format(request)?;
-        let waveform = Arc::new(LiveWaveform::default());
-        let tap = WaveTap::new(format.sample_rate, Arc::clone(&waveform))
-            .with_first_sound(options.auto_cue.threshold());
-        let loading = engine_media::load_file_tapped(file, format.sample_rate, Some(tap.boxed()))?;
-        waveform.set_timeline(Timeline {
-            // Our decoder trims gapless padding: entry 0 is the deck's frame 0.
-            origin: Origin::Trimmed,
-            start_trim: loading.info.start_trim,
-            file_rate: loading.info.file_sample_rate,
-        });
-        let source = Arc::clone(&loading.source);
-        let (mut engine, mut handle) = Engine::new(EngineConfig {
+        let (mut engine, handle) = Engine::new(EngineConfig {
             sample_rate: format.sample_rate,
             channels: format.channels,
             decks: 1,
         });
-        handle.send_deck(DECK, DeckCommand::Load(Arc::clone(&source)))?;
-        let library = LibraryWorker::spawn(options.library, file.to_path_buf()).ok();
+        let library = LibraryWorker::start(None, options.library).ok();
 
         let meter = Arc::clone(handle.load_meter());
         let ns_per_frame = 1e9 / f64::from(format.sample_rate);
@@ -173,27 +235,126 @@ impl Player {
             meter.record(busy, (frames as f64 * ns_per_frame) as u64);
         };
         let stream = backend.start(request, Box::new(callback))?;
-        let mut player = Self {
+        Ok(Self {
             format,
-            info: loading.info,
-            source,
             handle,
             stream: Some(stream),
-            loader: Some(loading.thread),
-            file: file.to_path_buf(),
             settings: options.settings,
+            library,
+            auto_cue: options.auto_cue,
+            persistence: None,
+            loaded: None,
+            loads: 0,
+            cue_serial: 0,
+            listing: None,
+            scan: None,
+            batch: None,
+            batch_progress: None,
+            deck_busy: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Load `file` onto the deck, replacing what is there (paused at the cue point once it
+    /// is known). The previous track's last cue edits go to the library first.
+    pub fn load(&mut self, file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let waveform = Arc::new(LiveWaveform::default());
+        let tap = WaveTap::new(self.format.sample_rate, Arc::clone(&waveform))
+            .with_first_sound(self.auto_cue.threshold());
+        let loading =
+            engine_media::load_file_tapped(file, self.format.sample_rate, Some(tap.boxed()))?;
+        waveform.set_timeline(Timeline {
+            // Our decoder trims gapless padding: entry 0 is the deck's frame 0.
+            origin: Origin::Trimmed,
+            start_trim: loading.info.start_trim,
+            file_rate: loading.info.file_sample_rate,
+        });
+        self.write_back_cues();
+        self.handle
+            .send_deck(DECK, DeckCommand::Load(Arc::clone(&loading.source)))?;
+        self.loads += 1;
+        if let Some(lib) = &self.library {
+            lib.open(self.loads, file.to_path_buf());
+        }
+        // Dropping the previous track stops its decode and analysis where they are.
+        self.loaded = Some(LoadedTrack {
+            info: loading.info,
+            source: loading.source,
+            loader: Some(loading.thread),
+            cancel: loading.cancel,
+            file: file.to_path_buf(),
+            serial: self.loads,
             analysis: None,
             analysed: None,
             waveform,
-            library,
             lib: LibState::default(),
-            auto_cue: options.auto_cue,
-            persistence: None,
-        };
-        if player.library.is_none() {
-            player.start_analysis(BTreeMap::new(), false);
+        });
+        if self.library.is_none() {
+            self.no_record();
         }
-        Ok(player)
+        Ok(())
+    }
+
+    /// The library's tracks by stored path ([`persist::stored_path`]), once it has said.
+    pub fn listing(&self) -> Option<&Arc<persist::Listing>> {
+        self.listing.as_ref()
+    }
+
+    /// Scan the stick: give every audio file under its root a record, with its tags.
+    pub fn scan(&mut self) {
+        if let Some(lib) = &self.library {
+            lib.scan();
+            self.scan.get_or_insert((0, 0));
+        }
+    }
+
+    /// ANALYZE ALL: analyse `files` for the library in a background job, one at a time, the
+    /// deck's own track first. False (and nothing started) without a library or while a
+    /// job runs.
+    pub fn analyze_all(&mut self, files: Vec<PathBuf>) -> bool {
+        if self.library.is_none() || self.batch.is_some() || files.is_empty() {
+            return false;
+        }
+        match batch::Batch::start(
+            files,
+            self.settings,
+            self.format.sample_rate,
+            Arc::clone(&self.deck_busy),
+        ) {
+            Ok(b) => {
+                self.batch_progress = Some(BatchProgress {
+                    total: b.total,
+                    ..BatchProgress::default()
+                });
+                self.batch = Some(b);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Stop ANALYZE ALL (the file under way is cancelled; what is done stays stored).
+    pub fn stop_analyze_all(&mut self) {
+        if let Some(b) = &self.batch {
+            b.stop();
+            if let Some(p) = self.batch_progress.as_mut() {
+                p.stopping = true;
+            }
+        }
+    }
+
+    /// How far ANALYZE ALL is, while it runs.
+    pub fn batch_progress(&self) -> Option<&BatchProgress> {
+        self.batch_progress.as_ref()
+    }
+
+    /// The scan's progress (files done, total) once one was asked for.
+    pub fn scan_progress(&self) -> Option<(usize, usize)> {
+        self.scan
+    }
+
+    /// The track on the deck, if any.
+    pub fn loaded(&self) -> Option<&LoadedTrack> {
+        self.loaded.as_ref()
     }
 
     /// Whether the library is saving this deck's edits; `None` until it has said.
@@ -209,11 +370,6 @@ impl Player {
         self.stream.as_ref().and_then(|s| s.buffer_frames())
     }
 
-    /// The track's waveform, growing while the track decodes (or the stored one).
-    pub fn waveform(&self) -> &Arc<LiveWaveform> {
-        &self.waveform
-    }
-
     pub fn state(&self) -> &Arc<DeckState> {
         self.handle.deck_state(DECK)
     }
@@ -224,7 +380,7 @@ impl Player {
 
     /// The loaded track in its library, once the library found or made its record.
     pub fn track(&self) -> Option<TrackRef> {
-        self.lib.track
+        self.loaded.as_ref().and_then(LoadedTrack::track)
     }
 
     /// Send a command to the deck; false if the command ring is full.
@@ -235,7 +391,7 @@ impl Player {
     /// MEMORY: store the active loop, else the cue point, as a memory cue in the library.
     /// Returns a line to show.
     pub fn memory(&mut self) -> String {
-        let (Some(t), Some(lib)) = (self.lib.track, &self.library) else {
+        let (Some(t), Some(lib)) = (self.track(), &self.library) else {
             return "no library record yet: memory not stored".into();
         };
         let st = self.handle.deck_state(DECK);
@@ -253,14 +409,27 @@ impl Player {
         line
     }
 
+    /// The loaded track has no library record (no library, or the file could not be read):
+    /// analyse from scratch, and nothing is stored.
+    fn no_record(&mut self) {
+        if let Some(d) = self.loaded.as_mut() {
+            d.lib.memory_cues.get_or_insert(0);
+        }
+        self.start_analysis(BTreeMap::new(), false);
+    }
+
     fn start_analysis(
         &mut self,
         cached: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
         audio_hash: bool,
     ) {
-        if self.analysis.is_none() {
-            self.analysis = Some(analyze_in_background(
-                self.file.clone(),
+        let Some(d) = self.loaded.as_mut() else {
+            return;
+        };
+        if d.analysis.is_none() {
+            d.analysis = Some(analyze_in_background(
+                d.file.clone(),
+                d.cancel.clone(),
                 self.format.sample_rate,
                 self.settings,
                 cached,
@@ -273,6 +442,9 @@ impl Player {
     /// (cues the DJ set before the library answered); the next [`Player::poll`] then writes
     /// those to the library, since they differ from what it gave.
     fn restore_cues(&mut self, record: &Track, fill_only: bool) -> bool {
+        let Some(d) = self.loaded.as_mut() else {
+            return false;
+        };
         let sr = f64::from(self.format.sample_rate);
         let mut hot = [None; HOT_CUES];
         for (slot, h) in hot.iter_mut().zip(&record.hot_cues) {
@@ -288,34 +460,45 @@ impl Player {
             }),
             fill_only,
         };
-        let serial = self.lib.serial + 1;
-        let sent = self.send(DeckCommand::SetCues {
-            source_id: self.source.id(),
-            serial,
-            cues,
-        });
+        let serial = self.cue_serial + 1;
+        let sent = self
+            .handle
+            .send_deck(
+                DECK,
+                DeckCommand::SetCues {
+                    source_id: d.source.id(),
+                    serial,
+                    cues,
+                },
+            )
+            .is_ok();
         if sent {
-            self.lib.serial = serial;
-            self.lib.restored = hot;
-            self.lib.known = hot;
-            self.lib.records = std::array::from_fn(|i| record.hot_cues.get(i).cloned().flatten());
+            self.cue_serial = serial;
+            d.lib.serial = serial;
+            d.lib.restored = hot;
+            d.lib.known = hot;
+            d.lib.records = std::array::from_fn(|i| record.hot_cues.get(i).cloned().flatten());
         }
         sent
     }
 
     fn on_loaded(&mut self, l: Loaded, lines: &mut Vec<String>) {
-        let first = self.lib.track.is_none();
-        self.lib.track = Some(l.track);
+        let Some(d) = self.loaded.as_mut().filter(|d| d.serial == l.serial) else {
+            return; // for a track no longer on the deck
+        };
+        let first = d.lib.track.is_none();
+        d.lib.track = Some(l.track);
         if first {
-            self.lib.memory_cues = Some(l.record.cues.len());
+            d.lib.memory_cues = Some(l.record.cues.len());
         }
         let hot = l.record.hot_cues.iter().flatten().count();
         let cues = l.record.cues.len();
         // The first restore only fills what the DJ hasn't set while the library was being
-        // read. On a merge, the merged record's cues replace the deck's only if the DJ has
-        // not edited them since they were restored.
-        let untouched = self.lib.known == self.lib.restored;
-        if (first || untouched) && (hot > 0 || cues > 0 || !first) {
+        // read (and, with nothing stored, gives the deck a serial to compare against). On a
+        // merge, the merged record's cues replace the deck's only if the DJ has not edited
+        // them since they were restored.
+        let untouched = d.lib.known == d.lib.restored;
+        if first || untouched {
             if !self.restore_cues(&l.record, first) {
                 lines.push("command ring full, stored cues dropped".into());
             } else if hot + cues > 0 {
@@ -323,20 +506,16 @@ impl Player {
                     "library: {hot} hot cues and {cues} memory cues restored"
                 ));
             }
-        } else if first {
-            // Nothing stored: the deck's (empty) cues are the library's.
-            self.lib.serial = self
-                .handle
-                .deck_state(DECK)
-                .cues_serial
-                .load(Ordering::Relaxed);
         }
         if first {
+            let Some(d) = self.loaded.as_mut() else {
+                return;
+            };
             if let Some(w) = l.waveform {
-                if self.waveform.set_stored(w) {
+                if d.waveform.set_stored(w) {
                     lines.push("library: waveform from the library".into());
                 }
-                self.lib.waveform_stored = true;
+                d.lib.waveform_stored = true;
             }
             let need_hash = !l.record.audio_hash.is_some_and(|a| a.is_current());
             self.start_analysis(l.analysis, need_hash);
@@ -344,41 +523,49 @@ impl Player {
     }
 
     /// The load-time cue point when the track has no memory cue: the first sound, with auto
-    /// cue on. Waits for the library's answer (a stored memory cue wins) unless there is no
-    /// library. Only fills: a cue point the DJ set meanwhile stays.
+    /// cue on. Waits for the library's answer (a stored memory cue wins). Only fills: a cue
+    /// point the DJ set meanwhile stays.
     fn apply_auto_cue(&mut self, lines: &mut Vec<String>) {
-        if self.lib.cue_decided {
+        let Some(d) = self.loaded.as_mut() else {
+            return;
+        };
+        if d.lib.cue_decided {
             return;
         }
-        let memory = match (self.library.is_some(), self.lib.memory_cues) {
-            (true, None) => return, // still waiting for the record
-            (_, Some(n)) => n,
-            (false, None) => 0,
+        let Some(memory) = d.lib.memory_cues else {
+            return; // still waiting for the record
         };
         if memory > 0 || self.auto_cue == AutoCue::Off {
-            self.lib.cue_decided = true;
+            d.lib.cue_decided = true;
             return;
         }
-        let Some(first) = self.waveform.first_sound() else {
+        let Some(first) = d.waveform.first_sound() else {
             return;
         };
-        self.lib.cue_decided = true;
+        d.lib.cue_decided = true;
         let Some(at) = first else {
             return; // silent all through: no cue point
         };
-        let serial = self.lib.serial + 1;
-        let sent = self.send(DeckCommand::SetCues {
-            source_id: self.source.id(),
-            serial,
-            cues: TrackCues {
-                cue: Some(at),
-                hot: [None; HOT_CUES],
-                stored_loop: None,
-                fill_only: true,
-            },
-        });
+        let serial = self.cue_serial + 1;
+        let sent = self
+            .handle
+            .send_deck(
+                DECK,
+                DeckCommand::SetCues {
+                    source_id: d.source.id(),
+                    serial,
+                    cues: TrackCues {
+                        cue: Some(at),
+                        hot: [None; HOT_CUES],
+                        stored_loop: None,
+                        fill_only: true,
+                    },
+                },
+            )
+            .is_ok();
         if sent {
-            self.lib.serial = serial;
+            self.cue_serial = serial;
+            d.lib.serial = serial;
             lines.push(format!(
                 "auto cue: first sound at {:.3} s",
                 at / f64::from(self.format.sample_rate)
@@ -390,11 +577,14 @@ impl Player {
 
     /// Write hot cue changes made on the deck to the library.
     fn write_back_cues(&mut self) {
-        let (Some(t), Some(lib)) = (self.lib.track, &self.library) else {
+        let (Some(d), Some(lib)) = (self.loaded.as_mut(), &self.library) else {
+            return;
+        };
+        let Some(t) = d.lib.track else {
             return;
         };
         let st = self.handle.deck_state(DECK);
-        if st.cues_serial.load(Ordering::Relaxed) != self.lib.serial {
+        if st.cues_serial.load(Ordering::Relaxed) != d.lib.serial {
             // The deck has not applied the stored cues yet.
             return;
         }
@@ -402,11 +592,11 @@ impl Player {
         for (slot, pos) in st.hot_cue_positions.iter().enumerate() {
             let p = pos.load();
             let now = (!p.is_nan()).then_some(p);
-            if now != self.lib.known[slot] {
-                self.lib.known[slot] = now;
+            if now != d.lib.known[slot] {
+                d.lib.known[slot] = now;
                 let cue = now.map(|f| {
                     let at = f / sr;
-                    match self.lib.records[slot].take() {
+                    match d.lib.records[slot].take() {
                         // Moved: the same cue at its new place. A loop end that would now
                         // come before the start no longer applies.
                         Some(old) => HotCue {
@@ -417,8 +607,63 @@ impl Player {
                         None => HotCue::at(at),
                     }
                 });
-                self.lib.records[slot] = cue.clone();
+                d.lib.records[slot] = cue.clone();
                 lib.edit(Edit::SetHotCue(t.track, slot, cue));
+            }
+        }
+    }
+
+    /// Pass the batch job's results to the library, and hold it while the deck is busy.
+    fn poll_batch(&mut self, lines: &mut Vec<String>) {
+        let busy = self
+            .loaded
+            .as_ref()
+            .is_some_and(|d| d.loader.is_some() || (d.analysis.is_some() && d.analysed.is_none()));
+        self.deck_busy.store(busy, Ordering::Relaxed);
+        let name = |p: &Path| {
+            p.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        };
+        while let Some(event) = self.batch.as_ref().and_then(batch::Batch::try_recv) {
+            let Some(progress) = self.batch_progress.as_mut() else {
+                break;
+            };
+            match event {
+                batch::BatchEvent::Started(_, file) => progress.current = Some(name(&file)),
+                batch::BatchEvent::Done(r) => {
+                    progress.done += 1;
+                    lines.push(format!(
+                        "analyze all {}/{}: {}: {}, key {}",
+                        progress.done,
+                        progress.total,
+                        name(&r.file),
+                        r.bpm.map_or("no tempo".into(), |b| format!("{b:.2} BPM")),
+                        r.key.as_deref().unwrap_or("?"),
+                    ));
+                    if let Some(lib) = &self.library {
+                        lib.store(*r);
+                    }
+                }
+                batch::BatchEvent::Failed(file, e) => {
+                    progress.done += 1;
+                    progress.failed += 1;
+                    lines.push(format!("analyze all: {}: {e}", name(&file)));
+                }
+                batch::BatchEvent::Finished { stopped } => {
+                    lines.push(format!(
+                        "analyze all {}: {} of {} done{}",
+                        if stopped { "stopped" } else { "finished" },
+                        progress.done - progress.failed,
+                        progress.total,
+                        if progress.failed > 0 {
+                            format!(", {} failed", progress.failed)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                    self.batch = None;
+                    self.batch_progress = None;
+                }
             }
         }
     }
@@ -430,6 +675,14 @@ impl Player {
             match reply {
                 Reply::Message(m) => lines.push(m),
                 Reply::Loaded(l) => self.on_loaded(*l, &mut lines),
+                Reply::Unrecorded { serial, reason } => {
+                    if self.loaded.as_ref().is_some_and(|d| d.serial == serial) {
+                        lines.push(format!(
+                            "library: {reason}; this track's edits are not stored"
+                        ));
+                        self.no_record();
+                    }
+                }
                 Reply::Failed(e) => {
                     lines.push(format!("library: {e}; nothing is stored"));
                     self.library = None;
@@ -437,48 +690,58 @@ impl Player {
                         edits: 0,
                         reason: e,
                     });
-                    self.start_analysis(BTreeMap::new(), false);
+                    self.no_record();
                 }
                 Reply::Status(p) => self.persistence = Some(p),
+                Reply::Listing(l) => self.listing = Some(l),
+                Reply::Scan { done, total } => self.scan = Some((done, total)),
             }
         }
-        if let Some(Ok(result)) = self.analysis.as_ref().map(Receiver::try_recv) {
+        if let Some(d) = self.loaded.as_mut()
+            && let Some(Ok(result)) = d.analysis.as_ref().map(Receiver::try_recv)
+        {
             match result {
                 Ok(mut done) => {
                     lines.push(done.summary.clone());
                     if let Some(grid) = &done.grid {
                         let cmd = DeckCommand::SetGrid {
-                            source_id: self.source.id(),
+                            source_id: d.source.id(),
                             grid: Arc::clone(grid),
                         };
-                        if !self.send(cmd) {
+                        if self.handle.send_deck(DECK, cmd).is_err() {
                             lines.push("command ring full, grid dropped".into());
                         }
                     }
-                    if let Some(lib) = &self.library {
+                    if let Some(lib) = &self.library
+                        && d.lib.track.is_some()
+                    {
                         lib.analysis(std::mem::take(&mut done.fresh));
+                        lib.analysed(done.bpm, done.key.clone());
                         if let Some(h) = done.audio_hash {
                             lib.audio_hash(h);
                         }
                     }
-                    self.analysed = Some(done);
+                    d.analysed = Some(done);
                 }
                 Err(e) => lines.push(format!("analysis: {e}")),
             }
         }
-        if !self.lib.waveform_stored
-            && self.lib.track.is_some()
+        if let Some(d) = self.loaded.as_mut()
+            && !d.lib.waveform_stored
+            && d.lib.track.is_some()
             && let Some(lib) = &self.library
-            && let Some(w) = self.waveform.finished()
+            && let Some(w) = d.waveform.finished()
         {
             lib.waveform(w);
-            self.lib.waveform_stored = true;
+            d.lib.waveform_stored = true;
         }
+        self.poll_batch(&mut lines);
         self.apply_auto_cue(&mut lines);
         self.write_back_cues();
         self.handle.collect_retired();
-        if self.loader.as_ref().is_some_and(|t| t.is_finished())
-            && let Some(Err(e)) = self.loader.take().and_then(|t| t.join().ok())
+        if let Some(d) = self.loaded.as_mut()
+            && d.loader.as_ref().is_some_and(|t| t.is_finished())
+            && let Some(Err(e)) = d.loader.take().and_then(|t| t.join().ok())
         {
             lines.push(format!("loader: {e} (playing what was decoded)"));
         }
@@ -682,6 +945,7 @@ pub struct Analysed {
 /// parameters still match. The result arrives on the returned channel.
 fn analyze_in_background(
     path: PathBuf,
+    cancel: engine_media::Cancel,
     engine_rate: u32,
     settings: engine_analysis::Settings,
     cached: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
@@ -691,7 +955,14 @@ fn analyze_in_background(
     let spawned = std::thread::Builder::new()
         .name("analysis".into())
         .spawn(move || {
-            let _ = tx.send(analyze(&path, engine_rate, settings, &cached, audio_hash));
+            let _ = tx.send(analyze(
+                &path,
+                &cancel,
+                engine_rate,
+                settings,
+                &cached,
+                audio_hash,
+            ));
         });
     if let Err(e) = spawned {
         // The sender is gone with the closure: the receiver just never yields.
@@ -702,6 +973,29 @@ fn analyze_in_background(
 
 fn analyze(
     path: &Path,
+    stop: &engine_media::Cancel,
+    engine_rate: u32,
+    settings: engine_analysis::Settings,
+    cached: &BTreeMap<String, (AnalysisRef, Vec<u8>)>,
+    want_audio_hash: bool,
+) -> Result<Analysed, String> {
+    analyze_with(
+        path,
+        &mut None,
+        stop,
+        engine_rate,
+        settings,
+        cached,
+        want_audio_hash,
+    )
+}
+
+/// [`analyze`], decoding into `audio` only if something has to be computed (or using what
+/// is there): the batch job passes it in and computes the waveform from it afterwards.
+fn analyze_with(
+    path: &Path,
+    audio: &mut Option<engine_analysis::TrackAudio>,
+    stop: &engine_media::Cancel,
     engine_rate: u32,
     settings: engine_analysis::Settings,
     cached: &BTreeMap<String, (AnalysisRef, Vec<u8>)>,
@@ -723,11 +1017,10 @@ fn analyze(
     analyzers.push(Box::new(engine_analysis::hpcpkey::HpcpKey::default()));
 
     // Decoded only if something has to be computed.
-    let mut audio = None;
     let load = || -> Result<engine_analysis::TrackAudio, String> {
-        engine_analysis::load(path).map_err(|e| e.to_string())
+        engine_analysis::load_until(path, stop).map_err(|e| e.to_string())
     };
-    let cancel = CancelFlag::new();
+    let cancel = CancelFlag::from_shared(stop.flag());
     let mut context: Vec<Analysis> = Vec::new();
     let mut fresh = Vec::new();
     let mut from_library = 0;
@@ -750,7 +1043,7 @@ fn analyze(
             }
             None => {
                 if audio.is_none() {
-                    audio = Some(load()?);
+                    *audio = Some(load()?);
                 }
                 let audio = audio.as_ref().expect("just loaded");
                 let r = a
@@ -769,7 +1062,7 @@ fn analyze(
     }
     let audio_hash = if want_audio_hash {
         if audio.is_none() {
-            audio = Some(load()?);
+            *audio = Some(load()?);
         }
         audio.as_ref().map(|a| AudioHash::of_pcm(&a.stereo))
     } else {
@@ -941,7 +1234,15 @@ mod tests {
         let path = dir.join("clicks.wav");
         clicks(&path);
         let settings = engine_analysis::Settings::default();
-        let first = analyze(&path, 48_000, settings, &BTreeMap::new(), true).unwrap();
+        let first = analyze(
+            &path,
+            &engine_media::Cancel::new(),
+            48_000,
+            settings,
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
         assert_eq!(first.from_library, 0);
         assert!(!first.fresh.is_empty());
         assert!(first.audio_hash.is_some());
@@ -963,7 +1264,15 @@ mod tests {
             .collect();
         // With every result stored and no audio hash wanted, the file is not even read.
         std::fs::remove_file(&path).unwrap();
-        let again = analyze(&path, 48_000, settings, &cached, false).unwrap();
+        let again = analyze(
+            &path,
+            &engine_media::Cancel::new(),
+            48_000,
+            settings,
+            &cached,
+            false,
+        )
+        .unwrap();
         assert_eq!(again.from_library, first.fresh.len());
         assert!(again.fresh.is_empty());
         assert_eq!(again.bpm, first.bpm);
@@ -978,7 +1287,17 @@ mod tests {
         for (r, _) in stale.values_mut() {
             r.version = "0.0.0-old".into();
         }
-        assert!(analyze(&path, 48_000, settings, &stale, false).is_err());
+        assert!(
+            analyze(
+                &path,
+                &engine_media::Cancel::new(),
+                48_000,
+                settings,
+                &stale,
+                false
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
