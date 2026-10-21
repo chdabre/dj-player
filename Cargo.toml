@@ -14,6 +14,7 @@ engine-media = { path = "crates/engine-media" }
 engine-io = { path = "crates/engine-io" }
 engine-stretch = { path = "crates/engine-stretch" }
 engine-analysis = { path = "crates/engine-analysis" }
+waveform = { path = "crates/waveform" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"
@@ -27,6 +28,7 @@ assert_no_alloc = "1.1"
 hound = "3.5"
 criterion = "0.8"
 crossterm = "0.29"
+png = "0.18"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

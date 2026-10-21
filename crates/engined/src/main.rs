@@ -12,15 +12,15 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
-use engine_core::{DeckCommand, DeckGrid, DeckState, Engine, EngineConfig, LoadMeter, Source};
-use engine_io::{AudioBackend, AudioStream, CpalBackend, StreamRequest};
+use engine_core::{DeckCommand, DeckState, LoadMeter, Source};
+use engine_io::{CpalBackend, StreamRequest};
+use engined::Player;
 
 /// Debug builds abort on any allocation inside `assert_no_alloc` scopes (the audio callback).
 #[cfg(debug_assertions)]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
-const DECK: usize = 0;
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
 
@@ -109,8 +109,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("no file given".into());
     };
 
-    // The device decides the engine rate; tracks are resampled to it at load.
-    let format = backend.format(&args.request)?;
+    let mut player = Player::open(&backend, &args.request, &file, args.settings)?;
+    let (format, info) = (player.format, &player.info);
     println!(
         "{} output: {} Hz, {} channels, buffer {}",
         backend.host_name(),
@@ -120,40 +120,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .buffer_frames
             .map_or("default".to_string(), |n| format!("{n} frames")),
     );
-
-    let loading = engine_media::load_file(&file, format.sample_rate)?;
     println!(
         "loading {} ({} Hz, {} ch{})",
         file.display(),
-        loading.info.file_sample_rate,
-        loading.info.file_channels,
-        if loading.info.file_sample_rate == format.sample_rate {
+        info.file_sample_rate,
+        info.file_channels,
+        if info.file_sample_rate == format.sample_rate {
             ""
         } else {
             ", resampling"
         },
     );
-    let source = Arc::clone(&loading.source);
-    let mut loader = Some(loading.thread);
-
-    let (mut engine, mut handle) = Engine::new(EngineConfig {
-        sample_rate: format.sample_rate,
-        channels: format.channels,
-        decks: 1,
-    });
-    handle.send_deck(DECK, DeckCommand::Load(Arc::clone(&source)))?;
-    let analysis = analyze_in_background(file.clone(), format.sample_rate, args.settings);
-
-    let meter = Arc::clone(handle.load_meter());
-    let ns_per_frame = 1e9 / f64::from(format.sample_rate);
-    let callback = move |out: &mut [f32], frames: usize| {
-        let start = Instant::now();
-        assert_no_alloc::assert_no_alloc(|| engine.process(out, frames));
-        let busy = start.elapsed().as_nanos() as u64;
-        meter.record(busy, (frames as f64 * ns_per_frame) as u64);
-    };
-    let stream = backend.start(&args.request, Box::new(callback))?;
-    println!("{}", stream.device_name());
+    println!("{}", player.device_name());
 
     let interactive = std::io::stdin().is_terminal() && terminal::enable_raw_mode().is_ok();
     let _raw = interactive.then_some(RawModeGuard);
@@ -164,10 +142,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         out("stdin is not a terminal: playing to the end without key control");
-        handle.send_deck(DECK, DeckCommand::Play)?;
+        player.send(DeckCommand::Play);
     }
 
-    let state = Arc::clone(handle.deck_state(DECK));
+    let state = Arc::clone(player.state());
+    let source = Arc::clone(&player.source);
     let mut controls = Controls::new(format.sample_rate);
     let mut next_report = Instant::now() + Duration::from_secs(1);
     loop {
@@ -179,14 +158,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 match controls.command(key) {
                     Action::Quit => break,
                     Action::Send(cmd) => {
-                        if handle.send_deck(DECK, cmd).is_err() {
+                        if !player.send(cmd) {
                             out("command ring full, key dropped");
                         }
                     }
                     Action::Tap(press, release) => {
-                        if handle.send_deck(DECK, press).is_err()
-                            || handle.send_deck(DECK, release).is_err()
-                        {
+                        if !player.send(press) || !player.send(release) {
                             out("command ring full, key dropped");
                         }
                     }
@@ -199,131 +176,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 && !state.playing.load(Ordering::Relaxed)
                 && state.position.load() > 0.0
             {
-                report(&state, handle.load_meter(), &source, format.sample_rate);
+                report(&state, player.load_meter(), &source, format.sample_rate);
                 break;
             }
         }
-        if let Ok(result) = analysis.try_recv() {
-            match result {
-                Ok(done) => {
-                    out(&done.summary);
-                    if let Some(grid) = done.grid {
-                        let cmd = DeckCommand::SetGrid {
-                            source_id: source.id(),
-                            grid,
-                        };
-                        if handle.send_deck(DECK, cmd).is_err() {
-                            out("command ring full, grid dropped");
-                        }
-                    }
-                }
-                Err(e) => out(&format!("analysis: {e}")),
-            }
-        }
-        handle.collect_retired();
-        if loader.as_ref().is_some_and(|t| t.is_finished())
-            && let Some(Err(e)) = loader.take().and_then(|t| t.join().ok())
-        {
-            out(&format!("loader: {e} (playing what was decoded)"));
-        }
-        for e in stream.take_errors() {
-            out(&format!("stream: {e}"));
+        for line in player.poll() {
+            out(&line);
         }
         if Instant::now() >= next_report {
             next_report += Duration::from_secs(1);
-            report(&state, handle.load_meter(), &source, format.sample_rate);
+            report(&state, player.load_meter(), &source, format.sample_rate);
         }
     }
-    // Stop the stream first: that drops the engine (and its sources) off the audio thread.
-    drop(stream);
-    handle.collect_retired();
     Ok(())
-}
-
-/// What the analysis thread hands back: the deck grid (engine frames) and a line to print.
-struct Analysed {
-    grid: Option<Arc<DeckGrid>>,
-    summary: String,
-}
-
-/// Analyse `path` on its own thread: tempo (TempoCNN, if `TEMPOCNN_MODEL` is set) refined by
-/// gridfit, the grid, and the key. The result arrives on the returned channel.
-fn analyze_in_background(
-    path: PathBuf,
-    engine_rate: u32,
-    settings: engine_analysis::Settings,
-) -> std::sync::mpsc::Receiver<Result<Analysed, String>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("analysis".into())
-        .spawn(move || {
-            let _ = tx.send(analyze(&path, engine_rate, settings));
-        });
-    if let Err(e) = spawned {
-        out(&format!("analysis thread: {e}"));
-    }
-    rx
-}
-
-fn analyze(
-    path: &std::path::Path,
-    engine_rate: u32,
-    settings: engine_analysis::Settings,
-) -> Result<Analysed, String> {
-    use engine_analysis::{Analysis, Analyzer, CancelFlag, FeatureSet, GridFit, GridFitConfig};
-    let started = Instant::now();
-    let audio = engine_analysis::load(path).map_err(|e| e.to_string())?;
-    let mut analyzers: Vec<Box<dyn Analyzer>> = Vec::new();
-    let mut hint = None;
-    if let Some(t) = engine_analysis::tempocnn::TempoCnn::from_env() {
-        analyzers.push(Box::new(t?.with_range(settings.bpm_range)));
-        hint = Some("tempocnn");
-    }
-    analyzers.push(Box::new(GridFit::new(GridFitConfig {
-        tempo_hint: hint,
-        bpm_range: settings.bpm_range,
-        ..GridFitConfig::default()
-    })));
-    analyzers.push(Box::new(engine_analysis::hpcpkey::HpcpKey::default()));
-    let results =
-        engine_analysis::run_all(&mut analyzers, &audio, FeatureSet::ALL, &CancelFlag::new())
-            .map_err(|e| e.to_string())?;
-    // Later analyzers refine earlier ones (gridfit's tempo over TempoCNN's).
-    let mut merged = Analysis::default();
-    for (_, r) in results {
-        let r = r.map_err(|e| e.to_string())?;
-        merged.tempo = r.tempo.or(merged.tempo);
-        merged.beatgrid = r.beatgrid.or(merged.beatgrid);
-        merged.key = r.key.or(merged.key);
-    }
-    let bpm = merged.tempo.as_ref().map(|t| t.value.bpm);
-    let grid = match (&merged.beatgrid, bpm) {
-        (Some(g), Some(bpm)) => DeckGrid::from_seconds(
-            g.value.beats.iter().map(|b| (b.time, b.bar_pos)),
-            bpm,
-            engine_rate,
-        )
-        .map(Arc::new),
-        _ => None,
-    };
-    let first_down = merged
-        .beatgrid
-        .as_ref()
-        .and_then(|g| g.value.beats.iter().find(|b| b.bar_pos == 1))
-        .map(|b| b.time);
-    let summary = format!(
-        "analysed in {:.1} s: {}, key {}, first downbeat {}{}",
-        started.elapsed().as_secs_f64(),
-        bpm.map_or("no tempo".into(), |b| format!("{b:.2} BPM")),
-        merged.key.map_or("?".into(), |k| k.value.to_string()),
-        first_down.map_or("?".into(), |t| format!("{t:.3} s")),
-        if hint.is_none() {
-            " (TEMPOCNN_MODEL not set: gridfit alone)"
-        } else {
-            ""
-        },
-    );
-    Ok(Analysed { grid, summary })
 }
 
 /// Print a line that also works in raw mode.
