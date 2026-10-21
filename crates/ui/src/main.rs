@@ -14,6 +14,7 @@ mod gfx;
 mod scene;
 mod screen;
 mod stats;
+mod theme;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,13 +37,15 @@ use crate::gfx::Gfx;
 use crate::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, Target, View};
 use crate::stats::FrameStats;
+use crate::theme::Theme;
 
 #[cfg(debug_assertions)]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] \
-                     [--at <seconds>] [--play] [--run-for <seconds>] [--screenshot <out.png>]";
+                     [--theme <name>] [--at <seconds>] [--play] [--run-for <seconds>] \
+                     [--screenshot <out.png>]";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
 const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
@@ -55,6 +58,7 @@ struct Args {
     at: Option<f64>,
     play: bool,
     run_for: Option<f64>,
+    theme: Theme,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
     let mut request = StreamRequest::default();
     let (mut fullscreen, mut screenshot, mut at) = (false, None, None);
     let (mut play, mut run_for) = (false, None);
+    let mut theme = Theme::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -82,6 +87,13 @@ fn parse_args() -> Result<Args, String> {
                 at = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
             }
             "--play" => play = true,
+            "--theme" => {
+                let name = args.next().ok_or("--theme needs a name")?;
+                theme = Theme::named(&name).ok_or_else(|| {
+                    let names: Vec<_> = Theme::all().iter().map(|t| t.name).collect();
+                    format!("unknown theme {name:?} (themes: {})", names.join(", "))
+                })?;
+            }
             "--run-for" => {
                 let s = args.next().ok_or("--run-for needs seconds")?;
                 run_for = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
@@ -99,6 +111,7 @@ fn parse_args() -> Result<Args, String> {
         at,
         play,
         run_for,
+        theme,
     })
 }
 
@@ -158,6 +171,7 @@ fn main() -> ExitCode {
         run_for: args.run_for.map(Duration::from_secs_f64),
         started: Instant::now(),
         gfx: None,
+        theme: args.theme,
         scene: Scene::default(),
         hits: Vec::new(),
         pressed: None,
@@ -192,6 +206,7 @@ struct App {
     run_for: Option<Duration>,
     started: Instant,
     gfx: Option<Gfx>,
+    theme: Theme,
     scene: Scene,
     hits: Vec<HitBox>,
     /// Touched target, held until release; the overview tracks the drag.
@@ -382,7 +397,7 @@ impl App {
             debug: self.debug.then_some(self.overlay.as_str()),
         };
         let build_start = Instant::now();
-        self.hits = screen::build(&view, &mut self.scene);
+        self.hits = screen::build(&view, &self.theme, &mut self.scene);
         let build = build_start.elapsed();
 
         let Some(gfx) = &mut self.gfx else {

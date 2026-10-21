@@ -1,7 +1,7 @@
 //! What one frame draws, in layout pixels (the 1024×600 design canvas): rounded rectangles,
 //! then text on top. Colours are sRGB, as in the design tokens.
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rgba(pub [f32; 4]);
 
 impl Rgba {
@@ -66,6 +66,8 @@ pub struct Text {
 
 #[derive(Debug, Default)]
 pub struct Scene {
+    /// What the frame is cleared to before drawing.
+    pub background: Rgba,
     pub rects: Vec<Rect>,
     pub texts: Vec<Text>,
 }

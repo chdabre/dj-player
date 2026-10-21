@@ -26,6 +26,15 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
 - **Waveforms are stand-ins.** The zoom view draws the analysed beat grid (bar lines brighter), the loop, the cue, the slip shadow and a centred playhead. The overview draws the played part, loop, cue, loading progress and 16-bar ticks. The real waveform data and shader come from the waveform work.
 
+## Design tokens
+
+Every colour, font size, corner radius and line width the screen uses lives in one `Theme` (`crates/ui/src/theme.rs`), named by role: `button_edge`, `cue`, `readout`, `section_radius`, and so on. `screen.rs` asks the theme and has no colour literals; a test fails if a colour literal turns up in `screen.rs`, `main.rs` or `gfx.rs`. The frame's clear colour comes from the theme too.
+
+- **Default:** `reference`, the wireframe's tokens. Moving to tokens changed no pixel: the 1024×600 screenshot before and after is byte-identical.
+- **Switching:** `--theme <name>` picks a theme. Only `reference` exists so far; a new theme is one more constructor in `Theme::all()`.
+- **Waveforms:** `WaveformTokens` holds the stand-in's colours (grid, cue, loop, playhead, played part). The waveform renderer's own theme (3-band palette blue / orange / white, RGB weights, auto gain as a display setting) joins it when that crate lands, so one theme drives the screen and the waveform shader.
+- **Not tokens:** layout positions and sizes stay in `screen.rs`. They come from the canvas, per screen.
+
 ## Measurements (Mac)
 
 MacBook Pro M1 Max, built-in 120 Hz panel, Metal, release build, playing an MP3 at 44.1 kHz. Each line is a 2 s window, from the `--play --run-for` runs. The timing overlay shows the same line (`d` toggles it).

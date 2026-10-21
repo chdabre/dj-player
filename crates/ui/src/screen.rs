@@ -9,31 +9,7 @@
 use engine_core::DeckGrid;
 
 use crate::scene::{Align, Rgba, Scene, Text, Weight};
-
-// Design tokens (docs/research/findings.md, "Reference UI wireframes — design tokens").
-const BG: Rgba = Rgba::hex(0x000000);
-const SECTION: Rgba = Rgba::hex(0x34373d);
-const RAIL_EDGE: Rgba = Rgba::hex(0x3a3d42);
-const BUTTON: Rgba = Rgba::hex(0x222428);
-const BUTTON_PRESSED: Rgba = Rgba::hex(0x33373d);
-const BUTTON_EDGE: Rgba = Rgba::hex(0x5f6369);
-const CHIP_EDGE: Rgba = Rgba::hex(0x7a7e84);
-const TEXT: Rgba = Rgba::hex(0xe6e6e6);
-const LABEL: Rgba = Rgba::hex(0xa6a9ae);
-const DIM: Rgba = Rgba::hex(0x6b6f75);
-const ACCENT: Rgba = Rgba::hex(0x2b7fff);
-const ACCENT_TEXT: Rgba = Rgba::hex(0x7cb4ff);
-const ACCENT_FILL: Rgba = Rgba::hex(0x0b2350);
-const ACCENT_DIM: Rgba = Rgba::hex(0x22457a);
-const AMBER: Rgba = Rgba::hex(0xe0a33a);
-const AMBER_TEXT: Rgba = Rgba::hex(0xf2c06a);
-const AMBER_DIM: Rgba = Rgba::hex(0x7a6a4a);
-const KEY: Rgba = Rgba::hex(0x6cc4f0);
-const TITLE_BAR: Rgba = Rgba::hex(0x1e2024);
-const TITLE_ACCENT: Rgba = Rgba::hex(0x8b7be0);
-const BEAT_LINE: Rgba = Rgba::hex(0x262a30);
-const BAR_LINE: Rgba = Rgba::hex(0x48505a);
-const HOT_CUE: Rgba = Rgba::hex(0xe8667a);
+use crate::theme::Theme;
 
 /// Things on screen that can be touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +87,7 @@ pub struct View<'a> {
 }
 
 struct Ui<'s> {
+    t: &'s Theme,
     scene: &'s mut Scene,
     hits: Vec<HitBox>,
     pressed: Option<Target>,
@@ -133,7 +110,7 @@ impl Ui<'_> {
             x,
             y,
             size,
-            line_height: 1.2,
+            line_height: self.t.font.line_height,
             weight,
             color,
             align,
@@ -163,11 +140,29 @@ impl Ui<'_> {
     }
 
     fn label(&mut self, s: &str, x: f32, y: f32, color: Rgba) {
-        self.text(s, x, y, 15.0, Weight::Regular, color, Align::Left);
+        self.text(
+            s,
+            x,
+            y,
+            self.t.font.label,
+            Weight::Regular,
+            color,
+            Align::Left,
+        );
     }
 
     fn section(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.scene.rounded(x, y, w, h, 6.0, BG, 1.0, SECTION);
+        let t = self.t;
+        self.scene.rounded(
+            x,
+            y,
+            w,
+            h,
+            t.shape.section_radius,
+            t.color.background,
+            t.shape.border,
+            t.color.section_edge,
+        );
     }
 
     /// `.b`: a touch button with an optional second line.
@@ -178,16 +173,27 @@ impl Ui<'_> {
         label: &str,
         sub: Option<&str>,
         on: bool,
-        size: f32,
     ) {
+        let t = self.t;
         let pressed = self.pressed == Some(target);
         let (fill, edge) = match (on, pressed) {
-            (_, true) => (BUTTON_PRESSED, TEXT),
-            (true, false) => (ACCENT_FILL, ACCENT),
-            (false, false) => (BUTTON, BUTTON_EDGE),
+            (_, true) => (t.color.button_pressed, t.color.button_pressed_edge),
+            (true, false) => (t.color.button_on, t.color.button_on_edge),
+            (false, false) => (t.color.button, t.color.button_edge),
         };
-        self.scene.rounded(x, y, w, h, 4.0, fill, 1.0, edge);
-        let block = size * 1.2 + sub.map_or(0.0, |_| 14.0 * 1.2);
+        self.scene.rounded(
+            x,
+            y,
+            w,
+            h,
+            t.shape.button_radius,
+            fill,
+            t.shape.border,
+            edge,
+        );
+        let size = t.font.button;
+        let lh = t.font.line_height;
+        let block = size * lh + sub.map_or(0.0, |_| t.font.small * lh);
         let top = y + (h - block) * 0.5;
         self.text(
             label,
@@ -195,17 +201,17 @@ impl Ui<'_> {
             top,
             size,
             Weight::SemiBold,
-            TEXT,
+            t.color.text,
             Align::Center,
         );
         if let Some(sub) = sub {
             self.text(
                 sub,
                 x + w * 0.5,
-                top + size * 1.2,
-                14.0,
+                top + size * lh,
+                t.font.small,
                 Weight::Regular,
-                LABEL,
+                t.color.label,
                 Align::Center,
             );
         }
@@ -222,11 +228,13 @@ impl Ui<'_> {
         color: Rgba,
         fill: Rgba,
     ) {
-        self.scene.rounded(x, y, w, h, 3.0, fill, 1.0, edge);
+        let t = self.t;
+        self.scene
+            .rounded(x, y, w, h, t.shape.chip_radius, fill, t.shape.border, edge);
         self.text(
             label,
             x + w * 0.5,
-            y + (h - size * 1.2) * 0.5,
+            y + (h - size * t.font.line_height) * 0.5,
             size,
             Weight::SemiBold,
             color,
@@ -240,43 +248,48 @@ impl Ui<'_> {
 
     /// A label centred in a horizontal rule (`CUE/LOOP`, `CALL`).
     fn rule_label(&mut self, label: &str, x: f32, y: f32, w: f32) {
-        // Barlow Condensed caps at 15 px are ~7 px wide; close enough to leave a gap.
-        let text_w = label.len() as f32 * 7.0 + 12.0;
+        let t = self.t;
+        // Barlow Condensed caps at the label size are ~7/15 em wide; close enough to leave a gap.
+        let text_w = label.len() as f32 * t.font.label * (7.0 / 15.0) + 12.0;
         let side = (w - text_w) * 0.5;
         let mid = y + 8.0;
-        self.scene.fill(x, mid, side, 1.0, RAIL_EDGE);
-        self.scene.fill(x + w - side, mid, side, 1.0, RAIL_EDGE);
+        self.scene.fill(x, mid, side, 1.0, t.color.rule);
+        self.scene.fill(x + w - side, mid, side, 1.0, t.color.rule);
         self.text(
             label,
             x + w * 0.5,
             y - 1.0,
-            15.0,
+            t.font.label,
             Weight::Regular,
-            LABEL,
+            t.color.label,
             Align::Center,
         );
     }
 }
 
 /// Lay out the screen into `scene`; returns the touch targets.
-pub fn build(view: &View, scene: &mut Scene) -> Vec<HitBox> {
+pub fn build(view: &View, theme: &Theme, scene: &mut Scene) -> Vec<HitBox> {
     scene.clear();
+    scene.background = theme.color.background;
     let mut ui = Ui {
+        t: theme,
         scene,
         hits: Vec::new(),
         pressed: view.pressed,
     };
 
+    let t = theme;
     // Frame: rail, tab row, info, status band, bottom strip, column dividers.
-    ui.scene.fill(0.0, 0.0, 101.0, 600.0, BG);
-    ui.scene.fill(100.0, 0.0, 1.0, 600.0, RAIL_EDGE);
+    ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
+    ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
     ui.section(106.0, 2.0, 915.0, 64.0);
     ui.section(106.0, 66.0, 915.0, 325.0);
     ui.section(106.0, 395.0, 915.0, 99.0);
     ui.section(106.0, 498.0, 915.0, 99.0);
-    ui.scene.fill(822.0, 117.0, 1.0, 269.0, SECTION);
-    ui.scene.fill(822.0, 400.0, 1.0, 89.0, SECTION);
-    ui.scene.fill(822.0, 502.0, 1.0, 90.0, SECTION);
+    ui.scene
+        .fill(822.0, 117.0, 1.0, 269.0, t.color.section_edge);
+    ui.scene.fill(822.0, 400.0, 1.0, 89.0, t.color.section_edge);
+    ui.scene.fill(822.0, 502.0, 1.0, 90.0, t.color.section_edge);
 
     rail(&mut ui, view);
     tabs(&mut ui);
@@ -290,18 +303,18 @@ pub fn build(view: &View, scene: &mut Scene) -> Vec<HitBox> {
             176.0,
             420.0,
             22.0,
-            3.0,
-            Rgba::hex(0x000000).alpha(0.75),
+            t.shape.chip_radius,
+            t.color.overlay,
             0.0,
-            BG,
+            t.color.background,
         );
         ui.text(
             line,
             119.0,
             178.0,
-            15.0,
+            t.font.label,
             Weight::Regular,
-            AMBER_TEXT,
+            t.color.cue_text,
             Align::Left,
         );
     }
@@ -309,54 +322,55 @@ pub fn build(view: &View, scene: &mut Scene) -> Vec<HitBox> {
 }
 
 fn rail(ui: &mut Ui, v: &View) {
+    let t = ui.t;
     ui.button(
         Target::Library,
         (6.0, 16.0, 88.0, 117.0),
         "LIBRARY",
         None,
         false,
-        20.0,
     );
-    ui.button(
-        Target::Link,
-        (6.0, 138.0, 88.0, 124.0),
-        "LINK",
-        None,
-        false,
-        20.0,
+    ui.button(Target::Link, (6.0, 138.0, 88.0, 124.0), "LINK", None, false);
+    ui.button(Target::Usb, (6.0, 267.0, 88.0, 117.0), "USB", None, true);
+    ui.scene.rounded(
+        6.0,
+        410.0,
+        88.0,
+        83.0,
+        t.shape.button_radius,
+        t.color.button,
+        t.shape.border,
+        t.color.button_edge,
     );
-    ui.button(
-        Target::Usb,
-        (6.0, 267.0, 88.0, 117.0),
-        "USB",
-        None,
-        true,
-        20.0,
-    );
-    ui.scene
-        .rounded(6.0, 410.0, 88.0, 83.0, 4.0, BUTTON, 1.0, BUTTON_EDGE);
     ui.text(
         "PLAYER",
         50.0,
         418.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        LABEL,
+        t.color.label,
         Align::Center,
     );
-    ui.digits("1", 50.0, 438.0, 39.0, TEXT, Align::Center);
+    ui.digits("1", 50.0, 438.0, t.font.player, t.color.text, Align::Center);
     ui.button(
         Target::Slip,
         (6.0, 505.0, 88.0, 76.0),
         "SLIP",
         None,
         v.slip_enabled,
-        20.0,
     );
     if v.slip_active {
         // Slipping: the shadow is running; amber edge like the reference's flashing button.
-        ui.scene
-            .rounded(6.0, 505.0, 88.0, 76.0, 4.0, Rgba::TRANSPARENT, 2.0, AMBER);
+        ui.scene.rounded(
+            6.0,
+            505.0,
+            88.0,
+            76.0,
+            t.shape.button_radius,
+            Rgba::TRANSPARENT,
+            t.shape.border_active,
+            t.color.cue,
+        );
     }
 }
 
@@ -369,7 +383,6 @@ fn tabs(ui: &mut Ui) {
         "BROWSE",
         Some("– SEARCH"),
         false,
-        20.0,
     );
     ui.button(
         Target::TagList,
@@ -377,7 +390,6 @@ fn tabs(ui: &mut Ui) {
         "TAG LIST",
         None,
         false,
-        20.0,
     );
     ui.button(
         Target::Info,
@@ -385,7 +397,6 @@ fn tabs(ui: &mut Ui) {
         "INFO",
         Some("– LINK INFO"),
         false,
-        20.0,
     );
     ui.button(
         Target::Menu,
@@ -393,7 +404,6 @@ fn tabs(ui: &mut Ui) {
         "MENU",
         Some("– UTILITY"),
         false,
-        20.0,
     );
     ui.button(
         Target::Perform,
@@ -401,23 +411,39 @@ fn tabs(ui: &mut Ui) {
         "PERFORM",
         None,
         false,
-        20.0,
     );
 }
 
 fn info(ui: &mut Ui, v: &View) {
+    let t = ui.t;
     // Title bar with the track colour on the left.
-    ui.scene
-        .rounded(113.0, 69.0, 903.0, 43.0, 4.0, TITLE_BAR, 1.0, BUTTON_EDGE);
-    ui.scene
-        .rounded(113.0, 69.0, 6.0, 43.0, 2.0, TITLE_ACCENT, 0.0, BG);
+    ui.scene.rounded(
+        113.0,
+        69.0,
+        903.0,
+        43.0,
+        t.shape.button_radius,
+        t.color.title_bar,
+        t.shape.border,
+        t.color.button_edge,
+    );
+    ui.scene.rounded(
+        113.0,
+        69.0,
+        6.0,
+        43.0,
+        t.shape.panel_radius,
+        t.color.track_color,
+        0.0,
+        t.color.background,
+    );
     ui.text(
         v.title,
         132.0,
         76.0,
-        23.0,
+        t.font.title,
         Weight::SemiBold,
-        TEXT,
+        t.color.text,
         Align::Left,
     );
     let key = v.key.map_or_else(
@@ -430,30 +456,53 @@ fn info(ui: &mut Ui, v: &View) {
         },
         |k| format!("KEY {k}"),
     );
-    ui.text(key, 1003.0, 77.0, 22.0, Weight::SemiBold, KEY, Align::Right);
+    ui.text(
+        key,
+        1003.0,
+        77.0,
+        t.font.title_aside,
+        Weight::SemiBold,
+        t.color.key,
+        Align::Right,
+    );
 
     // Master badge and phase meters: bar in the 4-bar phrase, beat in the bar.
     ui.text(
         "MASTER",
         262.0,
         117.0,
-        13.0,
+        t.font.caption,
         Weight::Regular,
-        AMBER_TEXT,
+        t.color.cue_text,
         Align::Right,
     );
     ui.text(
         "PLAYER",
         262.0,
         131.0,
-        13.0,
+        t.font.caption,
         Weight::Regular,
-        AMBER_TEXT,
+        t.color.cue_text,
         Align::Right,
     );
-    ui.scene
-        .rounded(267.0, 122.0, 17.0, 23.0, 3.0, AMBER, 0.0, BG);
-    ui.digits("1", 275.5, 124.0, 19.0, BG, Align::Center);
+    ui.scene.rounded(
+        267.0,
+        122.0,
+        17.0,
+        23.0,
+        t.shape.chip_radius,
+        t.color.cue,
+        0.0,
+        t.color.background,
+    );
+    ui.digits(
+        "1",
+        275.5,
+        124.0,
+        t.font.badge,
+        t.color.on_badge,
+        Align::Center,
+    );
     let (beat_in_bar, bar_in_phrase, bar, bars_left) = match v.grid {
         Some(g) => {
             let beat = g.beat_at(v.position).floor();
@@ -483,24 +532,38 @@ fn info(ui: &mut Ui, v: &View) {
         ),
         _ => ("--.-".into(), "--.-".into()),
     };
-    ui.digits(amber, 640.0, 118.0, 27.0, AMBER_TEXT, Align::Left);
+    ui.digits(
+        amber,
+        640.0,
+        118.0,
+        t.font.counter,
+        t.color.cue_text,
+        Align::Left,
+    );
     ui.text(
         "BARS",
         690.0,
         126.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        AMBER_TEXT,
+        t.color.cue_text,
         Align::Left,
     );
-    ui.digits(blue, 640.0, 144.0, 27.0, ACCENT_TEXT, Align::Left);
+    ui.digits(
+        blue,
+        640.0,
+        144.0,
+        t.font.counter,
+        t.color.accent_text,
+        Align::Left,
+    );
     ui.text(
         "BARS LEFT",
         690.0,
         152.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        ACCENT_TEXT,
+        t.color.accent_text,
         Align::Left,
     );
 
@@ -514,7 +577,6 @@ fn info(ui: &mut Ui, v: &View) {
         "DELETE",
         None,
         false,
-        20.0,
     );
     ui.button(
         Target::Memory,
@@ -522,7 +584,6 @@ fn info(ui: &mut Ui, v: &View) {
         "MEMORY",
         None,
         false,
-        20.0,
     );
     ui.rule_label("CALL", 828.0, 250.0, 188.0);
     let (prev, next) = if v.looping {
@@ -536,7 +597,6 @@ fn info(ui: &mut Ui, v: &View) {
         prev,
         None,
         false,
-        20.0,
     );
     ui.button(
         Target::CallNext,
@@ -544,24 +604,23 @@ fn info(ui: &mut Ui, v: &View) {
         next,
         None,
         false,
-        20.0,
     );
     let zoom_label = format!("ZOOM {}", v.zoom_beats);
     ui.chip(
         (828.0, 344.0, 88.0, 36.0),
         &zoom_label,
-        16.0,
-        CHIP_EDGE,
-        TEXT,
-        Rgba::hex(0x33363b),
+        t.font.chip,
+        t.color.chip_edge,
+        t.color.text,
+        t.color.chip_selected,
     );
     ui.hit(Target::Zoom, (828.0, 344.0, 88.0, 36.0));
     ui.chip(
         (923.0, 344.0, 93.0, 36.0),
         "GRID",
-        16.0,
-        CHIP_EDGE,
-        TEXT,
+        t.font.chip,
+        t.color.chip_edge,
+        t.color.text,
         Rgba::TRANSPARENT,
     );
     ui.hit(Target::Grid, (923.0, 344.0, 93.0, 36.0));
@@ -569,19 +628,26 @@ fn info(ui: &mut Ui, v: &View) {
 
 /// Four segments; `active` is 1-based. `filled`: the beat meter fills, the bar meter outlines.
 fn meter(ui: &mut Ui, x: f32, y: f32, active: Option<u8>, filled: bool) {
+    let t = ui.t;
     let (w, h, gap) = (338.0, 19.0, 5.0);
     let seg = (w - 3.0 * gap) / 4.0;
     for i in 0..4u8 {
         let sx = x + f32::from(i) * (seg + gap);
         let on = active == Some(i + 1);
-        match (filled, on) {
-            (true, true) => ui.scene.rounded(sx, y, seg, h, 3.0, ACCENT, 1.0, ACCENT),
-            (true, false) => ui.scene.rounded(sx, y, seg, h, 3.0, BG, 1.0, ACCENT_DIM),
-            (false, true) => ui.scene.rounded(sx, y, seg, h, 3.0, BG, 2.0, AMBER),
-            (false, false) => ui.scene.rounded(sx, y, seg, h, 3.0, BG, 1.0, AMBER_DIM),
-        }
+        let (fill, border, edge) = match (filled, on) {
+            (true, true) => (t.color.accent, t.shape.border, t.color.accent),
+            (true, false) => (t.color.background, t.shape.border, t.color.accent_dim),
+            (false, true) => (t.color.background, t.shape.border_active, t.color.cue),
+            (false, false) => (t.color.background, t.shape.border, t.color.cue_dim),
+        };
+        ui.scene
+            .rounded(sx, y, seg, h, t.shape.chip_radius, fill, border, edge);
         if i < 3 {
-            let line = if filled { ACCENT_DIM } else { AMBER_DIM };
+            let line = if filled {
+                t.color.accent_dim
+            } else {
+                t.color.cue_dim
+            };
             ui.scene.fill(sx + seg, y + h * 0.5 - 1.0, gap, 2.0, line);
         }
     }
@@ -589,10 +655,20 @@ fn meter(ui: &mut Ui, x: f32, y: f32, active: Option<u8>, filled: bool) {
 
 /// Zoomed view around the playhead: beat grid, loop, cue, hot cue strip, playhead.
 fn zoom(ui: &mut Ui, v: &View) {
+    let t = ui.t;
+    let wf = &t.waveform;
     let (x0, y0, w, h) = ZOOM;
-    ui.scene
-        .rounded(x0, y0, w, h, 2.0, Rgba::hex(0x07080a), 0.0, BG);
-    ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, Rgba::hex(0x15171b));
+    ui.scene.rounded(
+        x0,
+        y0,
+        w,
+        h,
+        t.shape.panel_radius,
+        wf.background,
+        0.0,
+        wf.background,
+    );
+    ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
     // Frames per design pixel.
     let span = match v.grid {
         Some(g) => v.zoom_beats * g.period(),
@@ -607,9 +683,12 @@ fn zoom(ui: &mut Ui, v: &View) {
         let (a, b) = (to_x(v.loop_start).max(x0), to_x(v.loop_end).min(x0 + w));
         if b > a {
             let (fill, edge) = if v.looping {
-                (AMBER.alpha(0.16), AMBER)
+                (wf.loop_color.alpha(wf.loop_fill), wf.loop_color)
             } else {
-                (AMBER.alpha(0.05), AMBER_DIM)
+                (
+                    wf.loop_color.alpha(wf.loop_fill_stored),
+                    wf.loop_edge_stored,
+                )
             };
             ui.scene.fill(a, y0, b - a, h, fill);
             for e in [to_x(v.loop_start), to_x(v.loop_end)] {
@@ -626,22 +705,31 @@ fn zoom(ui: &mut Ui, v: &View) {
             let pos = g.position_of(b as f64);
             let x = to_x(pos);
             if g.bar_position(pos + 0.5) == 1 {
-                ui.scene.fill(x - 0.75, y0, 1.5, h, BAR_LINE);
+                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.bar_line);
             } else {
-                ui.scene.fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, BEAT_LINE);
+                ui.scene
+                    .fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, wf.beat_line);
             }
         }
     }
     let cue = to_x(v.cue);
     if visible(cue) {
-        ui.scene.fill(cue - 1.0, y0, 2.0, h, AMBER);
-        ui.scene
-            .rounded(cue - 6.0, y0, 12.0, 8.0, 2.0, AMBER, 0.0, BG);
+        ui.scene.fill(cue - 1.0, y0, 2.0, h, wf.cue);
+        ui.scene.rounded(
+            cue - 6.0,
+            y0,
+            12.0,
+            8.0,
+            t.shape.panel_radius,
+            wf.cue,
+            0.0,
+            wf.cue,
+        );
     }
     if v.slip_active {
         let s = to_x(v.shadow_position);
         if visible(s) {
-            ui.scene.fill(s - 1.0, y0, 2.0, h, ACCENT.alpha(0.8));
+            ui.scene.fill(s - 1.0, y0, 2.0, h, wf.slip_shadow);
         }
     }
     let label = match (v.grid, v.analysing) {
@@ -653,16 +741,16 @@ fn zoom(ui: &mut Ui, v: &View) {
         label,
         x0 + 8.0,
         y0 + h - 24.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        DIM,
+        t.color.dim,
         Align::Left,
     );
     // Playhead, centred.
     let px = x0 + w * 0.5;
-    ui.scene.fill(px - 1.0, y0, 2.0, h, TEXT);
+    ui.scene.fill(px - 1.0, y0, 2.0, h, wf.playhead);
     ui.scene
-        .rounded(px - 5.0, y0, 10.0, 6.0, 1.0, TEXT, 0.0, BG);
+        .rounded(px - 5.0, y0, 10.0, 6.0, 1.0, wf.playhead, 0.0, wf.playhead);
 }
 
 fn clock(seconds: f64) -> (String, String) {
@@ -676,8 +764,16 @@ fn clock(seconds: f64) -> (String, String) {
 }
 
 fn status(ui: &mut Ui, v: &View) {
-    ui.label("TRACK", 113.0, 398.0, LABEL);
-    ui.digits("01", 113.0, 422.0, 56.0, TEXT, Align::Left);
+    let t = ui.t;
+    ui.label("TRACK", 113.0, 398.0, t.color.label);
+    ui.digits(
+        "01",
+        113.0,
+        422.0,
+        t.font.readout,
+        t.color.text,
+        Align::Left,
+    );
     let hot = v.hot_cues;
     let pads: String = (0..8u8)
         .map(|i| {
@@ -691,21 +787,25 @@ fn status(ui: &mut Ui, v: &View) {
     ui.chip(
         (226.0, 422.0, 113.0, 25.0),
         &pads,
-        16.0,
-        if hot != 0 { HOT_CUE } else { CHIP_EDGE },
-        TEXT,
+        t.font.chip,
+        if hot != 0 {
+            t.color.hot_cue
+        } else {
+            t.color.chip_edge
+        },
+        t.color.text,
         Rgba::TRANSPARENT,
     );
     ui.chip(
         (226.0, 453.0, 113.0, 25.0),
         "A.CUE",
-        16.0,
-        AMBER,
-        AMBER_TEXT,
+        t.font.chip,
+        t.color.cue,
+        t.color.cue_text,
         Rgba::TRANSPARENT,
     );
 
-    ui.label("REMAIN", 351.0, 398.0, LABEL);
+    ui.label("REMAIN", 351.0, 398.0, t.color.label);
     let quantize = match v.quantize {
         q if q <= 0.0 => "QUANTIZE : OFF".to_string(),
         q if q >= 1.0 => format!("QUANTIZE : {q}"),
@@ -715,23 +815,41 @@ fn status(ui: &mut Ui, v: &View) {
         &quantize,
         424.0,
         398.0,
-        if v.quantize > 0.0 { AMBER_TEXT } else { DIM },
+        if v.quantize > 0.0 {
+            t.color.cue_text
+        } else {
+            t.color.dim
+        },
     );
     let (mmss, ms) = clock((v.length - v.position) / v.sample_rate);
     // Tabular digits: "00:00" at 56 px ends ~118 px in.
-    ui.digits(mmss, 469.0, 422.0, 56.0, TEXT, Align::Right);
-    ui.digits(ms, 470.0, 437.0, 37.0, TEXT, Align::Left);
+    ui.digits(
+        mmss,
+        469.0,
+        422.0,
+        t.font.readout,
+        t.color.text,
+        Align::Right,
+    );
+    ui.digits(
+        ms,
+        470.0,
+        437.0,
+        t.font.readout_fraction,
+        t.color.text,
+        Align::Left,
+    );
 
-    ui.label("TEMPO", 653.0, 398.0, LABEL);
+    ui.label("TEMPO", 653.0, 398.0, t.color.label);
     let (edge, color) = if v.keylock {
-        (AMBER, AMBER_TEXT)
+        (t.color.cue, t.color.cue_text)
     } else {
-        (CHIP_EDGE, DIM)
+        (t.color.chip_edge, t.color.dim)
     };
     ui.chip(
         (705.0, 397.0, 64.0, 23.0),
         "KEYLOCK",
-        15.0,
+        t.font.label,
         edge,
         color,
         Rgba::TRANSPARENT,
@@ -744,8 +862,15 @@ fn status(ui: &mut Ui, v: &View) {
     } else {
         format!("−{:.2}", -pct)
     };
-    ui.digits(tempo, 790.0, 422.0, 56.0, TEXT, Align::Right);
-    ui.digits("%", 792.0, 448.0, 22.0, TEXT, Align::Left);
+    ui.digits(
+        tempo,
+        790.0,
+        422.0,
+        t.font.readout,
+        t.color.text,
+        Align::Right,
+    );
+    ui.digits("%", 792.0, 448.0, t.font.unit, t.color.text, Align::Left);
 
     ui.button(
         Target::Sync,
@@ -753,7 +878,6 @@ fn status(ui: &mut Ui, v: &View) {
         "SYNC",
         Some("– INST.D."),
         false,
-        20.0,
     );
     ui.button(
         Target::Master,
@@ -761,20 +885,29 @@ fn status(ui: &mut Ui, v: &View) {
         "MASTER",
         None,
         true,
-        20.0,
     );
 }
 
 fn bottom(ui: &mut Ui, v: &View) {
+    let t = ui.t;
+    let wf = &t.waveform;
     let (x0, y0, w, h) = OVERVIEW;
-    ui.scene
-        .rounded(x0, y0, w, h, 2.0, Rgba::hex(0x07080a), 0.0, BG);
+    ui.scene.rounded(
+        x0,
+        y0,
+        w,
+        h,
+        t.shape.panel_radius,
+        wf.background,
+        0.0,
+        wf.background,
+    );
     if v.length > 0.0 {
         let to_x = |pos: f64| x0 + (pos / v.length).clamp(0.0, 1.0) as f32 * w;
         if v.loaded_fraction < 1.0 {
             let lx = to_x(v.loaded_fraction * v.length);
             ui.scene
-                .fill(lx, y0 + h - 3.0, x0 + w - lx, 3.0, DIM.alpha(0.5));
+                .fill(lx, y0 + h - 3.0, x0 + w - lx, 3.0, wf.loading);
         }
         // 16-bar ticks.
         if let Some(g) = v.grid {
@@ -782,13 +915,13 @@ fn bottom(ui: &mut Ui, v: &View) {
             let mut b = 0;
             while b <= beats {
                 let x = to_x(g.position_of(b as f64));
-                ui.scene.fill(x - 0.5, y0 + h - 10.0, 1.0, 10.0, BAR_LINE);
+                ui.scene
+                    .fill(x - 0.5, y0 + h - 10.0, 1.0, 10.0, wf.bar_line);
                 b += 64;
             }
         }
         let px = to_x(v.position);
-        ui.scene
-            .fill(x0, y0 + 8.0, px - x0, h - 16.0, ACCENT.alpha(0.18));
+        ui.scene.fill(x0, y0 + 8.0, px - x0, h - 16.0, wf.played);
         if v.loop_end > v.loop_start {
             let (a, b) = (to_x(v.loop_start), to_x(v.loop_end));
             ui.scene.fill(
@@ -796,69 +929,84 @@ fn bottom(ui: &mut Ui, v: &View) {
                 y0,
                 (b - a).max(2.0),
                 h,
-                if v.looping {
-                    AMBER.alpha(0.45)
+                wf.loop_color.alpha(if v.looping {
+                    wf.overview_loop_fill
                 } else {
-                    AMBER.alpha(0.2)
-                },
+                    wf.overview_loop_fill_stored
+                }),
             );
         }
         let cx = to_x(v.cue);
-        ui.scene.fill(cx - 1.0, y0, 2.0, h, AMBER);
-        ui.scene.fill(px - 1.0, y0, 2.0, h, TEXT);
+        ui.scene.fill(cx - 1.0, y0, 2.0, h, wf.cue);
+        ui.scene.fill(px - 1.0, y0, 2.0, h, wf.playhead);
     }
     ui.text(
         "OVERVIEW STAND-IN · TOUCH TO SEEK",
         x0 + 8.0,
         y0 + 4.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        DIM,
+        t.color.dim,
         Align::Left,
     );
     ui.hit(Target::Overview, OVERVIEW);
-    ui.scene.fill(x0, 572.0, w, 1.0, BUTTON_EDGE);
+    ui.scene.fill(x0, 572.0, w, 1.0, t.color.button_edge);
     ui.text(
         "NEEDLE SEARCH",
         x0 + w * 0.5,
         574.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        LABEL,
+        t.color.label,
         Align::Center,
     );
 
     ui.chip(
         (828.0, 502.0, 62.0, 39.0),
         "±10",
-        22.0,
-        AMBER,
-        AMBER_TEXT,
+        t.font.chip_large,
+        t.color.cue,
+        t.color.cue_text,
         Rgba::TRANSPARENT,
     );
     ui.hit(Target::TempoRange, (828.0, 502.0, 62.0, 39.0));
     ui.chip(
         (828.0, 545.0, 62.0, 43.0),
         "[4]",
-        22.0,
-        CHIP_EDGE,
-        TEXT,
+        t.font.chip_large,
+        t.color.chip_edge,
+        t.color.text,
         Rgba::TRANSPARENT,
     );
     ui.hit(Target::JumpSize, (828.0, 545.0, 62.0, 43.0));
-    ui.scene
-        .rounded(898.0, 502.0, 118.0, 86.0, 4.0, BUTTON, 1.0, ACCENT);
+    ui.scene.rounded(
+        898.0,
+        502.0,
+        118.0,
+        86.0,
+        t.shape.button_radius,
+        t.color.button,
+        t.shape.border,
+        t.color.accent,
+    );
     let bpm = v
         .grid
         .map_or("--.-".to_string(), |g| format!("{:.1}", g.bpm() * v.rate));
-    ui.digits(bpm, 1006.0, 514.0, 41.0, ACCENT_TEXT, Align::Right);
+    ui.digits(
+        bpm,
+        1006.0,
+        514.0,
+        t.font.bpm,
+        t.color.accent_text,
+        Align::Right,
+    );
     ui.text(
         "BPM",
         1006.0,
         558.0,
-        14.0,
+        t.font.small,
         Weight::Regular,
-        LABEL,
+        t.color.label,
         Align::Right,
     );
 }
@@ -898,7 +1046,7 @@ mod tests {
     fn everything_stays_on_the_panel_and_targets_do_not_overlap() {
         let grid = DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap();
         let mut scene = Scene::default();
-        let hits = build(&view(Some(&grid)), &mut scene);
+        let hits = build(&view(Some(&grid)), &Theme::default(), &mut scene);
         for r in &scene.rects {
             assert!(
                 r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
@@ -927,7 +1075,7 @@ mod tests {
     #[test]
     fn builds_without_a_grid() {
         let mut scene = Scene::default();
-        build(&view(None), &mut scene);
+        build(&view(None), &Theme::default(), &mut scene);
         assert!(scene.texts.iter().any(|t| t.text == "--.-"));
     }
 }

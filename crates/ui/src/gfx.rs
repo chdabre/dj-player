@@ -464,6 +464,8 @@ impl Gfx {
                 .write_buffer(&self.instances, 0, &self.instance_bytes);
         }
         self.prepare_text(scene, w, h);
+        let [r, g, b, a] = self.color(scene.background).map(f64::from);
+        let clear = wgpu::Color { r, g, b, a };
 
         let mut encoder = self
             .device
@@ -476,7 +478,7 @@ impl Gfx {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
