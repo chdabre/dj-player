@@ -611,7 +611,9 @@ impl WaveTap {
             return;
         };
         let hit = stereo
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .position(|f| f[0].abs().max(f[1].abs()) >= level);
         if let Some(i) = hit {
             self.live.lock().first_sound = Some(Some((self.frames + i as u64) as f64));

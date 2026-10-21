@@ -422,8 +422,10 @@ impl Deck {
                         let inv = 1.0 / len as f32;
                         let span = &mut out[off * CHANNELS..(off + len) * CHANNELS];
                         for (k, (o, w)) in span
-                            .chunks_exact_mut(CHANNELS)
-                            .zip(ws.chunks_exact(CHANNELS))
+                            .as_chunks_mut::<CHANNELS>()
+                            .0
+                            .iter_mut()
+                            .zip(ws.as_chunks::<CHANNELS>().0.iter())
                             .enumerate()
                         {
                             let g = (k + 1) as f32 * inv;
@@ -445,8 +447,10 @@ impl Deck {
             let scratch = &self.scratch[..fade_len * CHANNELS];
             let inv = 1.0 / fade_len as f32;
             for (k, (o, s)) in out
-                .chunks_exact_mut(CHANNELS)
-                .zip(scratch.chunks_exact(CHANNELS))
+                .as_chunks_mut::<CHANNELS>()
+                .0
+                .iter_mut()
+                .zip(scratch.as_chunks::<CHANNELS>().0.iter())
                 .enumerate()
             {
                 let g = (k + 1) as f32 * inv;

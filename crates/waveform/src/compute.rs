@@ -275,11 +275,11 @@ impl Builder {
             self.frame(l, r);
             rest = tail;
         }
-        let mut frames = rest.chunks_exact(2);
-        for f in &mut frames {
+        let (frames, remainder) = rest.as_chunks::<2>();
+        for f in frames {
             self.frame(f[0], f[1]);
         }
-        self.half = frames.remainder().first().copied();
+        self.half = remainder.first().copied();
     }
 
     fn frame(&mut self, l: f32, r: f32) {

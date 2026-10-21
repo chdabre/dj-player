@@ -78,7 +78,9 @@ impl Rig {
             self.handle.collect_retired();
             done += n;
         }
-        out.chunks_exact(CHANNELS)
+        out.as_chunks::<CHANNELS>()
+            .0
+            .iter()
             .map(|f| f64::from(f[0]) * f64::from(SCALE))
             .collect()
     }
@@ -220,8 +222,10 @@ fn loop_wraps_without_a_click() {
     }
     // Natural steps of this sine are up to ~0.0065; a raw wrap could jump by up to 1.0.
     let max_step = out
-        .chunks_exact(CHANNELS)
-        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
         .skip(BLOCK)
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);
@@ -416,8 +420,10 @@ fn taking_and_releasing_the_track_does_not_click() {
         handle.collect_retired();
     }
     let max_step = out
-        .chunks_exact(CHANNELS)
-        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);
     // The sine's own steps at up to 4x are ~0.026; a hard start or stop could step by 0.5.

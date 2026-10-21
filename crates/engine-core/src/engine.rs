@@ -240,7 +240,7 @@ impl Engine {
 fn write_master(mix: &[f32], out: &mut [f32], channels: usize) {
     for (frame, lr) in out
         .chunks_exact_mut(channels)
-        .zip(mix.chunks_exact(CHANNELS))
+        .zip(mix.as_chunks::<CHANNELS>().0.iter())
     {
         if channels == 1 {
             frame[0] = 0.5 * (lr[0] + lr[1]);
@@ -325,8 +325,8 @@ mod tests {
         h.send_deck(0, DeckCommand::Play).unwrap();
         let mut out = vec![9.0; 4 * 64];
         e.process(&mut out, 64);
-        for f in out.chunks_exact(4) {
-            assert_eq!(f, [0.25, 0.25, 0.0, 0.0]);
+        for f in out.as_chunks::<4>().0.iter() {
+            assert_eq!(*f, [0.25, 0.25, 0.0, 0.0]);
         }
         let (mut e, mut h) = engine(1);
         e.deck_mut(0).set_declick(false);

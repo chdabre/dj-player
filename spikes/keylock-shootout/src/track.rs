@@ -41,7 +41,7 @@ impl Track {
 
     /// Copy `dst.len() / 2` frames starting at `first`, interleaved.
     pub fn copy_interleaved(&self, first: i64, dst: &mut [f32]) {
-        for (k, f) in dst.chunks_exact_mut(CHANNELS).enumerate() {
+        for (k, f) in dst.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
             f.copy_from_slice(&self.frame(first + k as i64));
         }
     }

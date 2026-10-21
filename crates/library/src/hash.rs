@@ -116,7 +116,7 @@ impl AudioHash {
         let mut h = blake3::Hasher::new();
         let mut buf = [0u8; 8192];
         for chunk in samples.chunks(buf.len() / 2) {
-            for (s, out) in chunk.iter().zip(buf.chunks_exact_mut(2)) {
+            for (s, out) in chunk.iter().zip(buf.as_chunks_mut::<2>().0.iter_mut()) {
                 let v = (f64::from(*s) * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
                 out.copy_from_slice(&v.to_le_bytes());
             }
