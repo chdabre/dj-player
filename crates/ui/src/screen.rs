@@ -717,7 +717,7 @@ fn zoom(ui: &mut Ui, v: &View) {
             let pos = g.position_of(b as f64);
             let x = to_x(pos);
             if g.bar_position(pos + 0.5) == 1 {
-                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.bar_line);
+                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.downbeat_line);
             } else {
                 ui.scene
                     .fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, wf.beat_line);

@@ -132,6 +132,9 @@ pub struct WaveformTokens {
     pub opacity: f32,
     pub center_line: Rgba,
     pub beat_line: Rgba,
+    /// Downbeats (the first beat of a bar) in the zoom's grid.
+    pub downbeat_line: Rgba,
+    /// The overview's 16-bar ticks.
     pub bar_line: Rgba,
     pub playhead: Rgba,
     pub cue: Rgba,
@@ -224,6 +227,7 @@ impl Theme {
                 opacity: 0.7,
                 center_line: Rgba::hex(0x15171b),
                 beat_line: Rgba::hex(0x262a30),
+                downbeat_line: Rgba::hex(0xd93a3a),
                 bar_line: Rgba::hex(0x48505a),
                 playhead: Rgba::hex(0xe6e6e6),
                 cue: amber,
