@@ -11,6 +11,7 @@ publish = false
 engine-stretch.workspace = true
 engine-media.workspace = true
 hound.workspace = true
+rustfft.workspace = true
 bungee-rs = "0.1.1"
 rubberband-sys = "0.1.4"
 
