@@ -1,26 +1,46 @@
-//! One deck playing one file through the real engine: device, decode, analysis and stream,
-//! shared by the `engined` terminal CLI and the UI spike.
+//! One deck playing one file through the real engine: device, decode, analysis, library and
+//! stream, shared by the `engined` terminal CLI and the UI spike.
 //!
 //! [`Player::open`] picks the device format, starts decoding the file at that rate, starts
-//! the stream and analyses the file on a background thread. The waveform is computed during
-//! the decode, from exactly the frames the deck plays, and grows in [`Player::waveform`]. The owner calls [`Player::poll`]
-//! regularly: it hands the analysed grid to the deck, collects retired objects off the audio
-//! thread and reports loader and stream errors.
+//! the stream and mounts the library on a worker thread ([`persist`]). The waveform is
+//! computed during the decode, from exactly the frames the deck plays, and grows in
+//! [`Player::waveform`]. The owner calls [`Player::poll`] regularly: it restores the track's
+//! stored cues into the deck, uses the stored waveform and analysis when the library has
+//! them (analysing otherwise, on a background thread), hands the grid to the deck, writes
+//! new waveforms, analysis results and cue edits back, collects retired objects off the
+//! audio thread and reports loader and stream errors.
 
+pub mod persist;
+mod stored;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use engine_core::{
-    DeckCommand, DeckGrid, DeckState, Engine, EngineConfig, EngineHandle, LoadMeter, Source,
+    DeckCommand, DeckGrid, DeckState, Engine, EngineConfig, EngineHandle, HOT_CUES, LoadMeter,
+    Source, TrackCues,
 };
 use engine_io::{AudioBackend, AudioStream, CpalBackend, CpalStream, StreamFormat, StreamRequest};
+use library::{AnalysisRef, AudioHash, Cue, CueKind, Edit, HotCue, Track, TrackRef};
 use waveform::compute::{Builder, Entry, Origin, Params, Timeline, Waveform};
+
+pub use persist::LibraryChoice;
+use persist::{FreshAnalysis, LibraryWorker, Loaded, Reply};
 
 /// The deck everything here drives.
 pub const DECK: usize = 0;
+
+/// How to open a [`Player`].
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    pub settings: engine_analysis::Settings,
+    pub library: LibraryChoice,
+}
 
 pub struct Player {
     pub format: StreamFormat,
@@ -31,19 +51,51 @@ pub struct Player {
     /// dropped off the audio thread before the retire ring is drained.
     stream: Option<CpalStream>,
     loader: Option<JoinHandle<Result<(), engine_media::LoadError>>>,
-    analysis: Receiver<Result<Analysed, String>>,
+    file: PathBuf,
+    settings: engine_analysis::Settings,
+    /// Started once the library said what it has for the track.
+    analysis: Option<Receiver<Result<Analysed, String>>>,
     /// The analysis result, once it arrived.
     pub analysed: Option<Analysed>,
     waveform: Arc<LiveWaveform>,
+    library: Option<LibraryWorker>,
+    lib: LibState,
+}
+
+/// What the player knows about the track's library record.
+#[derive(Debug, Default)]
+struct LibState {
+    track: Option<TrackRef>,
+    /// Serial of the last stored cues sent to the deck (0 = none yet).
+    serial: u64,
+    /// Hot cues (frames) as the library gave them, and as last seen on the deck.
+    restored: [Option<f64>; HOT_CUES],
+    known: [Option<f64>; HOT_CUES],
+    /// The waveform is stored, or was sent to be stored.
+    waveform_stored: bool,
 }
 
 impl Player {
-    /// Open the output, start loading `file` and start playing paused.
+    /// Open the output, start loading `file` and start playing paused, with the library at
+    /// its default place (see [`LibraryChoice::Auto`]).
     pub fn open(
         backend: &CpalBackend,
         request: &StreamRequest,
         file: &Path,
         settings: engine_analysis::Settings,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let options = Options {
+            settings,
+            ..Options::default()
+        };
+        Self::open_with(backend, request, file, options)
+    }
+
+    pub fn open_with(
+        backend: &CpalBackend,
+        request: &StreamRequest,
+        file: &Path,
+        options: Options,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // The device decides the engine rate; tracks are resampled to it at load.
         let format = backend.format(request)?;
@@ -63,7 +115,7 @@ impl Player {
             decks: 1,
         });
         handle.send_deck(DECK, DeckCommand::Load(Arc::clone(&source)))?;
-        let analysis = analyze_in_background(file.to_path_buf(), format.sample_rate, settings);
+        let library = LibraryWorker::spawn(options.library, file.to_path_buf()).ok();
 
         let meter = Arc::clone(handle.load_meter());
         let ns_per_frame = 1e9 / f64::from(format.sample_rate);
@@ -74,17 +126,25 @@ impl Player {
             meter.record(busy, (frames as f64 * ns_per_frame) as u64);
         };
         let stream = backend.start(request, Box::new(callback))?;
-        Ok(Self {
+        let mut player = Self {
             format,
             info: loading.info,
             source,
             handle,
             stream: Some(stream),
             loader: Some(loading.thread),
-            analysis,
+            file: file.to_path_buf(),
+            settings: options.settings,
+            analysis: None,
             analysed: None,
             waveform,
-        })
+            library,
+            lib: LibState::default(),
+        };
+        if player.library.is_none() {
+            player.start_analysis(BTreeMap::new(), false);
+        }
+        Ok(player)
     }
 
     pub fn device_name(&self) -> &str {
@@ -95,7 +155,7 @@ impl Player {
         self.stream.as_ref().and_then(|s| s.buffer_frames())
     }
 
-    /// The track's waveform, growing while the track decodes.
+    /// The track's waveform, growing while the track decodes (or the stored one).
     pub fn waveform(&self) -> &Arc<LiveWaveform> {
         &self.waveform
     }
@@ -108,17 +168,163 @@ impl Player {
         self.handle.load_meter()
     }
 
+    /// The loaded track in its library, once the library found or made its record.
+    pub fn track(&self) -> Option<TrackRef> {
+        self.lib.track
+    }
+
     /// Send a command to the deck; false if the command ring is full.
     pub fn send(&mut self, cmd: DeckCommand) -> bool {
         self.handle.send_deck(DECK, cmd).is_ok()
     }
 
-    /// Housekeeping; returns lines worth showing the user (analysis result, errors).
+    /// MEMORY: store the active loop, else the cue point, as a memory cue in the library.
+    /// Returns a line to show.
+    pub fn memory(&mut self) -> String {
+        let (Some(t), Some(lib)) = (self.lib.track, &self.library) else {
+            return "no library record yet: memory not stored".into();
+        };
+        let st = self.handle.deck_state(DECK);
+        let sr = f64::from(self.format.sample_rate);
+        let cue = if st.looping.load(Ordering::Relaxed) {
+            Cue::memory_loop(st.loop_start.load() / sr, st.loop_end.load() / sr)
+        } else {
+            Cue::memory(st.cue.load() / sr)
+        };
+        let line = match cue.end {
+            Some(end) => format!("memory loop {:.3}-{:.3} s stored", cue.at, end),
+            None => format!("memory cue {:.3} s stored", cue.at),
+        };
+        lib.edit(Edit::AddCue(t.track, cue));
+        line
+    }
+
+    fn start_analysis(
+        &mut self,
+        cached: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
+        audio_hash: bool,
+    ) {
+        if self.analysis.is_none() {
+            self.analysis = Some(analyze_in_background(
+                self.file.clone(),
+                self.format.sample_rate,
+                self.settings,
+                cached,
+                audio_hash,
+            ));
+        }
+    }
+
+    /// Hand the record's cues to the deck.
+    fn restore_cues(&mut self, record: &Track) -> bool {
+        let sr = f64::from(self.format.sample_rate);
+        let mut hot = [None; HOT_CUES];
+        for (slot, h) in hot.iter_mut().zip(&record.hot_cues) {
+            *slot = h.as_ref().map(|h| h.at * sr);
+        }
+        let first = record.cues.first().map(|(_, c)| c);
+        let cues = TrackCues {
+            cue: first.map(|c| c.at * sr),
+            hot,
+            stored_loop: first.and_then(|c| match (c.kind, c.end) {
+                (CueKind::Loop, Some(end)) => Some((c.at * sr, end * sr)),
+                _ => None,
+            }),
+        };
+        let serial = self.lib.serial + 1;
+        let sent = self.send(DeckCommand::SetCues {
+            source_id: self.source.id(),
+            serial,
+            cues,
+        });
+        if sent {
+            self.lib.serial = serial;
+            self.lib.restored = hot;
+            self.lib.known = hot;
+        }
+        sent
+    }
+
+    fn on_loaded(&mut self, l: Loaded, lines: &mut Vec<String>) {
+        let first = self.lib.track.is_none();
+        self.lib.track = Some(l.track);
+        let hot = l.record.hot_cues.iter().flatten().count();
+        let cues = l.record.cues.len();
+        // On a merge, the merged record's cues replace the deck's only if the DJ has not
+        // edited them since they were restored.
+        let untouched = self.lib.known == self.lib.restored;
+        if (first || untouched) && (hot > 0 || cues > 0 || !first) {
+            if !self.restore_cues(&l.record) {
+                lines.push("command ring full, stored cues dropped".into());
+            } else if hot + cues > 0 {
+                lines.push(format!(
+                    "library: {hot} hot cues and {cues} memory cues restored"
+                ));
+            }
+        } else if first {
+            // Nothing stored: the deck's (empty) cues are the library's.
+            self.lib.serial = self
+                .handle
+                .deck_state(DECK)
+                .cues_serial
+                .load(Ordering::Relaxed);
+        }
+        if first {
+            if let Some(w) = l.waveform {
+                if self.waveform.set_stored(w) {
+                    lines.push("library: waveform from the library".into());
+                }
+                self.lib.waveform_stored = true;
+            }
+            let need_hash = !l.record.locations.iter().any(|(_, f)| {
+                f.file_hash == l.file_hash && f.audio_hash.is_some_and(|a| a.is_current())
+            });
+            self.start_analysis(l.analysis, need_hash);
+        }
+    }
+
+    /// Write hot cue changes made on the deck to the library.
+    fn write_back_cues(&mut self) {
+        let (Some(t), Some(lib)) = (self.lib.track, &self.library) else {
+            return;
+        };
+        let st = self.handle.deck_state(DECK);
+        if st.cues_serial.load(Ordering::Relaxed) != self.lib.serial {
+            // The deck has not applied the stored cues yet.
+            return;
+        }
+        let sr = f64::from(self.format.sample_rate);
+        for (slot, pos) in st.hot_cue_positions.iter().enumerate() {
+            let p = pos.load();
+            let now = (!p.is_nan()).then_some(p);
+            if now != self.lib.known[slot] {
+                self.lib.known[slot] = now;
+                lib.edit(Edit::SetHotCue(
+                    t.track,
+                    slot,
+                    now.map(|f| HotCue::at(f / sr)),
+                ));
+            }
+        }
+    }
+
+    /// Housekeeping; returns lines worth showing the user (library, analysis, errors).
     pub fn poll(&mut self) -> Vec<String> {
         let mut lines = Vec::new();
-        if let Ok(result) = self.analysis.try_recv() {
+        while let Some(reply) = self.library.as_ref().and_then(LibraryWorker::try_recv) {
+            match reply {
+                Reply::Message(m) => lines.push(m),
+                Reply::Loaded(l) => self.on_loaded(*l, &mut lines),
+                Reply::Failed(e) => {
+                    lines.push(format!("library: {e}; nothing is stored"));
+                    self.library = None;
+                    self.start_analysis(BTreeMap::new(), false);
+                }
+            }
+        }
+        if let Some(Ok(result)) = self.analysis.as_ref().map(Receiver::try_recv) {
             match result {
-                Ok(done) => {
+                Ok(mut done) => {
                     lines.push(done.summary.clone());
                     if let Some(grid) = &done.grid {
                         let cmd = DeckCommand::SetGrid {
@@ -129,11 +335,26 @@ impl Player {
                             lines.push("command ring full, grid dropped".into());
                         }
                     }
+                    if let Some(lib) = &self.library {
+                        lib.analysis(std::mem::take(&mut done.fresh));
+                        if let Some(h) = done.audio_hash {
+                            lib.audio_hash(h);
+                        }
+                    }
                     self.analysed = Some(done);
                 }
                 Err(e) => lines.push(format!("analysis: {e}")),
             }
         }
+        if !self.lib.waveform_stored
+            && self.lib.track.is_some()
+            && let Some(lib) = &self.library
+            && let Some(w) = self.waveform.finished()
+        {
+            lib.waveform(w);
+            self.lib.waveform_stored = true;
+        }
+        self.write_back_cues();
         self.handle.collect_retired();
         if self.loader.as_ref().is_some_and(|t| t.is_finished())
             && let Some(Err(e)) = self.loader.take().and_then(|t| t.join().ok())
@@ -154,6 +375,9 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        // Last deck edits first; dropping the worker then waits for its final flush.
+        self.write_back_cues();
+        drop(self.library.take());
         drop(self.stream.take());
         self.handle.collect_retired();
     }
@@ -163,6 +387,8 @@ impl Drop for Player {
 #[derive(Debug, Default)]
 pub struct LiveWaveform {
     state: Mutex<LiveState>,
+    /// A stored waveform replaced the computation: the tap stops.
+    stored: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -179,6 +405,20 @@ impl LiveWaveform {
 
     fn set_timeline(&self, timeline: Timeline) {
         self.lock().timeline = timeline;
+    }
+
+    /// Use a stored waveform instead of computing one. False (and ignored) if the
+    /// computed one is already complete.
+    fn set_stored(&self, w: Waveform) -> bool {
+        let mut s = self.lock();
+        if s.done.is_some() {
+            return false;
+        }
+        s.entries.clear();
+        s.timeline = w.timeline;
+        s.done = Some(w);
+        self.stored.store(true, Ordering::Relaxed);
+        true
     }
 
     /// Append the entries `have` does not have yet. Returns true once the waveform is
@@ -229,6 +469,9 @@ impl WaveTap {
     }
 
     fn push(&mut self, stereo: &[f32]) {
+        if self.live.stored.load(Ordering::Relaxed) {
+            self.builder = None;
+        }
         let Some(b) = self.builder.as_mut() else {
             return;
         };
@@ -248,33 +491,44 @@ impl Drop for WaveTap {
         if let Some(b) = self.builder.take() {
             let wf = b.finish();
             let mut s = self.live.lock();
-            s.entries.clear();
-            s.done = Some(wf);
+            if s.done.is_none() {
+                s.entries.clear();
+                s.done = Some(wf);
+            }
         }
     }
 }
 
-/// What the analysis thread hands back: the deck grid (engine frames), the key and a line to
-/// print.
+/// What the analysis thread hands back: the deck grid (engine frames), the key, a line to
+/// print, and what to store in the library.
 pub struct Analysed {
     pub grid: Option<Arc<DeckGrid>>,
     pub bpm: Option<f64>,
     pub key: Option<String>,
     pub summary: String,
+    /// Results computed now (not from the library), to be stored.
+    pub fresh: Vec<FreshAnalysis>,
+    /// Analyzers whose result came from the library.
+    pub from_library: usize,
+    /// The audio hash, if it was asked for.
+    pub audio_hash: Option<AudioHash>,
 }
 
 /// Analyse `path` on its own thread: tempo (TempoCNN, if `TEMPOCNN_MODEL` is set) refined by
-/// gridfit, the grid, and the key. The result arrives on the returned channel.
+/// gridfit, the grid, and the key, reusing `cached` results whose analyzer version and
+/// parameters still match. The result arrives on the returned channel.
 fn analyze_in_background(
     path: PathBuf,
     engine_rate: u32,
     settings: engine_analysis::Settings,
+    cached: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
+    audio_hash: bool,
 ) -> Receiver<Result<Analysed, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("analysis".into())
         .spawn(move || {
-            let _ = tx.send(analyze(&path, engine_rate, settings));
+            let _ = tx.send(analyze(&path, engine_rate, settings, &cached, audio_hash));
         });
     if let Err(e) = spawned {
         // The sender is gone with the closure: the receiver just never yields.
@@ -287,10 +541,11 @@ fn analyze(
     path: &Path,
     engine_rate: u32,
     settings: engine_analysis::Settings,
+    cached: &BTreeMap<String, (AnalysisRef, Vec<u8>)>,
+    want_audio_hash: bool,
 ) -> Result<Analysed, String> {
     use engine_analysis::{Analysis, Analyzer, CancelFlag, FeatureSet, GridFit, GridFitConfig};
     let started = Instant::now();
-    let audio = engine_analysis::load(path).map_err(|e| e.to_string())?;
     let mut analyzers: Vec<Box<dyn Analyzer>> = Vec::new();
     let mut hint = None;
     if let Some(t) = engine_analysis::tempocnn::TempoCnn::from_env() {
@@ -303,13 +558,63 @@ fn analyze(
         ..GridFitConfig::default()
     })));
     analyzers.push(Box::new(engine_analysis::hpcpkey::HpcpKey::default()));
-    let results =
-        engine_analysis::run_all(&mut analyzers, &audio, FeatureSet::ALL, &CancelFlag::new())
-            .map_err(|e| e.to_string())?;
+
+    // Decoded only if something has to be computed.
+    let mut audio = None;
+    let load = || -> Result<engine_analysis::TrackAudio, String> {
+        engine_analysis::load(path).map_err(|e| e.to_string())
+    };
+    let cancel = CancelFlag::new();
+    let mut context: Vec<Analysis> = Vec::new();
+    let mut fresh = Vec::new();
+    let mut from_library = 0;
+    for a in &mut analyzers {
+        let want = FeatureSet::ALL.intersect(a.features());
+        if want.is_empty() {
+            continue;
+        }
+        let id = a.id();
+        // A result is reused only while everything before it was reused too: analyzers
+        // refine their predecessors' results.
+        let reuse = cached
+            .get(&id.name)
+            .filter(|(r, _)| fresh.is_empty() && r.version == id.version && r.params == id.params)
+            .and_then(|(_, blob)| stored::decode(blob, &id));
+        let result = match reuse {
+            Some(r) => {
+                from_library += 1;
+                r
+            }
+            None => {
+                if audio.is_none() {
+                    audio = Some(load()?);
+                }
+                let audio = audio.as_ref().expect("just loaded");
+                let r = a
+                    .analyze(audio, want, &context, &cancel)
+                    .map_err(|e| e.to_string())?;
+                fresh.push(FreshAnalysis {
+                    name: id.name.clone(),
+                    version: id.version.clone(),
+                    params: id.params.clone(),
+                    blob: stored::encode(&r),
+                });
+                r
+            }
+        };
+        context.push(result);
+    }
+    let audio_hash = if want_audio_hash {
+        if audio.is_none() {
+            audio = Some(load()?);
+        }
+        audio.as_ref().map(|a| AudioHash::of_pcm(&a.stereo))
+    } else {
+        None
+    };
     // Later analyzers refine earlier ones (gridfit's tempo over TempoCNN's).
     let mut merged = Analysis::default();
-    for (_, r) in results {
-        let r = r.map_err(|e| e.to_string())?;
+    for r in context {
         merged.tempo = r.tempo.or(merged.tempo);
         merged.beatgrid = r.beatgrid.or(merged.beatgrid);
         merged.key = r.key.or(merged.key);
@@ -331,7 +636,12 @@ fn analyze(
         .map(|b| b.time);
     let key = merged.key.map(|k| k.value.to_string());
     let summary = format!(
-        "analysed in {:.1} s: {}, key {}, first downbeat {}{}",
+        "{} in {:.1} s: {}, key {}, first downbeat {}{}",
+        if fresh.is_empty() {
+            "analysis from the library"
+        } else {
+            "analysed"
+        },
         started.elapsed().as_secs_f64(),
         bpm.map_or("no tempo".into(), |b| format!("{b:.2} BPM")),
         key.as_deref().unwrap_or("?"),
@@ -347,6 +657,9 @@ fn analyze(
         bpm,
         key,
         summary,
+        fresh,
+        from_library,
+        audio_hash,
     })
 }
 
@@ -379,5 +692,89 @@ mod tests {
         let batch = waveform::compute::compute(&audio, sr as u32, &Params::default());
         assert_eq!(seen, batch.entries);
         assert_eq!(live.finished().unwrap().entries, batch.entries);
+    }
+
+    #[test]
+    fn a_stored_waveform_stops_the_computation() {
+        let live = Arc::new(LiveWaveform::default());
+        let mut tap = WaveTap::new(48_000, Arc::clone(&live)).boxed();
+        tap(&vec![0.5; 2 * 48_000]);
+        let stored = waveform::compute::compute(&vec![0.1; 4 * 48_000], 48_000, &Params::default());
+        assert!(live.set_stored(stored.clone()));
+        tap(&vec![0.5; 2 * 48_000]);
+        drop(tap);
+        assert_eq!(live.finished().unwrap().entries, stored.entries);
+        assert!(!live.set_stored(stored), "only before one is complete");
+    }
+
+    /// 20 s of clicks at 120 BPM, stereo, 16-bit.
+    fn clicks(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..44_100 * 20 {
+            let since = i % 22_050;
+            let x = if since < 400 {
+                (since as f32 * 0.7).sin() * (1.0 - since as f32 / 400.0)
+            } else {
+                0.0
+            };
+            let s = (x * 20_000.0) as i16;
+            w.write_sample(s).unwrap();
+            w.write_sample(s).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn stored_analysis_is_reused_without_decoding() {
+        let dir = std::env::temp_dir().join(format!("engined-analysis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clicks.wav");
+        clicks(&path);
+        let settings = engine_analysis::Settings::default();
+        let first = analyze(&path, 48_000, settings, &BTreeMap::new(), true).unwrap();
+        assert_eq!(first.from_library, 0);
+        assert!(!first.fresh.is_empty());
+        assert!(first.audio_hash.is_some());
+        let bpm = first.bpm.unwrap();
+        assert!((bpm - 120.0).abs() < 0.5, "{bpm}");
+
+        let cached: BTreeMap<String, (AnalysisRef, Vec<u8>)> = first
+            .fresh
+            .iter()
+            .map(|f| {
+                let r = AnalysisRef {
+                    version: f.version.clone(),
+                    params: f.params.clone(),
+                    blob: library::BlobId::of(&f.blob),
+                    created: String::new(),
+                };
+                (f.name.clone(), (r, f.blob.clone()))
+            })
+            .collect();
+        // With every result stored and no audio hash wanted, the file is not even read.
+        std::fs::remove_file(&path).unwrap();
+        let again = analyze(&path, 48_000, settings, &cached, false).unwrap();
+        assert_eq!(again.from_library, first.fresh.len());
+        assert!(again.fresh.is_empty());
+        assert_eq!(again.bpm, first.bpm);
+        assert_eq!(again.key, first.key);
+        assert_eq!(
+            again.grid.as_ref().map(|g| g.bpm()),
+            first.grid.as_ref().map(|g| g.bpm())
+        );
+
+        // A result from another analyzer version is recomputed (and the file is needed).
+        let mut stale = cached;
+        for (r, _) in stale.values_mut() {
+            r.version = "0.0.0-old".into();
+        }
+        assert!(analyze(&path, 48_000, settings, &stale, false).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

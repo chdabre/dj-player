@@ -1110,6 +1110,9 @@ dependencies = [
  "engine-core",
  "engine-io",
  "engine-media",
+ "hound",
+ "library",
+ "serde_json",
  "waveform",
 ]
 

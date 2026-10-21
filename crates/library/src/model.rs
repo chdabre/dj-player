@@ -63,13 +63,13 @@ pub fn track_of_path(path: &str) -> Option<TrackId> {
     }
 }
 
-/// A path component an analyzer name can be: ASCII letters, digits, `-`, `_`, `.`.
+/// A path component an analyzer name can be: ASCII letters, digits, `-`, `_`, `.`, `+`.
 pub fn is_component(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
 }
 
 fn take_f64(m: &mut Map<String, Value>, k: &str) -> Option<f64> {

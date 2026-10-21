@@ -5,7 +5,7 @@
 //! overview to seek. Keys as in `engined`, plus a real CUE hold (the window sees key
 //! releases): space play/pause, c cue, 1–8 hot cues (shift: delete), i/o/l loop,
 //! b 4-beat loop, [ ] loop ½X / 2X, , . beat jump, ←/→ seek ±5 s, +/- rate, 0 reset,
-//! k keylock, r reverse, s slip, z quantize, w waveform mode (3-band / RGB / single colour),
+//! k keylock, r reverse, s slip, m memory cue, z quantize, w waveform mode (3-band / RGB / single colour),
 //! d timing overlay, f fullscreen, q quit.
 //!
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use engine_core::DeckCommand;
 use engine_io::{CpalBackend, StreamRequest};
-use engined::Player;
+use engined::{LibraryChoice, Options, Player};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, Touch, TouchPhase, WindowEvent};
@@ -50,7 +50,7 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] \
                      [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--at <seconds>] [--play] [--run-for <seconds>] \
-                     [--screenshot <out.png>]";
+                     [--screenshot <out.png>] [--library <dir> | --no-library]";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
 const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
@@ -65,6 +65,7 @@ struct Args {
     run_for: Option<f64>,
     theme: Theme,
     wave_mode: Mode,
+    library: LibraryChoice,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -75,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
     let mut theme = Theme::default();
     let mut wave_theme: Option<String> = None;
     let mut wave_mode = Mode::ThreeBand;
+    let mut library = LibraryChoice::Auto;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -117,6 +119,12 @@ fn parse_args() -> Result<Args, String> {
                     format!("unknown theme {name:?} (themes: {})", names.join(", "))
                 })?;
             }
+            "--library" => {
+                library = LibraryChoice::Folder(PathBuf::from(
+                    args.next().ok_or("--library needs a folder")?,
+                ))
+            }
+            "--no-library" => library = LibraryChoice::Ram,
             "--run-for" => {
                 let s = args.next().ok_or("--run-for needs seconds")?;
                 run_for = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
@@ -148,6 +156,7 @@ fn parse_args() -> Result<Args, String> {
         run_for,
         theme,
         wave_mode,
+        library,
     })
 }
 
@@ -163,7 +172,11 @@ fn main() -> ExitCode {
         }
     };
     let backend = CpalBackend::new();
-    let mut player = match Player::open(&backend, &args.request, &args.file, Default::default()) {
+    let options = Options {
+        library: args.library.clone(),
+        ..Options::default()
+    };
+    let mut player = match Player::open_with(&backend, &args.request, &args.file, options) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("dj-ui: {e}");
@@ -347,6 +360,10 @@ impl App {
                     "q" => return event_loop.exit(),
                     "d" => {
                         self.debug = !self.debug;
+                        return;
+                    }
+                    "m" => {
+                        eprintln!("{}", self.player.memory());
                         return;
                     }
                     "w" => {

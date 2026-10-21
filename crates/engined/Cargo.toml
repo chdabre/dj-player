@@ -1,6 +1,6 @@
 [package]
 name = "engined"
-description = "Engine daemon; for now a CLI that plays one file on one deck."
+description = "Engine daemon; for now a CLI that plays one file on one deck, with its library."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,7 +14,12 @@ engine-io.workspace = true
 engine-analysis.workspace = true
 waveform = { workspace = true, default-features = false }
 assert_no_alloc.workspace = true
+library.workspace = true
+serde_json.workspace = true
 crossterm.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
 
 [lints]
 workspace = true
