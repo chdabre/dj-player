@@ -5,7 +5,9 @@ use std::io;
 
 use serde_json::{Value, json};
 
-use crate::codec::{self, FORMAT_VERSION, Line, Op, OpKind, SegmentHeader, SnapshotHeader};
+use crate::codec::{
+    self, FORMAT_VERSION, Line, Op, OpKind, SegmentHeader, SnapshotEnd, SnapshotHeader,
+};
 use crate::hash::{AudioHash, FileHash, track_id};
 use crate::hlc::{Clock, Hlc, Stamp};
 use crate::ids::{BlobId, DeviceId, LibraryId, TrackId, TrackRef};
@@ -15,6 +17,19 @@ use crate::store::Store;
 
 /// A segment is closed and the next one opened once it passes this size.
 pub const SEGMENT_ROTATE_BYTES: usize = 64 * 1024;
+
+/// Files larger than these are not read: a junk file on someone else's stick must not fill
+/// RAM. Far above what a real library writes (segments rotate at 64 KB; 10,000 tracks make
+/// a 45 MB snapshot; a 5-minute waveform blob is 135 KB).
+pub const MAX_SEGMENT_BYTES: u64 = 64 << 20;
+pub const MAX_SNAPSHOT_BYTES: u64 = 2 << 30;
+pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+
+/// The last stamp any library in this process handed out, per device. Two mounts as one
+/// device (two decks on one stick) then never hand out the same stamp, so never the same
+/// element id.
+static LAST_STAMPS: std::sync::Mutex<BTreeMap<DeviceId, Hlc>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 /// The `format` field of `FORMAT`.
 pub const FORMAT_NAME: &str = "djplayer-library";
@@ -136,8 +151,10 @@ pub struct MountStats {
     /// Segments not read because a snapshot holds them.
     pub segments_covered: usize,
     pub ops: usize,
-    /// Torn or corrupt lines skipped.
+    /// Torn or corrupt lines skipped, and operations dropped for an implausible HLC.
     pub skipped_lines: usize,
+    /// Files (segments, snapshots) or folders that could not be read and were skipped.
+    pub skipped_files: usize,
 }
 
 /// What [`Library::find_or_create`] did.
@@ -239,11 +256,28 @@ impl Library {
         let mut state = State::new();
         let mut vector: BTreeMap<DeviceId, u32> = BTreeMap::new();
         let mut stats = MountStats::default();
-        for name in store.list("snapshots")? {
+        // One unreadable file or folder is skipped with a warning, never the whole mount.
+        let skip = |warnings: &mut Vec<String>, stats: &mut MountStats, what: String, e| {
+            stats.skipped_files += 1;
+            warnings.push(format!("{what}: {e}; skipped"));
+        };
+        let snapshots = store.list("snapshots").unwrap_or_else(|e| {
+            skip(&mut warnings, &mut stats, "snapshots/".into(), e);
+            Vec::new()
+        });
+        for name in snapshots {
             if !name.ends_with(".snap") {
                 continue;
             }
-            let decoded = codec::decode(&store.read(&format!("snapshots/{name}"))?);
+            let path = format!("snapshots/{name}");
+            let bytes = match store.read_limited(&path, MAX_SNAPSHOT_BYTES) {
+                Ok(b) => b,
+                Err(e) => {
+                    skip(&mut warnings, &mut stats, path, e);
+                    continue;
+                }
+            };
+            let decoded = codec::decode(&bytes);
             let Some(Line::Snapshot(header)) = decoded.lines.first() else {
                 warnings.push(format!("snapshot {name} has no header; ignored"));
                 continue;
@@ -251,53 +285,83 @@ impl Library {
             if u64::from(header.format) > u64::from(FORMAT_VERSION) {
                 return Err(MountError::NewerFormat(header.format.into()));
             }
-            for (d, s) in &header.vector {
-                let v = vector.entry(*d).or_default();
-                *v = (*v).max(*s);
-            }
-            state.observe(header.hlc);
             stats.snapshots += 1;
             stats.skipped_lines += decoded.skipped;
             for line in &decoded.lines[1..] {
                 if let Line::Op(op) = line {
-                    state.apply(op);
-                    stats.ops += 1;
+                    apply_counted(&mut state, op, &mut stats);
                 }
+            }
+            state.observe(header.hlc);
+            // Its operations are safe to use either way; its vector only if the file is
+            // whole, or segments it never held would be skipped as covered.
+            if snapshot_is_whole(&bytes, &decoded) {
+                for (d, s) in &header.vector {
+                    let v = vector.entry(*d).or_default();
+                    *v = (*v).max(*s);
+                }
+            } else {
+                warnings.push(format!(
+                    "snapshot {name} is incomplete or damaged: its operations are used, \
+                     and the journal segments it claims to hold are read again"
+                ));
             }
         }
 
         let covered = vector.clone();
         let mut own_last = 0;
-        for dev_name in store.list("journal")? {
+        let devices = store.list("journal").unwrap_or_else(|e| {
+            skip(&mut warnings, &mut stats, "journal/".into(), e);
+            Vec::new()
+        });
+        for dev_name in devices {
             let Ok(dev) = dev_name.parse::<DeviceId>() else {
                 continue;
             };
-            let mut segments: Vec<u32> = store
-                .list(&format!("journal/{dev_name}"))?
-                .iter()
-                .filter_map(|n| segment_number(n))
-                .collect();
+            let dir = format!("journal/{dev_name}");
+            let names = match store.list(&dir) {
+                Ok(n) => n,
+                Err(e) => {
+                    skip(&mut warnings, &mut stats, dir, e);
+                    continue;
+                }
+            };
+            let mut segments: Vec<u32> = names.iter().filter_map(|n| segment_number(n)).collect();
             segments.sort_unstable();
             if dev == opts.device {
+                // Every listed number counts, read or not: it is taken.
                 own_last = segments.last().copied().unwrap_or(0);
             }
+            // The highest segment held with every one below it: the vector never covers a
+            // gap (a segment not synced yet, or unreadable now), so it is read when it comes.
+            let mut held = covered.get(&dev).copied().unwrap_or(0);
             for seg in segments {
                 if covered.get(&dev).is_some_and(|&c| seg < c) {
                     stats.segments_covered += 1;
                     continue;
                 }
-                let bytes = store.read(&format!("journal/{dev_name}/{seg:08}.log"))?;
+                let path = format!("{dir}/{seg:08}.log");
+                let bytes = match store.read_limited(&path, MAX_SEGMENT_BYTES) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        skip(&mut warnings, &mut stats, path, e);
+                        continue;
+                    }
+                };
                 let decoded = codec::decode(&bytes);
                 stats.segments += 1;
                 stats.skipped_lines += decoded.skipped;
                 for line in &decoded.lines {
                     if let Line::Op(op) = line {
-                        state.apply(op);
-                        stats.ops += 1;
+                        apply_counted(&mut state, op, &mut stats);
                     }
                 }
-                let v = vector.entry(dev).or_default();
-                *v = (*v).max(seg);
+                if seg <= held + 1 {
+                    held = held.max(seg);
+                }
+            }
+            if held > 0 {
+                vector.insert(dev, held);
             }
         }
         if stats.skipped_lines > 0 {
@@ -306,6 +370,9 @@ impl Library {
                 stats.skipped_lines
             ));
         }
+        // Never reuse a segment number: not one on disk, nor one a snapshot holds (its file
+        // may have been compacted away).
+        let next_segment = own_last.max(vector.get(&opts.device).copied().unwrap_or(0)) + 1;
 
         let mut clock = Clock::default();
         clock.observe(state.max_hlc());
@@ -315,7 +382,7 @@ impl Library {
             }
         } else {
             Mode::Journal {
-                segment: own_last + 1,
+                segment: next_segment,
                 bytes: 0,
                 open: false,
             }
@@ -380,8 +447,15 @@ impl Library {
     }
 
     fn stamp(&mut self) -> Stamp {
+        let mut last = LAST_STAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shared = last.entry(self.opts.device).or_default();
+        self.clock.observe(*shared);
+        let hlc = self.clock.tick((self.opts.now)());
+        *shared = hlc;
         Stamp {
-            hlc: self.clock.tick((self.opts.now)()),
+            hlc,
             device: self.opts.device,
         }
     }
@@ -414,27 +488,50 @@ impl Library {
             self.unsaved += ops.len();
             return;
         };
-        let path = format!("journal/{}/{:08}.log", self.opts.device, segment);
-        let mut text = String::new();
-        if !*open {
-            let header = SegmentHeader {
-                segment: *segment,
-                device: self.opts.device,
-                format: FORMAT_VERSION,
-                opened: self.clock.last(),
-                extra: Default::default(),
-            };
-            text += &codec::frame(&header.to_json());
-        }
+        let mut body = String::new();
         for op in ops {
-            text += &codec::frame(&op.to_json());
+            body += &codec::frame(&op.to_json());
         }
-        let (seg, was_open) = (*segment, *open);
-        match self.store.append(&path, text.as_bytes()) {
-            Ok(()) => {
-                *bytes += text.len();
+        let was_open = *open;
+        let written = if *open {
+            let path = format!("journal/{}/{:08}.log", self.opts.device, segment);
+            self.store
+                .append(&path, body.as_bytes())
+                .map(|()| (path, body.len()))
+        } else {
+            // A new segment is claimed with its header in one step; one taken by another
+            // writer as this device (a second mount) is passed over.
+            let mut attempt = 0;
+            loop {
+                let path = format!("journal/{}/{:08}.log", self.opts.device, segment);
+                let header = SegmentHeader {
+                    segment: *segment,
+                    device: self.opts.device,
+                    format: FORMAT_VERSION,
+                    opened: self.clock.last(),
+                    extra: Default::default(),
+                };
+                let text = codec::frame(&header.to_json()) + &body;
+                match self.store.append_new(&path, text.as_bytes()) {
+                    Ok(()) => break Ok((path, text.len())),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 1000 => {
+                        attempt += 1;
+                        *segment += 1;
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        };
+        let seg = *segment;
+        match written {
+            Ok((path, len)) => {
+                *bytes += len;
                 *open = true;
-                self.vector.insert(self.opts.device, seg);
+                // Held without a gap only if every lower own segment is held too.
+                let v = self.vector.entry(self.opts.device).or_default();
+                if seg <= *v + 1 {
+                    *v = (*v).max(seg);
+                }
                 self.unflushed = Some(path);
                 if *bytes >= SEGMENT_ROTATE_BYTES {
                     *segment += 1;
@@ -479,10 +576,18 @@ impl Library {
     /// Apply operations from a linked player: stamped with its HLC and device id, journaled
     /// here as they are.
     pub fn apply_remote(&mut self, ops: &[Op]) {
-        for op in ops {
+        // An implausible stamp would win every merge: such an op is not taken.
+        let ops: Vec<Op> = ops
+            .iter()
+            .filter(|op| op.stamp.hlc.is_plausible())
+            .cloned()
+            .collect();
+        for op in &ops {
             self.clock.observe(op.stamp.hlc);
         }
-        self.commit(ops);
+        if !ops.is_empty() {
+            self.commit(&ops);
+        }
     }
 
     /// Make an edit. Edits to a track that was merged into another go to the survivor.
@@ -889,9 +994,29 @@ impl Library {
             return id;
         }
         if self.is_writable() {
-            match self.store.create(&id.path(), bytes) {
+            let path = id.path();
+            match self.store.create(&path, bytes) {
                 Ok(()) => return id,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return id,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if self.read_blob(id).is_ok() {
+                        return id;
+                    }
+                    // A damaged copy under this name would fail every read: replace it.
+                    match self
+                        .store
+                        .remove(&path)
+                        .and_then(|()| self.store.create(&path, bytes))
+                    {
+                        Ok(()) => {
+                            self.warnings
+                                .push(format!("blob {id} was damaged and is rewritten"));
+                            return id;
+                        }
+                        Err(e) => self
+                            .warnings
+                            .push(format!("blob {id} is damaged and can't be rewritten ({e})")),
+                    }
+                }
                 Err(e) => self.stop_saving(e.to_string()),
             }
         }
@@ -904,7 +1029,7 @@ impl Library {
         if let Some(b) = self.ram_blobs.get(&id) {
             return Ok(b.clone());
         }
-        let bytes = self.store.read(&id.path())?;
+        let bytes = self.store.read_limited(&id.path(), MAX_BLOB_BYTES)?;
         if BlobId::of(&bytes) != id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -916,8 +1041,9 @@ impl Library {
 
     // Snapshots
 
-    /// The current state as a snapshot file: a header with the version vector, then one
-    /// line per register, element, tombstone and event, with their original stamps.
+    /// The current state as a snapshot file: a header with the version vector, one line per
+    /// register, element, tombstone and event with their original stamps, and an end line
+    /// with the count and hash of those lines, so a cut-short copy is never trusted.
     pub fn snapshot_bytes(&self) -> Vec<u8> {
         let header = SnapshotHeader {
             device: self.opts.device,
@@ -927,9 +1053,14 @@ impl Library {
             extra: Default::default(),
         };
         let mut out = codec::frame(&header.to_json()).into_bytes();
+        let mut body = Vec::new();
+        let mut ops = 0;
         for op in self.state.ops() {
-            out.extend_from_slice(codec::frame(&op.to_json()).as_bytes());
+            body.extend_from_slice(codec::frame(&op.to_json()).as_bytes());
+            ops += 1;
         }
+        out.extend_from_slice(&body);
+        out.extend_from_slice(codec::frame(&SnapshotEnd::of(ops, &body).to_json()).as_bytes());
         out
     }
 
@@ -945,6 +1076,40 @@ impl Library {
         self.store.create(&path, &self.snapshot_bytes())?;
         Ok(path)
     }
+}
+
+/// Apply `op`, counting one with an implausible HLC (which the state drops) as skipped.
+fn apply_counted(state: &mut State, op: &Op, stats: &mut MountStats) {
+    if op.stamp.hlc.is_plausible() {
+        state.apply(op);
+        stats.ops += 1;
+    } else {
+        stats.skipped_lines += 1;
+    }
+}
+
+/// True if a snapshot file ends with a [`SnapshotEnd`] that matches what is between it and
+/// the header, and no line was skipped: nothing was cut off or damaged.
+fn snapshot_is_whole(bytes: &[u8], decoded: &codec::Decoded) -> bool {
+    let Some(Line::SnapshotEnd(end)) = decoded.lines.last() else {
+        return false;
+    };
+    if decoded.skipped > 0 || !bytes.ends_with(b"\n") {
+        return false;
+    }
+    let Some(header_end) = bytes.iter().position(|&b| b == b'\n') else {
+        return false;
+    };
+    let last = bytes.len() - 1;
+    let Some(end_start) = bytes[..last].iter().rposition(|&b| b == b'\n') else {
+        return false;
+    };
+    let ops = decoded
+        .lines
+        .iter()
+        .filter(|l| matches!(l, Line::Op(_)))
+        .count();
+    end_start > header_end && end.matches(ops as u64, &bytes[header_end + 1..=end_start])
 }
 
 fn push_unique(v: &mut Vec<TrackId>, t: TrackId) {

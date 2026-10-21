@@ -45,12 +45,18 @@ pub struct State {
 }
 
 /// `a` beats `b`: higher stamp, and on an exact tie (never made by a correct device) the
-/// larger value text, so even then every replica picks the same one.
+/// larger value text, then the larger text of the extra fields, so even then every replica
+/// picks the same one whatever the order it saw them in.
 fn wins(a: &Entry, b: &Entry) -> bool {
     match a.stamp.cmp(&b.stamp) {
         std::cmp::Ordering::Equal => {
-            let (x, y) = (a.value.to_string(), b.value.to_string());
-            x > y
+            let key = |e: &Entry| {
+                (
+                    e.value.to_string(),
+                    Value::Object(e.extra.clone()).to_string(),
+                )
+            };
+            key(a) > key(b)
         }
         o => o.is_gt(),
     }
@@ -69,10 +75,18 @@ impl State {
     /// Raise [`State::max_hlc`] to at least `hlc`: a snapshot records the highest HLC it
     /// saw, which may belong to an operation it no longer needs to keep.
     pub fn observe(&mut self, hlc: Hlc) {
-        self.max_hlc = self.max_hlc.max(hlc);
+        if hlc.is_plausible() {
+            self.max_hlc = self.max_hlc.max(hlc);
+        }
     }
 
+    /// Fold in one operation. An operation with an implausible HLC (see
+    /// [`crate::hlc::MAX_PLAUSIBLE_MS`]) is dropped: it would otherwise win every merge, and
+    /// every replica drops it alike.
     pub fn apply(&mut self, op: &Op) {
+        if !op.stamp.hlc.is_plausible() {
+            return;
+        }
         self.max_hlc = self.max_hlc.max(op.stamp.hlc);
         let entry = |value: &Value| Entry {
             stamp: op.stamp,
@@ -131,9 +145,16 @@ impl State {
                 }
             }
             OpKind::Unknown(_) => {
-                self.unknown
-                    .entry((op.stamp, op.path.clone()))
-                    .or_insert_with(|| op.clone());
+                // On a duplicate key, keep the larger text, whatever the order.
+                let key = (op.stamp, op.path.clone());
+                let text = |o: &Op| o.to_json().to_string();
+                let keep = self
+                    .unknown
+                    .get(&key)
+                    .is_none_or(|old| text(op) > text(old));
+                if keep {
+                    self.unknown.insert(key, op.clone());
+                }
             }
         }
     }

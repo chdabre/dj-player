@@ -15,6 +15,11 @@ pub struct Hlc(pub u64);
 
 const MS_MAX: u64 = (1 << 48) - 1;
 
+/// 2200-01-01T00:00:00Z in ms: no correct device stamps anything later. An HLC beyond it is
+/// corrupt or hostile (the 48-bit field reaches the year 10889): merging drops the operation
+/// and clocks never observe it, so one bad line can't pin every device's clock at the top.
+pub const MAX_PLAUSIBLE_MS: u64 = 7_258_118_400_000;
+
 impl Hlc {
     pub const ZERO: Hlc = Hlc(0);
 
@@ -33,6 +38,11 @@ impl Hlc {
     /// The next value after this one.
     pub fn next(self) -> Hlc {
         Hlc(self.0.saturating_add(1))
+    }
+
+    /// At or before [`MAX_PLAUSIBLE_MS`].
+    pub fn is_plausible(self) -> bool {
+        self.ms() <= MAX_PLAUSIBLE_MS
     }
 }
 
@@ -84,14 +94,18 @@ impl Clock {
     }
 
     /// Never hand out anything at or below `seen` (an HLC read from the library or a peer).
+    /// An implausible HLC (see [`MAX_PLAUSIBLE_MS`]) is ignored.
     pub fn observe(&mut self, seen: Hlc) {
-        self.last = self.last.max(seen);
+        if seen.is_plausible() {
+            self.last = self.last.max(seen);
+        }
     }
 
     /// A new value for an edit made now (`wall_ms`, milliseconds since the Unix epoch, or 0
-    /// without a clock), strictly greater than every earlier one.
+    /// without a clock), strictly greater than every earlier one. A wall clock set beyond
+    /// [`MAX_PLAUSIBLE_MS`] counts as that.
     pub fn tick(&mut self, wall_ms: u64) -> Hlc {
-        let wall = Hlc::new(wall_ms, 0);
+        let wall = Hlc::new(wall_ms.min(MAX_PLAUSIBLE_MS), 0);
         self.last = if wall > self.last {
             wall
         } else {
@@ -125,6 +139,19 @@ mod tests {
         c.observe(Hlc::new(9000, 7));
         assert_eq!(c.tick(1001), Hlc::new(9000, 8));
         assert_eq!(c.tick(9001), Hlc::new(9001, 0));
+    }
+
+    #[test]
+    fn implausible_hlcs_are_not_observed() {
+        let mut c = Clock::default();
+        c.observe(Hlc::new(1000, 0));
+        // A corrupt or hostile line stamped at the top of the range.
+        c.observe(Hlc(u64::MAX));
+        c.observe(Hlc::new(MAX_PLAUSIBLE_MS + 1, 0));
+        assert_eq!(c.tick(500), Hlc::new(1000, 1));
+        assert!(Hlc::new(MAX_PLAUSIBLE_MS, 0xffff).is_plausible());
+        // A wall clock set to the year 9000 stamps at the ceiling, not beyond.
+        assert_eq!(c.tick(u64::MAX), Hlc::new(MAX_PLAUSIBLE_MS, 0));
     }
 
     #[test]

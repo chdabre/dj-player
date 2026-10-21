@@ -15,9 +15,22 @@ pub trait Store: Send {
     /// is empty.
     fn list(&self, dir: &str) -> io::Result<Vec<String>>;
     fn read(&self, path: &str) -> io::Result<Vec<u8>>;
+    /// [`Store::read`], refusing a file over `limit` bytes with [`io::ErrorKind::InvalidData`]
+    /// (a junk file on someone else's stick must not fill RAM).
+    fn read_limited(&self, path: &str, limit: u64) -> io::Result<Vec<u8>> {
+        let bytes = self.read(path)?;
+        if bytes.len() as u64 > limit {
+            return Err(too_big(path, limit));
+        }
+        Ok(bytes)
+    }
     /// Append to a file, creating it (and its folders) if needed. Only for the device's own
     /// journal segments.
     fn append(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
+    /// Make a new file with `bytes` that is then appended to, failing with
+    /// [`io::ErrorKind::AlreadyExists`] if it exists: a check and create in one step, so
+    /// two writers can never open the same segment.
+    fn append_new(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
     /// Write a whole file once: written aside and renamed into place, so a reader never sees
     /// it half-written. Fails with [`io::ErrorKind::AlreadyExists`] if it exists.
     fn create(&self, path: &str, bytes: &[u8]) -> io::Result<()>;
@@ -33,8 +46,14 @@ impl<S: Store + Sync + ?Sized> Store for std::sync::Arc<S> {
     fn read(&self, path: &str) -> io::Result<Vec<u8>> {
         (**self).read(path)
     }
+    fn read_limited(&self, path: &str, limit: u64) -> io::Result<Vec<u8>> {
+        (**self).read_limited(path, limit)
+    }
     fn append(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         (**self).append(path, bytes)
+    }
+    fn append_new(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        (**self).append_new(path, bytes)
     }
     fn create(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         (**self).create(path, bytes)
@@ -45,6 +64,13 @@ impl<S: Store + Sync + ?Sized> Store for std::sync::Arc<S> {
     fn flush(&self, path: &str) -> io::Result<()> {
         (**self).flush(path)
     }
+}
+
+fn too_big(path: &str, limit: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{path} is over {limit} bytes"),
+    )
 }
 
 /// A store in RAM. Writes can be made to fail, to test a full or yanked stick.
@@ -114,6 +140,10 @@ impl Store for MemStore {
             .or_default()
             .extend_from_slice(bytes);
         Ok(())
+    }
+
+    fn append_new(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        self.create(path, bytes)
     }
 
     fn create(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
@@ -214,6 +244,31 @@ impl Store for FolderStore {
         std::fs::read(self.full(path)?)
     }
 
+    fn read_limited(&self, path: &str, limit: u64) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+        let f = std::fs::File::open(self.full(path)?)?;
+        if f.metadata()?.len() > limit {
+            return Err(too_big(path, limit));
+        }
+        // The file may grow between the check and the read: never take more than allowed.
+        let mut bytes = Vec::new();
+        f.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(too_big(path, limit));
+        }
+        Ok(bytes)
+    }
+
+    fn append_new(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
+        let p = self.full(path)?;
+        Self::make_parent(&p)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)?;
+        f.write_all(bytes)
+    }
+
     fn append(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         let p = self.full(path)?;
         Self::make_parent(&p)?;
@@ -272,6 +327,21 @@ mod tests {
         s.append("journal/a/00000001.log", b"two\n").unwrap();
         s.flush("journal/a/00000001.log").unwrap();
         s.append("journal/b/00000001.log", b"x").unwrap();
+        let taken = s.append_new("journal/b/00000001.log", b"y").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        s.append_new("journal/b/00000002.log", b"new").unwrap();
+        s.append("journal/b/00000002.log", b"+").unwrap();
+        assert_eq!(s.read("journal/b/00000002.log").unwrap(), b"new+");
+        assert_eq!(
+            s.read_limited("journal/b/00000002.log", 3)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            s.read_limited("journal/b/00000002.log", 4).unwrap(),
+            b"new+"
+        );
         assert_eq!(s.list("journal").unwrap(), ["a", "b"]);
         assert_eq!(s.read("journal/a/00000001.log").unwrap(), b"one\ntwo\n");
         s.create("blobs/ab/abcd", b"blob").unwrap();

@@ -231,6 +231,48 @@ impl SnapshotHeader {
     }
 }
 
+/// The last line of a snapshot: how many operation lines it holds and the BLAKE3 hash of
+/// every byte between the header line and this one. A snapshot without it, or whose body
+/// doesn't match, was cut short or damaged, and its version vector must not be trusted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotEnd {
+    pub ops: u64,
+    /// BLAKE3 of the body, 64 hex digits.
+    pub body: String,
+    pub extra: Map<String, Value>,
+}
+
+impl SnapshotEnd {
+    pub fn of(ops: u64, body: &[u8]) -> Self {
+        Self {
+            ops,
+            body: blake3::hash(body).to_hex().to_string(),
+            extra: Map::new(),
+        }
+    }
+
+    /// True if `body` (the bytes between the header line and this line) is what was written.
+    pub fn matches(&self, ops: u64, body: &[u8]) -> bool {
+        self.ops == ops && self.body == blake3::hash(body).to_hex().as_str()
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut m = self.extra.clone();
+        m.insert("end".into(), 1.into());
+        m.insert("ops".into(), self.ops.into());
+        m.insert("body".into(), self.body.clone().into());
+        Value::Object(m)
+    }
+
+    fn from_json(m: &Map<String, Value>) -> Option<Self> {
+        let mut extra = m.clone();
+        extra.remove("end")?;
+        let ops = extra.remove("ops")?.as_u64()?;
+        let body = take_str(&mut extra, "body")?;
+        Some(Self { ops, body, extra })
+    }
+}
+
 /// One line, framed: `<crc32c 8 hex> <json>\n`.
 pub fn frame(json: &Value) -> String {
     let text = json.to_string();
@@ -242,6 +284,7 @@ pub fn frame(json: &Value) -> String {
 pub enum Line {
     Segment(SegmentHeader),
     Snapshot(SnapshotHeader),
+    SnapshotEnd(SnapshotEnd),
     Op(Op),
 }
 
@@ -287,12 +330,18 @@ fn parse_line(line: &[u8]) -> Option<Line> {
     }
     let v: Value = serde_json::from_slice(body).ok()?;
     let m = v.as_object()?;
-    if m.contains_key("segment") {
+    // Operations are told apart by their `op` field first: an operation may carry any extra
+    // field, even one named like a header's.
+    if m.contains_key("op") {
+        Op::from_json(v).map(Line::Op)
+    } else if m.contains_key("segment") {
         SegmentHeader::from_json(m).map(Line::Segment)
     } else if m.contains_key("snapshot") {
         SnapshotHeader::from_json(m).map(Line::Snapshot)
+    } else if m.contains_key("end") {
+        SnapshotEnd::from_json(m).map(Line::SnapshotEnd)
     } else {
-        Op::from_json(v).map(Line::Op)
+        None
     }
 }
 
