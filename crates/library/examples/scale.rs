@@ -1,17 +1,17 @@
-//! Mount and replay time for a large synthetic library.
+//! Open time, size and edit cost of a large synthetic library.
 //!
 //! `cargo run --release -p library --example scale [tracks] [dir]`: builds a library of
 //! `tracks` (default 10 000) tracks in `dir` (default a temporary folder), each with a file
 //! identity and its audio hash, 8 hot cues, 3 memory cues, a rating, 3 analysis results and
-//! a waveform, written by 3 devices over many sessions. Then times mounting it from the
-//! journals, writing a snapshot, and mounting it from the snapshot.
+//! a waveform, written in sessions of 500 tracks. Then times opening it, reading one track
+//! and committing a batch of 20 edits.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use library::{
-    AnalysisRef, AudioHash, Cue, DeviceId, Edit, FileHash, FileIdentity, FolderStore, HotCue,
-    Library, MountOptions, Store, WaveformRef,
+    AnalysisRef, AudioHash, Cue, DeviceId, Edit, FileHash, FileIdentity, HotCue, Library,
+    MountOptions, WaveformRef,
 };
 
 fn dir_size(p: &std::path::Path) -> u64 {
@@ -36,122 +36,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let root = dir.join("DJPLAYER");
-    let devices: Vec<DeviceId> = (0..3).map(|_| DeviceId::random()).collect();
+    let opts = MountOptions::new(DeviceId::random());
 
-    let started = Instant::now();
-    // 50 sessions, round-robin over the devices: each mounts, edits its share, unmounts.
-    let sessions = 50;
-    let fake_blob = |n: usize, what: &str| library::BlobId::of(format!("{what}{n}").as_bytes());
-    for s in 0..sessions {
-        let device = devices[s % devices.len()];
-        let mut lib = Library::mount(FolderStore::new(&root), MountOptions::new(device))?;
-        for i in (s..tracks).step_by(sessions) {
-            let bytes = format!("file {i}");
-            let fh = FileHash::of(bytes.as_bytes());
-            let id = lib
-                .find_or_create(FileIdentity::new(
-                    format!("Music/Artist {}/Track {i}.mp3", i % 300),
-                    8_000_000 + i as u64,
-                    fh,
-                ))
-                .track;
-            let mut ah = [0u8; 32];
-            ah[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            lib.set_audio_hash(id, fh, AudioHash { v: 1, hash: ah });
-            for slot in 0..8 {
-                lib.apply(Edit::SetHotCue(
-                    id,
-                    slot,
-                    Some(HotCue::at(slot as f64 * 15.0 + 0.123)),
-                ))?;
-            }
-            for k in 0..3 {
-                lib.apply(Edit::AddCue(id, Cue::memory(k as f64 * 32.0 + 0.5)))?;
-            }
-            lib.apply(Edit::SetRating(id, Some((i % 6) as u8)))?;
-            for name in ["tempocnn", "gridfit", "hpcpkey"] {
-                let a = AnalysisRef {
-                    version: "0.1.0".into(),
-                    params: "default".into(),
-                    blob: fake_blob(i, name),
-                    created: library::rfc3339(library::system_ms()),
-                    extra: Default::default(),
-                };
-                lib.apply(Edit::SetAnalysis(id, name.into(), a))?;
-            }
-            let w = WaveformRef {
-                blob: fake_blob(i, "detail"),
-                overview_blob: fake_blob(i, "overview"),
-                extra: Default::default(),
+    let t0 = Instant::now();
+    let mut lib = Library::mount(&root, opts.clone())?;
+    for i in 0..tracks {
+        let mut fh = [0u8; 32];
+        fh[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let id = lib
+            .find_or_create(FileIdentity::new(
+                format!("Music/Artist {}/Track {i}.mp3", i % 300),
+                8_000_000 + i as u64,
+                FileHash(fh),
+            ))?
+            .track;
+        let mut ah = fh;
+        ah[31] = 0xa1;
+        lib.set_audio_hash(id, AudioHash { v: 1, hash: ah })?;
+        for slot in 0..8 {
+            lib.apply(Edit::SetHotCue(
+                id,
+                slot,
+                Some(HotCue::at(slot as f64 * 15.0)),
+            ))?;
+        }
+        for k in 0..3 {
+            lib.apply(Edit::AddCue(id, Cue::memory(k as f64 * 32.0 + 0.5)))?;
+        }
+        lib.apply(Edit::SetRating(id, Some((i % 6) as u8)))?;
+        for name in ["tempocnn", "gridfit", "hpcpkey"] {
+            let blob = lib.put_blob(format!("{name} {i}").as_bytes());
+            let a = AnalysisRef {
+                version: "0.1.0".into(),
+                params: "default".into(),
+                blob,
+                created: "2026-10-21T12:00:00Z".into(),
             };
-            lib.apply(Edit::SetWaveform(id, w))?;
+            lib.apply(Edit::SetAnalysis(id, name.into(), a))?;
         }
-        lib.flush();
+        let wf = lib.put_blob(format!("waveform {i}").as_bytes());
+        let ov = lib.put_blob(format!("overview {i}").as_bytes());
+        lib.apply(Edit::SetWaveform(id, WaveformRef::new(wf, ov)))?;
+        if i % 500 == 499 {
+            // A session ends: the next mount opens the file again.
+            drop(lib);
+            lib = Library::mount(&root, opts.clone())?;
+        }
     }
-    let built = started.elapsed();
-    let journal_bytes = dir_size(&root.join("journal"));
-    let segments: usize = FolderStore::new(&root)
-        .list("journal")?
-        .iter()
-        .map(|d| {
-            FolderStore::new(&root)
-                .list(&format!("journal/{d}"))
-                .map_or(0, |v| v.len())
-        })
-        .sum();
-
-    let t = Instant::now();
-    let mut lib = Library::mount(FolderStore::new(&root), MountOptions::new(devices[0]))?;
-    let mount_journal = t.elapsed();
-    let ops = lib.stats().ops;
-    assert_eq!(lib.tracks().len(), tracks);
-
-    let t = Instant::now();
-    let probe = lib.tracks()[tracks / 2];
-    let view = lib.track(probe).expect("track");
-    let first_lookup = t.elapsed();
-    assert_eq!(view.hot_cues.iter().flatten().count(), 8);
-
-    let t = Instant::now();
-    let snap = lib.snapshot()?;
-    let snapshot_write = t.elapsed();
-    let snap_bytes = std::fs::metadata(root.join(&snap))?.len();
     drop(lib);
+    let built = t0.elapsed();
+    let db = std::fs::metadata(root.join("library.db"))?.len();
+    println!(
+        "built {tracks} tracks in {:.1} s; library.db {:.1} MB, folder {:.1} MB",
+        built.as_secs_f64(),
+        db as f64 / 1e6,
+        dir_size(&root) as f64 / 1e6
+    );
 
-    // Remove the covered segments, as compaction will: mount reads the snapshot alone.
-    let store = FolderStore::new(&root);
-    for d in store.list("journal")? {
-        for s in store.list(&format!("journal/{d}"))? {
-            store.remove(&format!("journal/{d}/{s}"))?;
-        }
-    }
     let t = Instant::now();
-    let lib = Library::mount(FolderStore::new(&root), MountOptions::new(devices[1]))?;
-    let mount_snapshot = t.elapsed();
-    assert_eq!(lib.tracks().len(), tracks);
-
+    let mut lib = Library::mount(&root, opts)?;
+    let open = t.elapsed();
+    let ids = lib.tracks()?;
+    assert_eq!(ids.len(), tracks);
+    let probe = ids[tracks / 2];
+    let t = Instant::now();
+    let view = lib.track(probe)?.expect("a track");
+    let read = t.elapsed();
+    assert_eq!(view.hot_cues.iter().flatten().count(), 8);
+    let t = Instant::now();
+    for k in 0..20 {
+        lib.apply(Edit::SetHotCue(
+            probe,
+            8 + k % 8,
+            Some(HotCue::at(k as f64)),
+        ))?;
+    }
+    lib.flush();
+    let batch = t.elapsed();
+    // The first write of a mount also makes the backup: that is in this time.
     println!(
-        "{tracks} tracks, {ops} ops in {segments} segments ({:.1} MB of journal), built in {:.1} s",
-        journal_bytes as f64 / 1e6,
-        built.as_secs_f64()
+        "open {:.1} ms, one track {:.2} ms, 20 edits and the backup committed {:.1} ms",
+        open.as_secs_f64() * 1e3,
+        read.as_secs_f64() * 1e3,
+        batch.as_secs_f64() * 1e3,
     );
+    let t = Instant::now();
+    for k in 0..20 {
+        lib.apply(Edit::SetHotCue(probe, k % 8, Some(HotCue::at(k as f64))))?;
+    }
+    lib.flush();
     println!(
-        "mount + replay from journals: {:.0} ms",
-        mount_journal.as_secs_f64() * 1e3
+        "20 more edits committed {:.1} ms",
+        t.elapsed().as_secs_f64() * 1e3
     );
-    println!(
-        "first track lookup (builds the index): {:.1} ms",
-        first_lookup.as_secs_f64() * 1e3
-    );
-    println!(
-        "snapshot write: {:.0} ms ({:.1} MB)",
-        snapshot_write.as_secs_f64() * 1e3,
-        snap_bytes as f64 / 1e6
-    );
-    println!(
-        "mount from the snapshot alone: {:.0} ms",
-        mount_snapshot.as_secs_f64() * 1e3
-    );
+    drop(lib);
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }

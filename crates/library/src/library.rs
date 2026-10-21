@@ -1,69 +1,45 @@
-//! One mounted library: the merged state, this device's open journal segment and its HLC.
+//! One open library: the SQLite file, the queue of edits not yet committed, and the blobs.
+//!
+//! The library worker is the only writer. An edit runs against the file at once, inside a
+//! write transaction that [`Library::flush`] commits (the player calls it about once a
+//! second), and stays in the queue until that commit. If a write fails (the stick was
+//! pulled, is full or went read-only) the transaction is rolled back, the queue is kept and
+//! the library says [`Persistence::Unsaved`]. When the library is dropped with edits still
+//! queued, they are kept in this process and replayed when the same library (by its id) is
+//! opened again.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use serde_json::{Value, json};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::codec::{
-    self, FORMAT_VERSION, Line, Op, OpKind, SegmentHeader, SnapshotEnd, SnapshotHeader,
-};
+use crate::db::{self, BACKUP_FILE, DB_FILE, DbError};
 use crate::hash::{AudioHash, FileHash, track_id};
-use crate::hlc::{Clock, Hlc, Stamp};
-use crate::ids::{BlobId, DeviceId, LibraryId, TrackId, TrackRef};
-use crate::model::{self, AnalysisRef, Cue, FileIdentity, HOT_CUES, HotCue, Track, WaveformRef};
-use crate::state::State;
-use crate::store::Store;
+use crate::ids::{BlobId, DeviceId, LibraryId, TrackId, TrackRef, hex, unhex};
+use crate::model::{
+    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Track, WaveformRef, is_component,
+};
 
-/// A segment is closed and the next one opened once it passes this size.
-pub const SEGMENT_ROTATE_BYTES: usize = 64 * 1024;
-
-/// Files larger than these are not read: a junk file on someone else's stick must not fill
-/// RAM. Far above what a real library writes (segments rotate at 64 KB; 10,000 tracks make
-/// a 45 MB snapshot; a 5-minute waveform blob is 135 KB).
-pub const MAX_SEGMENT_BYTES: u64 = 64 << 20;
-pub const MAX_SNAPSHOT_BYTES: u64 = 2 << 30;
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
-
-/// The last stamp any library in this process handed out, per device. Two mounts as one
-/// device (two decks on one stick) then never hand out the same stamp, so never the same
-/// element id.
-static LAST_STAMPS: std::sync::Mutex<BTreeMap<DeviceId, Hlc>> =
-    std::sync::Mutex::new(BTreeMap::new());
-
-/// The `format` field of `FORMAT`.
-pub const FORMAT_NAME: &str = "djplayer-library";
-
-/// How to mount.
+/// How to open a library.
 #[derive(Debug, Clone)]
 pub struct MountOptions {
-    /// This device: the author of its edits and the owner of its journal folder.
+    /// This device: written next to each edit, for a later sync layer.
     pub device: DeviceId,
-    /// Never write to the store: edits stay in RAM, shown as unsaved (a write-protected or
-    /// locked stick).
+    /// Never write to the folder: the file is read into RAM, and edits stay there, shown
+    /// as unsaved (a write-protected stick).
     pub read_only: bool,
-    /// Written once to `devices/<device-id>.json` (name, model, …).
-    pub device_info: Value,
     /// Wall-clock milliseconds since the Unix epoch; 0 if the device has no clock.
     pub now: fn() -> u64,
-    /// The wall clock is known to be right (NTP-synchronised, or a kept RTC). The clock then
-    /// doesn't adopt stamps more than [`TRUSTED_CLOCK_AHEAD_MS`] ahead of it: a device whose
-    /// clock ran fast can't drag this one into its future. The merge is unaffected (it must
-    /// be the same on every device); only what this clock observes is.
-    pub trusted_clock: bool,
 }
-
-/// How far ahead of a trusted wall clock a stamp may be and still be observed: one day.
-pub const TRUSTED_CLOCK_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 
 impl MountOptions {
     pub fn new(device: DeviceId) -> Self {
         Self {
             device,
             read_only: false,
-            device_info: json!({}),
             now: system_ms,
-            trusted_clock: false,
         }
     }
 }
@@ -78,20 +54,22 @@ pub fn system_ms() -> u64 {
 #[derive(Debug)]
 pub enum MountError {
     Io(io::Error),
-    /// `FORMAT` is unreadable or not ours.
-    BadFormat(String),
-    /// Written by a newer major version this build can't read.
-    NewerFormat(u64),
+    /// The file can't be opened or read (locked by another process, unreadable).
+    Db(String),
+    /// Written by a newer version that this one can't read.
+    Newer(i64),
 }
 
 impl std::fmt::Display for MountError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MountError::Io(e) => write!(f, "library: {e}"),
-            MountError::BadFormat(e) => write!(f, "library FORMAT file: {e}"),
-            MountError::NewerFormat(v) => {
-                write!(f, "library format version {v} is newer than this player")
-            }
+            MountError::Db(e) => write!(f, "library: {e}"),
+            MountError::Newer(v) => write!(
+                f,
+                "library needs player version {v} or later (this is {})",
+                db::SCHEMA_VERSION
+            ),
         }
     }
 }
@@ -101,6 +79,33 @@ impl std::error::Error for MountError {}
 impl From<io::Error> for MountError {
     fn from(e: io::Error) -> Self {
         MountError::Io(e)
+    }
+}
+
+impl From<DbError> for MountError {
+    fn from(e: DbError) -> Self {
+        match e {
+            DbError::Newer { min_reader } => MountError::Newer(min_reader),
+            e => MountError::Db(e.to_string()),
+        }
+    }
+}
+
+/// A read that failed (the stick is gone or damaged).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadError(pub String);
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "can't read the library: {}", self.0)
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+impl From<rusqlite::Error> for ReadError {
+    fn from(e: rusqlite::Error) -> Self {
+        ReadError(e.to_string())
     }
 }
 
@@ -132,7 +137,7 @@ pub enum Edit {
     SetRating(TrackId, Option<u8>),
     /// A new memory cue or loop.
     AddCue(TrackId, Cue),
-    /// Change a cue: its old element is removed and the new value added under a new id.
+    /// Change the cue with this id; it keeps its id.
     ReplaceCue(TrackId, String, Cue),
     RemoveCue(TrackId, String),
     /// Hot cue slot 0–15 (two banks of 8); `None` deletes it.
@@ -141,29 +146,28 @@ pub enum Edit {
     SetWaveform(TrackId, WaveformRef),
 }
 
-/// Whether edits reach the store.
+/// Whether edits reach the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Persistence {
-    /// Everything is written and flushed.
+    /// Everything is committed.
     Saved,
-    /// Written, not yet flushed.
+    /// Edits are waiting for the next commit.
     Pending,
-    /// Edits are kept in RAM only (read-only or failing store) and lost at power-off.
+    /// Edits are kept in RAM only (no library, a read-only or failing stick) and lost at
+    /// power-off.
     Unsaved { edits: usize, reason: String },
 }
 
-/// What mounting read.
+/// What opening found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MountStats {
-    pub snapshots: usize,
-    pub segments: usize,
-    /// Segments not read because a snapshot holds them.
-    pub segments_covered: usize,
-    pub ops: usize,
-    /// Torn or corrupt lines skipped, and operations dropped for an implausible HLC.
-    pub skipped_lines: usize,
-    /// Files (segments, snapshots) or folders that could not be read and were skipped.
-    pub skipped_files: usize,
+    pub tracks: usize,
+    /// There was no library file: an empty one was made.
+    pub created: bool,
+    /// Edits left unsaved by an earlier mount of this library, written now.
+    pub replayed: usize,
+    /// The last session did not close the file cleanly: [`Library::check`] should run.
+    pub needs_check: bool,
 }
 
 /// What [`Library::find_or_create`] did.
@@ -177,488 +181,384 @@ pub struct Found {
     pub new_location: bool,
 }
 
-enum Mode {
-    /// Journaling into `journal/<device>/<segment>.log`.
-    Journal {
-        segment: u32,
-        bytes: usize,
-        open: bool,
+/// One row-level write: what the queue holds. Each is idempotent, so replaying a queue that
+/// was partly written already is harmless.
+#[derive(Debug, Clone, PartialEq)]
+enum Op {
+    Locate(TrackId, FileIdentity),
+    AudioHash(TrackId, AudioHash),
+    /// Move everything of `from` to `into` and make `from` an alias of it.
+    Merge {
+        from: TrackId,
+        into: TrackId,
     },
-    /// Not writing (read-only or failed store).
-    Ram { reason: String },
+    Rating(TrackId, Option<u8>),
+    PutCue(TrackId, [u8; 16], Cue),
+    RemoveCue([u8; 16]),
+    HotCue(TrackId, usize, Option<HotCue>),
+    Analysis(TrackId, String, AnalysisRef),
+    Waveform(TrackId, WaveformRef),
 }
 
+/// Edits and blobs a dropped library could not write, by library.
 #[derive(Default)]
-struct Index {
-    by_file: HashMap<FileHash, Vec<TrackId>>,
-    by_audio: HashMap<AudioHash, Vec<TrackId>>,
-    /// Root id → ids aliased into it (not including the root).
-    members: HashMap<TrackId, Vec<TrackId>>,
+struct Parked {
+    ops: Vec<Op>,
+    blobs: HashMap<BlobId, Vec<u8>>,
+}
+
+static PARKED: Mutex<BTreeMap<LibraryId, Parked>> = Mutex::new(BTreeMap::new());
+
+/// The library id of [`Library::ram`]: edits made without a library carry over between
+/// loads in one process.
+const RAM_LIBRARY: LibraryId = LibraryId::nil();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The file on the stick, written through a transaction.
+    Folder,
+    /// A write to the folder failed; the queue is in RAM only.
+    Failed,
+    /// An in-memory database (no library, or a read-only stick's copy).
+    Ram,
 }
 
 pub struct Library {
-    store: Box<dyn Store>,
+    conn: Connection,
+    /// The `DJPLAYER/` folder, unless this library lives in RAM only.
+    dir: Option<PathBuf>,
     id: LibraryId,
-    opts: MountOptions,
-    state: State,
-    clock: Clock,
+    device: [u8; 16],
+    now: fn() -> u64,
     mode: Mode,
-    /// Per writer device, the highest segment the state holds completely.
-    vector: BTreeMap<DeviceId, u32>,
-    /// Path of a segment with appended, unflushed lines.
-    unflushed: Option<String>,
-    /// Edits applied but not written.
-    unsaved: usize,
-    /// Blobs that could not be written: kept in RAM.
+    /// Why edits are not saved; `None` while they reach the folder.
+    unsaved: Option<String>,
+    /// Ops not yet committed (or never, in RAM), in order.
+    queue: Vec<Op>,
+    /// Every op this mount wrote, to replay onto a backup if the check finds damage.
+    session: Vec<Op>,
+    /// A write transaction is open on `conn`.
+    in_tx: bool,
+    /// The file is marked in use (`clean_unmount = 0`) and backed up.
+    started: bool,
+    /// The last session didn't close the file cleanly.
+    unclean: bool,
     ram_blobs: HashMap<BlobId, Vec<u8>>,
-    index: Option<Index>,
-    stats: MountStats,
     warnings: Vec<String>,
-    /// This device's writer lock, taken before its first segment is opened.
-    writer_lock: Option<crate::store::WriterLock>,
+    stats: MountStats,
 }
 
 impl std::fmt::Debug for Library {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Library")
             .field("id", &self.id)
-            .field("device", &self.opts.device)
-            .field("stats", &self.stats)
+            .field("dir", &self.dir)
+            .field("mode", &self.mode)
+            .field("queue", &self.queue.len())
             .finish_non_exhaustive()
     }
 }
 
-/// Parse `NNNNNNNN.log`.
-fn segment_number(name: &str) -> Option<u32> {
-    name.strip_suffix(".log")?.parse().ok()
-}
-
 impl Library {
-    /// Mount the library in `store`: read `FORMAT` (made if missing and writable), load
-    /// every snapshot, replay every journal segment no snapshot holds, and start this
-    /// device's clock above the highest HLC found. This device's edits go to a new segment,
-    /// opened on the first edit.
-    pub fn mount(store: impl Store + 'static, opts: MountOptions) -> Result<Self, MountError> {
-        let store: Box<dyn Store> = Box::new(store);
+    /// Open the library in `dir` (the `DJPLAYER/` folder), making the folder and an empty
+    /// library if there is none. A damaged file is set aside as `library.db.corrupt-<date>`
+    /// and the backup used instead (or an empty library, if there is no backup).
+    pub fn mount(dir: &Path, opts: MountOptions) -> Result<Self, MountError> {
+        let path = dir.join(DB_FILE);
         let mut warnings = Vec::new();
-        let mut read_only = opts.read_only;
-        let id = match store.read("FORMAT") {
-            Ok(bytes) => parse_format(&bytes)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let id = LibraryId::random();
-                if !read_only {
-                    let format = json!({
-                        "format": FORMAT_NAME,
-                        "version": FORMAT_VERSION,
-                        "library": id.to_string(),
-                        "created": rfc3339((opts.now)()),
-                    });
-                    let text = format!("{format}\n");
-                    if let Err(e) = store.create("FORMAT", text.as_bytes()) {
-                        warnings.push(format!("can't create the library ({e}): RAM only"));
-                        read_only = true;
-                    }
-                }
-                id
+        if opts.read_only {
+            let conn = if path.exists() {
+                db::open_copy(&path)?
+            } else {
+                db::open_memory()?
+            };
+            let created = !path.exists();
+            // Blobs are still read from the folder.
+            let mut lib = Self::with(conn, Some(dir.to_path_buf()), opts, Mode::Ram, warnings)?;
+            lib.stats.created = created;
+            lib.unsaved = Some(format!("{} is read-only", dir.display()));
+            return Ok(lib);
+        }
+        std::fs::create_dir_all(dir.join("blobs"))?;
+        let existed = path.exists();
+        let open = |path: &Path| -> Result<Connection, DbError> {
+            let c = db::open_rw(path)?;
+            db::prepare(&c, LibraryId::random().bytes())?;
+            Ok(c)
+        };
+        let conn = match open(&path) {
+            Ok(c) => c,
+            Err(e) if e.is_damage() => {
+                warnings.push(set_aside(dir, &e.to_string())?);
+                open(&path)?
             }
             Err(e) => return Err(e.into()),
         };
+        let mut lib = Self::with(conn, Some(dir.to_path_buf()), opts, Mode::Folder, warnings)?;
+        lib.stats.created = !existed;
+        Ok(lib)
+    }
 
-        let mut state = State::new();
-        let mut vector: BTreeMap<DeviceId, u32> = BTreeMap::new();
-        let mut stats = MountStats::default();
-        let cutoff = observe_cutoff(&opts);
-        // The highest HLC the clock may adopt, and how many were too far ahead to.
-        let mut seen = Seen::new(cutoff);
-        // One unreadable file or folder is skipped with a warning, never the whole mount.
-        let skip = |warnings: &mut Vec<String>, stats: &mut MountStats, what: String, e| {
-            stats.skipped_files += 1;
-            warnings.push(format!("{what}: {e}; skipped"));
-        };
-        let snapshots = store.list("snapshots").unwrap_or_else(|e| {
-            skip(&mut warnings, &mut stats, "snapshots/".into(), e);
-            Vec::new()
-        });
-        for name in snapshots {
-            if !name.ends_with(".snap") {
-                continue;
-            }
-            let path = format!("snapshots/{name}");
-            let bytes = match store.read_limited(&path, MAX_SNAPSHOT_BYTES) {
-                Ok(b) => b,
-                Err(e) => {
-                    skip(&mut warnings, &mut stats, path, e);
-                    continue;
-                }
-            };
-            let decoded = codec::decode(&bytes);
-            let Some(Line::Snapshot(header)) = decoded.lines.first() else {
-                warnings.push(format!("snapshot {name} has no header; ignored"));
-                continue;
-            };
-            if u64::from(header.format) > u64::from(FORMAT_VERSION) {
-                return Err(MountError::NewerFormat(header.format.into()));
-            }
-            stats.snapshots += 1;
-            stats.skipped_lines += decoded.skipped;
-            for line in &decoded.lines[1..] {
-                if let Line::Op(op) = line {
-                    apply_counted(&mut state, op, &mut stats, &mut seen);
-                }
-            }
-            state.observe(header.hlc);
-            seen.see(header.hlc);
-            // Its operations are safe to use either way; its vector only if the file is
-            // whole, or segments it never held would be skipped as covered.
-            if snapshot_is_whole(&bytes, &decoded) {
-                for (d, s) in &header.vector {
-                    let v = vector.entry(*d).or_default();
-                    *v = (*v).max(*s);
-                }
-            } else {
-                warnings.push(format!(
-                    "snapshot {name} is incomplete or damaged: its operations are used, \
-                     and the journal segments it claims to hold are read again"
-                ));
-            }
-        }
+    /// A library in RAM only: nothing is saved. Edits made in it carry over to the next
+    /// [`Library::ram`] in this process.
+    pub fn ram(opts: MountOptions, reason: impl Into<String>) -> Self {
+        let conn = db::open_memory().expect("an in-memory database opens");
+        db::prepare(&conn, RAM_LIBRARY.bytes()).expect("an empty database takes the schema");
+        let mut lib = Self::with(conn, None, opts, Mode::Ram, Vec::new())
+            .expect("an in-memory library opens");
+        lib.unsaved = Some(reason.into());
+        lib.stats.created = true;
+        lib
+    }
 
-        let covered = vector.clone();
-        let mut own_last = 0;
-        let devices = store.list("journal").unwrap_or_else(|e| {
-            skip(&mut warnings, &mut stats, "journal/".into(), e);
-            Vec::new()
-        });
-        for dev_name in devices {
-            let Ok(dev) = dev_name.parse::<DeviceId>() else {
-                continue;
-            };
-            let dir = format!("journal/{dev_name}");
-            let names = match store.list(&dir) {
-                Ok(n) => n,
-                Err(e) => {
-                    skip(&mut warnings, &mut stats, dir, e);
-                    continue;
-                }
-            };
-            let mut segments: Vec<u32> = names.iter().filter_map(|n| segment_number(n)).collect();
-            segments.sort_unstable();
-            if dev == opts.device {
-                // Every listed number counts, read or not: it is taken.
-                own_last = segments.last().copied().unwrap_or(0);
-            }
-            // The highest segment held with every one below it: the vector never covers a
-            // gap (a segment not synced yet, or unreadable now), so it is read when it comes.
-            let mut held = covered.get(&dev).copied().unwrap_or(0);
-            for seg in segments {
-                if covered.get(&dev).is_some_and(|&c| seg < c) {
-                    stats.segments_covered += 1;
-                    continue;
-                }
-                let path = format!("{dir}/{seg:08}.log");
-                let bytes = match store.read_limited(&path, MAX_SEGMENT_BYTES) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        skip(&mut warnings, &mut stats, path, e);
-                        continue;
-                    }
-                };
-                let decoded = codec::decode(&bytes);
-                stats.segments += 1;
-                stats.skipped_lines += decoded.skipped;
-                for line in &decoded.lines {
-                    if let Line::Op(op) = line {
-                        apply_counted(&mut state, op, &mut stats, &mut seen);
-                    }
-                }
-                if seg <= held + 1 {
-                    held = held.max(seg);
-                }
-            }
-            if held > 0 {
-                vector.insert(dev, held);
-            }
-        }
-        if stats.skipped_lines > 0 {
-            warnings.push(format!(
-                "{} torn or corrupt journal lines skipped",
-                stats.skipped_lines
-            ));
-        }
-        // Never reuse a segment number: not one on disk, nor one a snapshot holds (its file
-        // may have been compacted away).
-        let next_segment = own_last.max(vector.get(&opts.device).copied().unwrap_or(0)) + 1;
-
-        if seen.ahead > 0 {
-            warnings.push(format!(
-                "{} operations are stamped more than a day ahead of this player's clock (a \
-                 device with a fast clock?): this player's clock doesn't follow them",
-                seen.ahead
-            ));
-        }
-        if !read_only {
-            match store.sweep_tmp() {
-                Ok(0) => {}
-                Ok(n) => warnings.push(format!("{n} leftover files of interrupted writes removed")),
-                Err(e) => warnings.push(format!("tmp/: {e}")),
-            }
-        }
-        let mut clock = Clock::default();
-        clock.observe(seen.max);
-        let mode = if read_only {
-            Mode::Ram {
-                reason: "the library is read-only".into(),
-            }
-        } else {
-            Mode::Journal {
-                segment: next_segment,
-                bytes: 0,
-                open: false,
-            }
-        };
-        Ok(Library {
-            store,
+    fn with(
+        conn: Connection,
+        dir: Option<PathBuf>,
+        opts: MountOptions,
+        mode: Mode,
+        warnings: Vec<String>,
+    ) -> Result<Self, MountError> {
+        let (id, clean) = db::prepare(&conn, LibraryId::random().bytes())?;
+        let id = LibraryId::from_bytes(id);
+        let tracks: i64 = conn
+            .query_row("SELECT count(*) FROM tracks", [], |r| r.get(0))
+            .map_err(DbError::from)?;
+        let mut lib = Self {
+            conn,
+            dir,
             id,
-            opts,
-            state,
-            clock,
+            device: opts.device.bytes(),
+            now: opts.now,
             mode,
-            vector,
-            unflushed: None,
-            unsaved: 0,
+            unsaved: None,
+            queue: Vec::new(),
+            session: Vec::new(),
+            in_tx: false,
+            started: false,
+            unclean: !clean && mode == Mode::Folder,
             ram_blobs: HashMap::new(),
-            index: None,
-            stats,
             warnings,
-            writer_lock: None,
-        })
+            stats: MountStats {
+                tracks: tracks as usize,
+                needs_check: !clean && mode == Mode::Folder,
+                ..MountStats::default()
+            },
+        };
+        let parked = lock_parked().remove(&id).unwrap_or_default();
+        if !parked.ops.is_empty() || !parked.blobs.is_empty() {
+            lib.stats.replayed = parked.ops.len();
+            for (id, bytes) in parked.blobs {
+                lib.store_blob(id, bytes);
+            }
+            for op in parked.ops {
+                lib.write(op);
+            }
+            lib.flush();
+        }
+        Ok(lib)
     }
 
     pub fn id(&self) -> LibraryId {
         self.id
     }
 
-    pub fn device(&self) -> DeviceId {
-        self.opts.device
-    }
-
-    pub fn state(&self) -> &State {
-        &self.state
-    }
-
     pub fn stats(&self) -> &MountStats {
         &self.stats
     }
 
-    /// The highest HLC handed out or seen.
-    pub fn hlc(&self) -> Hlc {
-        self.clock.last()
-    }
-
-    /// Messages worth showing (skipped lines, a stick that stopped taking writes); each
-    /// once.
+    /// Things worth telling the user since the last call (failed writes, a damaged file).
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.warnings)
     }
 
     pub fn persistence(&self) -> Persistence {
-        match &self.mode {
-            Mode::Ram { reason } => Persistence::Unsaved {
-                edits: self.unsaved,
+        match &self.unsaved {
+            Some(reason) => Persistence::Unsaved {
+                edits: self.queue.len(),
                 reason: reason.clone(),
             },
-            Mode::Journal { .. } if self.unflushed.is_some() => Persistence::Pending,
-            Mode::Journal { .. } => Persistence::Saved,
+            None if self.queue.is_empty() => Persistence::Saved,
+            None => Persistence::Pending,
         }
     }
 
-    /// Keep every edit in RAM from now on, reported as unsaved for `reason` (a RAM-only
-    /// session: no library was found, or none was wanted).
-    pub fn keep_in_ram(&mut self, reason: impl Into<String>) {
-        self.mode = Mode::Ram {
-            reason: reason.into(),
-        };
-    }
-
-    pub fn is_writable(&self) -> bool {
-        matches!(self.mode, Mode::Journal { .. })
-    }
-
-    fn stamp(&mut self) -> Stamp {
-        let mut last = LAST_STAMPS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let shared = last.entry(self.opts.device).or_default();
-        self.clock.observe(*shared);
-        let hlc = self.clock.tick((self.opts.now)());
-        *shared = hlc;
-        Stamp {
-            hlc,
-            device: self.opts.device,
+    pub fn track_ref(&self, track: TrackId) -> TrackRef {
+        TrackRef {
+            library: self.id,
+            track,
         }
     }
 
-    fn element_id(stamp: Stamp) -> String {
-        format!("{}@{}", stamp.hlc, stamp.device)
+    // Writing
+
+    fn write(&mut self, op: Op) {
+        if self.mode == Mode::Folder
+            && !self.in_tx
+            && let Err(e) = self.begin()
+        {
+            self.fail(&e);
+        }
+        if self.mode != Mode::Failed
+            && let Err(e) = op.exec(&self.conn, self.device, (self.now)() as i64)
+        {
+            self.fail_db(&e);
+        }
+        self.session.push(op.clone());
+        self.queue.push(op);
     }
 
-    fn stop_saving(&mut self, why: String) {
-        if !matches!(self.mode, Mode::Ram { .. }) {
-            self.warnings.push(format!(
-                "library stopped saving ({why}): edits are kept in RAM"
-            ));
-            self.mode = Mode::Ram { reason: why };
-        }
-    }
-
-    /// Apply `ops` to the state and append them to this device's segment.
-    fn commit(&mut self, ops: &[Op]) {
-        for op in ops {
-            self.state.apply(op);
-            self.update_index(op);
-        }
-        let open_now = match &self.mode {
-            Mode::Journal { open, .. } => *open,
-            Mode::Ram { .. } => {
-                self.unsaved += ops.len();
-                return;
+    /// Open the write transaction. The first one of a mount backs the file up and marks it
+    /// in use.
+    fn begin(&mut self) -> rusqlite::Result<()> {
+        if !self.started {
+            if !self.stats.created
+                && let Err(e) = self.backup()
+            {
+                self.warnings.push(format!("no backup made: {e}"));
             }
-        };
-        if !open_now && self.writer_lock.is_none() {
-            let path = format!("journal/{}/writer.lock", self.opts.device);
-            match self.store.lock_writer(&path) {
-                Ok(Some(lock)) => self.writer_lock = Some(lock),
-                Ok(None) => {
-                    self.unsaved += ops.len();
-                    self.stop_saving(
-                        "another program is writing this library as this device".into(),
-                    );
-                    return;
-                }
-                // A file system without locks: journal anyway, each mount in its own
-                // segment.
-                Err(e) => {
-                    self.warnings
-                        .push(format!("{path}: {e}; writing without a lock"));
-                    self.writer_lock = Some(Box::new(()));
-                }
-            }
+            self.started = true;
         }
-        let Mode::Journal {
-            segment,
-            bytes,
-            open,
-        } = &mut self.mode
-        else {
-            unreachable!("checked above");
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.in_tx = true;
+        db::set_clean(&self.conn, false)
+    }
+
+    /// `library.db.bak`: the file as it was before this mount wrote to it.
+    fn backup(&self) -> io::Result<()> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
         };
-        let mut body = String::new();
-        for op in ops {
-            body += &codec::frame(&op.to_json());
+        let tmp = dir.join(format!("{BACKUP_FILE}.tmp"));
+        let _ = std::fs::remove_file(&tmp);
+        self.conn
+            .execute("VACUUM INTO ?1", [tmp.to_string_lossy()])
+            .map_err(io::Error::other)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, dir.join(BACKUP_FILE))?;
+        sync_dir(dir)
+    }
+
+    fn fail(&mut self, e: &dyn std::fmt::Display) {
+        if self.in_tx {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            self.in_tx = false;
         }
-        let was_open = *open;
-        let written = if *open {
-            let path = format!("journal/{}/{:08}.log", self.opts.device, segment);
-            self.store
-                .append(&path, body.as_bytes())
-                .map(|()| (path, body.len()))
-        } else {
-            // A new segment is claimed with its header in one step; one taken by another
-            // writer as this device (a second mount) is passed over.
-            let mut attempt = 0;
-            loop {
-                let path = format!("journal/{}/{:08}.log", self.opts.device, segment);
-                let header = SegmentHeader {
-                    segment: *segment,
-                    device: self.opts.device,
-                    format: FORMAT_VERSION,
-                    opened: self.clock.last(),
-                    extra: Default::default(),
-                };
-                let text = codec::frame(&header.to_json()) + &body;
-                match self.store.append_new(&path, text.as_bytes()) {
-                    Ok(()) => break Ok((path, text.len())),
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 1000 => {
-                        attempt += 1;
-                        *segment += 1;
+        if self.mode == Mode::Folder {
+            self.mode = Mode::Failed;
+            let reason = format!("can't write the library: {e}");
+            self.warnings.push(reason.clone());
+            self.unsaved = Some(reason);
+        }
+    }
+
+    /// A failed statement; a damaged file also asks for [`Library::check`].
+    fn fail_db(&mut self, e: &rusqlite::Error) {
+        if db::is_damage(e) {
+            self.stats.needs_check = true;
+        }
+        self.fail(e);
+    }
+
+    /// Commit the queued edits. After a failed write, try writing the whole queue again.
+    pub fn flush(&mut self) {
+        match self.mode {
+            Mode::Ram => {}
+            Mode::Folder => {
+                if self.in_tx {
+                    match self.conn.execute_batch("COMMIT") {
+                        Ok(()) => {
+                            self.in_tx = false;
+                            self.queue.clear();
+                        }
+                        Err(e) => self.fail_db(&e),
                     }
-                    Err(e) => break Err(e),
                 }
             }
+            Mode::Failed => {
+                if self.retry().is_ok() {
+                    self.mode = Mode::Folder;
+                    self.unsaved = None;
+                    self.queue.clear();
+                    self.warnings.push("library: writing again".into());
+                }
+            }
+        }
+    }
+
+    /// Write the blobs kept in RAM and the queue in one transaction.
+    fn retry(&mut self) -> Result<(), String> {
+        let dir = self.dir.clone().expect("only a folder library fails");
+        for (id, bytes) in &self.ram_blobs {
+            write_blob(&dir, *id, bytes).map_err(|e| e.to_string())?;
+        }
+        self.ram_blobs.clear();
+        let now = (self.now)() as i64;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        let done = db::set_clean(&self.conn, false).and_then(|()| {
+            self.queue
+                .iter()
+                .try_for_each(|op| op.exec(&self.conn, self.device, now))
+        });
+        match done.and_then(|()| self.conn.execute_batch("COMMIT")) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Check the file after a session that didn't close it cleanly, or after a write found
+    /// damage (`PRAGMA quick_check`; seconds on a big library on a stick). Cheap when there
+    /// is nothing to check. Damage sets the file aside, goes back to the
+    /// backup and writes this mount's edits onto it. Returns what was found, if anything.
+    pub fn check(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.stats.needs_check) || self.mode == Mode::Ram {
+            return None;
+        }
+        let problem = match db::quick_check(&self.conn) {
+            Ok(None) => return None,
+            Ok(Some(p)) => p,
+            Err(e) => e.to_string(),
         };
-        let seg = *segment;
-        match written {
-            Ok((path, len)) => {
-                *bytes += len;
-                *open = true;
-                // Held without a gap only if every lower own segment is held too.
-                let v = self.vector.entry(self.opts.device).or_default();
-                if seg <= *v + 1 {
-                    *v = (*v).max(seg);
+        let dir = self.dir.clone().expect("a folder library");
+        if self.in_tx {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            self.in_tx = false;
+        }
+        let reopened = (|| -> Result<Connection, MountError> {
+            drop(std::mem::replace(&mut self.conn, db::open_memory()?));
+            let line = set_aside(&dir, &problem)?;
+            self.warnings.push(line);
+            let conn = db::open_rw(&dir.join(DB_FILE))?;
+            db::prepare(&conn, self.id.bytes())?;
+            Ok(conn)
+        })();
+        match reopened {
+            Ok(conn) => {
+                self.conn = conn;
+                self.started = true;
+                self.mode = Mode::Folder;
+                self.unsaved = None;
+                let ops = std::mem::take(&mut self.session);
+                self.queue.clear();
+                for op in ops {
+                    self.write(op);
                 }
-                self.unflushed = Some(path);
-                if *bytes >= SEGMENT_ROTATE_BYTES {
-                    *segment += 1;
-                    *bytes = 0;
-                    *open = false;
-                    // The full segment gets its flush now; the next starts clean.
-                    self.flush();
-                }
-                if !was_open {
-                    self.write_device_info();
-                }
+                self.flush();
             }
             Err(e) => {
-                self.unsaved += ops.len();
-                self.stop_saving(e.to_string());
+                self.mode = Mode::Ram;
+                self.unsaved = Some(format!("library damaged: {e}"));
             }
         }
-    }
-
-    fn write_device_info(&mut self) {
-        let mut info = self.opts.device_info.clone();
-        if let Value::Object(m) = &mut info {
-            m.insert("device".into(), self.opts.device.to_string().into());
-        }
-        let path = format!("devices/{}.json", self.opts.device);
-        match self.store.create(&path, format!("{info}\n").as_bytes()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => self.warnings.push(format!("{path}: {e}")),
-        }
-    }
-
-    /// Make every edit so far durable. A failure switches the library to RAM.
-    pub fn flush(&mut self) {
-        if let Some(path) = self.unflushed.take()
-            && let Err(e) = self.store.flush(&path)
-        {
-            self.stop_saving(e.to_string());
-        }
-    }
-
-    /// Apply operations from a linked player: stamped with its HLC and device id, journaled
-    /// here as they are.
-    pub fn apply_remote(&mut self, ops: &[Op]) {
-        // An implausible stamp would win every merge: such an op is not taken.
-        let ops: Vec<Op> = ops
-            .iter()
-            .filter(|op| op.stamp.hlc.is_plausible())
-            .cloned()
-            .collect();
-        let cutoff = observe_cutoff(&self.opts);
-        for op in &ops {
-            if op.stamp.hlc <= cutoff {
-                self.clock.observe(op.stamp.hlc);
-            }
-        }
-        if !ops.is_empty() {
-            self.commit(&ops);
-        }
+        Some(problem)
     }
 
     /// Make an edit. Edits to a track that was merged into another go to the survivor.
-    /// Returns the new element id for [`Edit::AddCue`] and [`Edit::ReplaceCue`].
+    /// Returns the cue's id for [`Edit::AddCue`] and [`Edit::ReplaceCue`].
     pub fn apply(&mut self, edit: Edit) -> Result<Option<String>, WriteError> {
         let track = match &edit {
             Edit::SetRating(t, _)
@@ -669,426 +569,301 @@ impl Library {
             | Edit::SetAnalysis(t, _, _)
             | Edit::SetWaveform(t, _) => *t,
         };
-        if !self.exists(track) {
+        // Without a readable file (a pulled stick) the edit is queued unchecked.
+        let t = resolve(&self.conn, track).unwrap_or(track);
+        if self.has_track(t) == Some(false) {
             return Err(WriteError::NoSuchTrack(track));
         }
-        let t = self.resolve(track);
-        let mut new_id = None;
-        let ops = match edit {
-            Edit::SetRating(_, r) => {
-                let s = self.stamp();
-                vec![Op::set(
-                    s,
-                    model::rating_path(t),
-                    r.map_or(Value::Null, Value::from),
-                )]
+        let cue_of = |lib: &Self, id: &str| -> Result<[u8; 16], WriteError> {
+            let bytes = unhex::<16>(id).ok_or_else(|| WriteError::NoSuchCue(id.into()))?;
+            let owner: rusqlite::Result<Option<Vec<u8>>> = lib
+                .conn
+                .query_row("SELECT track FROM cues WHERE id = ?1", [&bytes[..]], |r| {
+                    r.get(0)
+                })
+                .optional();
+            match owner {
+                Ok(Some(o)) if o == t.0 => Ok(bytes),
+                Ok(_) => Err(WriteError::NoSuchCue(id.into())),
+                Err(_) => Ok(bytes),
             }
+        };
+        let (op, id) = match edit {
+            Edit::SetRating(_, r) => (Op::Rating(t, r), None),
             Edit::AddCue(_, cue) => {
-                let s = self.stamp();
-                let id = Self::element_id(s);
-                new_id = Some(id.clone());
-                vec![Op::add(s, model::cue_path(t), id, cue.to_json())]
+                let id = LibraryId::random().bytes();
+                (Op::PutCue(t, id, cue), Some(hex(&id)))
             }
             Edit::ReplaceCue(_, old, cue) => {
-                let path = self.cue_set_holding(t, &old)?;
-                let s1 = self.stamp();
-                let s2 = self.stamp();
-                let id = Self::element_id(s2);
-                new_id = Some(id.clone());
-                vec![
-                    Op::rm(s1, path, old),
-                    Op::add(s2, model::cue_path(t), id, cue.to_json()),
-                ]
+                let id = cue_of(self, &old)?;
+                (Op::PutCue(t, id, cue), Some(old))
             }
-            Edit::RemoveCue(_, old) => {
-                let path = self.cue_set_holding(t, &old)?;
-                let s = self.stamp();
-                vec![Op::rm(s, path, old)]
-            }
+            Edit::RemoveCue(_, old) => (Op::RemoveCue(cue_of(self, &old)?), None),
             Edit::SetHotCue(_, slot, cue) => {
                 if slot >= HOT_CUES {
                     return Err(WriteError::BadHotCueSlot(slot));
                 }
-                let s = self.stamp();
-                let v = cue.map_or(Value::Null, |c| c.to_json());
-                vec![Op::set(s, model::hot_cue_path(t, slot), v)]
+                (Op::HotCue(t, slot, cue), None)
             }
             Edit::SetAnalysis(_, name, a) => {
-                if !model::is_component(&name) {
+                if !is_component(&name) {
                     return Err(WriteError::BadAnalyzerName(name));
                 }
-                let s = self.stamp();
-                vec![Op::set(s, model::analysis_path(t, &name), a.to_json())]
+                (Op::Analysis(t, name, a), None)
             }
-            Edit::SetWaveform(_, w) => {
-                let s = self.stamp();
-                vec![Op::set(s, model::waveform_path(t), w.to_json())]
-            }
+            Edit::SetWaveform(_, w) => (Op::Waveform(t, w), None),
         };
-        self.commit(&ops);
-        Ok(new_id)
+        self.write(op);
+        Ok(id)
     }
 
-    /// The cue set (of the track or one merged into it) holding element `id`.
-    fn cue_set_holding(&mut self, root: TrackId, id: &str) -> Result<String, WriteError> {
-        self.members(root)
-            .into_iter()
-            .map(model::cue_path)
-            .find(|p| self.state.present(p).any(|(e, _)| e == id))
-            .ok_or_else(|| WriteError::NoSuchCue(id.to_owned()))
+    /// `Some(true)` if the track has a record, `None` if the file can't be read.
+    fn has_track(&self, t: TrackId) -> Option<bool> {
+        self.conn
+            .query_row("SELECT 1 FROM tracks WHERE id = ?1", [&t.0[..]], |_| Ok(()))
+            .optional()
+            .ok()
+            .map(|r| r.is_some())
     }
 
     // Identity
 
-    fn index(&mut self) -> &Index {
-        if self.index.is_none() {
-            self.index = Some(self.build_index());
-        }
-        self.index.as_ref().expect("just built")
-    }
-
-    /// Keep the index current after `op`. Index entries are candidates: a removed location
-    /// may leave one behind, so lookups check the state.
-    fn update_index(&mut self, op: &Op) {
-        let p = op.path.as_str();
-        if p.starts_with("alias/") {
-            // Rare: rebuild on the next lookup.
-            self.index = None;
-            return;
-        }
-        let Some(ix) = self.index.as_mut() else {
-            return;
-        };
-        if let (OpKind::Add { value, .. }, true) = (&op.kind, p.ends_with("/file"))
-            && let Some(t) = model::track_of_path(p)
-            && let Some(f) = FileIdentity::from_json(value)
-        {
-            push_unique(ix.by_file.entry(f.file_hash).or_default(), t);
-            if let Some(a) = f.audio_hash {
-                push_unique(ix.by_audio.entry(a).or_default(), t);
-            }
-        }
-    }
-
-    /// Present locations of `track` itself (not of tracks merged into it).
-    fn own_locations(&self, track: TrackId) -> impl Iterator<Item = FileIdentity> + '_ {
-        self.state
-            .present(&model::file_path(track))
-            .filter_map(|(_, e)| FileIdentity::from_json(&e.value))
-    }
-
-    fn build_index(&self) -> Index {
-        let mut ix = Index::default();
-        for path in self.state.sets_under("track/") {
-            if !path.ends_with("/file") {
-                continue;
-            }
-            let Some(t) = model::track_of_path(path) else {
-                continue;
-            };
-            for (_, e) in self.state.present(path) {
-                if let Some(f) = FileIdentity::from_json(&e.value) {
-                    ix.by_file.entry(f.file_hash).or_default().push(t);
-                    if let Some(a) = f.audio_hash {
-                        ix.by_audio.entry(a).or_default().push(t);
-                    }
-                }
-            }
-        }
-        for (path, _) in self.state.registers_under("alias/") {
-            if let Some(t) = model::track_of_path(path) {
-                let root = self.resolve(t);
-                if root != t {
-                    ix.members.entry(root).or_default().push(t);
-                }
-            }
-        }
-        for v in ix.by_file.values_mut().chain(ix.by_audio.values_mut()) {
-            v.sort_unstable();
-            v.dedup();
-        }
-        ix
-    }
-
-    /// The track `id` was merged into, following aliases (itself if none). In an alias
-    /// cycle (two devices merging the same pair opposite ways), the lowest id in the cycle.
+    /// The track `id` was merged into (itself if none).
     pub fn resolve(&self, id: TrackId) -> TrackId {
-        let mut seen = vec![id];
-        let mut cur = id;
-        while let Some(next) = self
-            .state
-            .value(&model::alias_path(cur))
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<TrackId>().ok())
-        {
-            if let Some(pos) = seen.iter().position(|&s| s == next) {
-                return *seen[pos..].iter().min().expect("non-empty cycle");
-            }
-            seen.push(next);
-            cur = next;
-        }
-        cur
-    }
-
-    /// `root` and every id merged into it.
-    fn members(&mut self, root: TrackId) -> Vec<TrackId> {
-        let mut m = vec![root];
-        if let Some(more) = self.index().members.get(&root) {
-            m.extend_from_slice(more);
-        }
-        m
-    }
-
-    fn exists(&self, id: TrackId) -> bool {
-        self.state.elements(&model::file_path(id)).next().is_some()
-            || self
-                .state
-                .registers_under(&model::track_prefix(id))
-                .next()
-                .is_some()
-            || self.state.register(&model::alias_path(id)).is_some()
-    }
-
-    /// When a track was first seen: the earliest HLC among its file elements' ids (which
-    /// stay as tombstones when a location is replaced).
-    fn first_seen(&self, id: TrackId) -> Hlc {
-        self.state
-            .elements(&model::file_path(id))
-            .filter_map(|(eid, _)| eid.split('@').next()?.parse::<Hlc>().ok())
-            .min()
-            .unwrap_or(Hlc(u64::MAX))
+        resolve(&self.conn, id).unwrap_or(id)
     }
 
     /// Find the track a file belongs to by its file hash, or make its record. A known file
     /// at a new path gets that path as another location (an exact duplicate, or a moved
     /// file); a new file gets the id derived from its hash.
-    pub fn find_or_create(&mut self, file: FileIdentity) -> Found {
-        let hash = file.file_hash;
-        let known: Vec<TrackId> = self.index().by_file.get(&hash).cloned().unwrap_or_default();
-        let known: Vec<TrackId> = known
-            .into_iter()
-            .filter(|&t| self.own_locations(t).any(|l| l.file_hash == hash))
-            .collect();
-        let mut roots: Vec<TrackId> = known.iter().map(|&t| self.resolve(t)).collect();
-        roots.sort_by_key(|&t| (self.first_seen(t), t));
-        roots.dedup();
-        if let Some(&root) = roots.first() {
-            let have = self.track(root).is_some_and(|t| {
-                t.locations
-                    .iter()
-                    .any(|(_, l)| l.file_hash == hash && l.path == file.path)
-            });
-            if !have {
-                self.add_location(root, file);
+    pub fn find_or_create(&mut self, file: FileIdentity) -> Result<Found, ReadError> {
+        let known: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT l.track FROM locations l JOIN tracks t ON t.id = l.track \
+                 WHERE l.file_hash = ?1 ORDER BY t.rowid LIMIT 1",
+                [&file.file_hash.0[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let found = match known.map(|b| track_of(&b)) {
+            Some(track) => {
+                let have: bool = self.conn.query_row(
+                    "SELECT count(*) > 0 FROM locations WHERE track = ?1 AND path = ?2",
+                    params![&track.0[..], file.path],
+                    |r| r.get(0),
+                )?;
+                Found {
+                    track,
+                    created: false,
+                    new_location: !have,
+                }
             }
-            return Found {
-                track: root,
-                created: false,
-                new_location: !have,
-            };
+            None => {
+                let track = resolve(&self.conn, track_id(&file.file_hash))?;
+                Found {
+                    track,
+                    created: self.has_track(track) != Some(true),
+                    new_location: true,
+                }
+            }
+        };
+        if found.new_location {
+            self.write(Op::Locate(found.track, file));
+            if found.created {
+                self.stats.tracks += 1;
+            }
         }
-        let id = track_id(&hash);
-        self.add_location(id, file);
-        Found {
-            track: self.resolve(id),
-            created: true,
-            new_location: true,
-        }
+        Ok(found)
     }
 
-    fn add_location(&mut self, track: TrackId, file: FileIdentity) {
-        let s = self.stamp();
-        let op = Op::add(
-            s,
-            model::file_path(track),
-            Self::element_id(s),
-            file.to_json(),
-        );
-        self.commit(&[op]);
-    }
-
-    /// Record the audio hash of the file with `file_hash` on `track` (replacing a stale
-    /// one), then merge every other track with the same audio hash: the one seen first
-    /// survives and the others alias to it. Returns the surviving track.
+    /// Record the audio hash of `track`, then merge every other track with the same audio
+    /// hash (tag-edited copies): the one this library saw first survives and the others
+    /// become its aliases. Returns the surviving track.
     pub fn set_audio_hash(
         &mut self,
         track: TrackId,
-        file_hash: FileHash,
         audio: AudioHash,
-    ) -> TrackId {
-        let root = self.resolve(track);
-        let mut ops = Vec::new();
-        for member in self.members(root) {
-            let path = model::file_path(member);
-            let stale: Vec<(String, FileIdentity)> = self
-                .state
-                .present(&path)
-                .filter_map(|(id, e)| Some((id.to_owned(), FileIdentity::from_json(&e.value)?)))
-                .filter(|(_, f)| f.file_hash == file_hash && f.audio_hash != Some(audio))
-                .collect();
-            for (old, mut f) in stale {
-                f.audio_hash = Some(audio);
-                let s1 = self.stamp();
-                let s2 = self.stamp();
-                ops.push(Op::rm(s1, path.clone(), old));
-                ops.push(Op::add(s2, path.clone(), Self::element_id(s2), f.to_json()));
-            }
+    ) -> Result<TrackId, ReadError> {
+        let root = resolve(&self.conn, track)?;
+        self.write(Op::AudioHash(root, audio));
+        let mut st = self.conn.prepare_cached(
+            "SELECT id FROM tracks WHERE audio_hash = ?1 AND audio_hash_v = ?2 ORDER BY rowid",
+        )?;
+        let same: Vec<TrackId> = st
+            .query_map(params![&audio.hash[..], audio.v], |r| {
+                Ok(track_of(&r.get::<_, Vec<u8>>(0)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(st);
+        let survivor = same.first().copied().unwrap_or(root);
+        for &from in same.iter().filter(|&&t| t != survivor) {
+            self.write(Op::Merge {
+                from,
+                into: survivor,
+            });
+            self.stats.tracks = self.stats.tracks.saturating_sub(1);
         }
-        if !ops.is_empty() {
-            self.commit(&ops);
-        }
-        let same: Vec<TrackId> = self
-            .index()
-            .by_audio
-            .get(&audio)
-            .cloned()
-            .unwrap_or_default();
-        let same: Vec<TrackId> = same
-            .into_iter()
-            .filter(|&t| self.own_locations(t).any(|l| l.audio_hash == Some(audio)))
-            .collect();
-        let mut roots: Vec<TrackId> = same.iter().map(|&t| self.resolve(t)).collect();
-        roots.push(root);
-        roots.sort_by_key(|&t| (self.first_seen(t), t));
-        roots.dedup();
-        let survivor = roots[0];
-        let aliases: Vec<Op> = roots[1..]
-            .iter()
-            .map(|&t| {
-                let s = self.stamp();
-                Op::set(s, model::alias_path(t), survivor.to_string().into())
-            })
-            .collect();
-        if !aliases.is_empty() {
-            self.commit(&aliases);
-        }
-        survivor
+        Ok(survivor)
     }
 
-    /// The merged record of a track (following aliases), if the library has one. Fields
-    /// merge across the merged tracks by their own rules: the latest register wins, sets
-    /// are united.
-    pub fn track(&mut self, id: TrackId) -> Option<Track> {
-        if !self.exists(id) {
-            return None;
-        }
-        let root = self.resolve(id);
-        let members = self.members(root);
-        let s = &self.state;
-        let latest = |path: &dyn Fn(TrackId) -> String| {
-            members
-                .iter()
-                .filter_map(|&m| s.register(&path(m)))
-                .max_by_key(|e| e.stamp)
-                .map(|e| &e.value)
-                .filter(|v| !v.is_null())
-        };
-        let mut locations = Vec::new();
-        let mut cues = Vec::new();
-        let mut analysis = BTreeMap::new();
-        let mut analysis_stamp = BTreeMap::new();
-        for &m in &members {
-            for (eid, e) in s.present(&model::file_path(m)) {
-                if let Some(f) = FileIdentity::from_json(&e.value) {
-                    locations.push((eid.to_owned(), f));
-                }
-            }
-            for (eid, e) in s.present(&model::cue_path(m)) {
-                if let Some(c) = Cue::from_json(&e.value) {
-                    cues.push((eid.to_owned(), c));
-                }
-            }
-            let prefix = format!("track/{m}/analysis/");
-            for (path, e) in s.registers_under(&prefix) {
-                let name = &path[prefix.len()..];
-                let newer = analysis_stamp.get(name).is_none_or(|old| e.stamp > *old);
-                if newer {
-                    analysis_stamp.insert(name.to_owned(), e.stamp);
-                    match AnalysisRef::from_json(&e.value) {
-                        Some(a) => analysis.insert(name.to_owned(), a),
-                        None => analysis.remove(name),
+    // Reading
+
+    /// The record of a track (following merges), if the library has one.
+    pub fn track(&self, id: TrackId) -> Result<Option<Track>, ReadError> {
+        let c = &self.conn;
+        let id = resolve(c, id)?;
+        let key = &id.0[..];
+        let Some(mut t) = c
+            .query_row(
+                "SELECT rating, audio_hash, audio_hash_v, waveform, waveform_overview \
+                 FROM tracks WHERE id = ?1",
+                [key],
+                |r| {
+                    let mut t = Track::empty(id);
+                    t.rating = r.get(0)?;
+                    let hash: Option<Vec<u8>> = r.get(1)?;
+                    t.audio_hash = hash.and_then(|h| {
+                        Some(AudioHash {
+                            v: r.get(2).ok()?,
+                            hash: h.try_into().ok()?,
+                        })
+                    });
+                    t.waveform = match (blob_col(r, 3)?, blob_col(r, 4)?) {
+                        (Some(blob), Some(overview_blob)) => Some(WaveformRef {
+                            blob,
+                            overview_blob,
+                        }),
+                        _ => None,
                     };
-                }
+                    Ok(t)
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut st = c.prepare_cached(
+            "SELECT path, size, file_hash FROM locations WHERE track = ?1 \
+             ORDER BY updated_at, path",
+        )?;
+        t.locations = st
+            .query_map([key], |r| {
+                let hash: Vec<u8> = r.get(2)?;
+                Ok(FileIdentity {
+                    path: r.get(0)?,
+                    size: r.get::<_, i64>(1)? as u64,
+                    file_hash: FileHash(hash.try_into().unwrap_or([0; 32])),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut st = c.prepare_cached(
+            "SELECT id, kind, at, end_at, color, comment FROM cues WHERE track = ?1 \
+             ORDER BY at, id",
+        )?;
+        t.cues = st
+            .query_map([key], |r| {
+                let id: Vec<u8> = r.get(0)?;
+                let kind: String = r.get(1)?;
+                Ok((
+                    hex(&id),
+                    Cue {
+                        kind: CueKind::parse(&kind),
+                        at: r.get(2)?,
+                        end: r.get(3)?,
+                        color: r.get(4)?,
+                        comment: r.get(5)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut st = c.prepare_cached(
+            "SELECT slot, at, end_at, color, comment FROM hot_cues WHERE track = ?1",
+        )?;
+        let hot = st.query_map([key], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                HotCue {
+                    at: r.get(1)?,
+                    end: r.get(2)?,
+                    color: r.get(3)?,
+                    comment: r.get(4)?,
+                },
+            ))
+        })?;
+        for h in hot {
+            let (slot, cue) = h?;
+            if let Some(s) = usize::try_from(slot)
+                .ok()
+                .and_then(|s| t.hot_cues.get_mut(s))
+            {
+                *s = Some(cue);
             }
         }
-        cues.sort_by(|a, b| a.1.at.total_cmp(&b.1.at).then_with(|| a.0.cmp(&b.0)));
-        let hot_cues = std::array::from_fn(|slot| {
-            latest(&|m| model::hot_cue_path(m, slot)).and_then(HotCue::from_json)
-        });
-        let rating = latest(&model::rating_path)
-            .and_then(Value::as_u64)
-            .and_then(|r| u8::try_from(r).ok());
-        let waveform = latest(&model::waveform_path).and_then(WaveformRef::from_json);
-        Some(Track {
-            id: root,
-            locations,
-            rating,
-            cues,
-            hot_cues,
-            analysis,
-            waveform,
-            merged: members[1..].to_vec(),
-        })
-    }
-
-    /// Every track id that is not merged into another.
-    pub fn tracks(&self) -> Vec<TrackId> {
-        let mut ids: Vec<TrackId> = self
-            .state
-            .sets_under("track/")
-            .filter(|p| p.ends_with("/file"))
-            .filter_map(model::track_of_path)
-            .filter(|&t| self.resolve(t) == t)
-            .collect();
-        ids.dedup();
-        ids
-    }
-
-    pub fn track_ref(&self, track: TrackId) -> TrackRef {
-        TrackRef {
-            library: self.id,
-            track,
+        let mut st = c.prepare_cached(
+            "SELECT analyzer, version, params, blob, created FROM analysis WHERE track = ?1",
+        )?;
+        let rows = st.query_map([key], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                blob_col(r, 3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            if let (name, version, params, Some(blob), created) = row? {
+                t.analysis.insert(
+                    name,
+                    AnalysisRef {
+                        version,
+                        params,
+                        blob,
+                        created,
+                    },
+                );
+            }
         }
+        let mut st = c.prepare_cached("SELECT old FROM aliases WHERE new = ?1 ORDER BY old")?;
+        t.merged = st
+            .query_map([key], |r| Ok(track_of(&r.get::<_, Vec<u8>>(0)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Some(t))
+    }
+
+    /// Every track id (merged tracks resolve to their survivor and are not listed), in the
+    /// order the library first saw them.
+    pub fn tracks(&self) -> Result<Vec<TrackId>, ReadError> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT id FROM tracks ORDER BY rowid")?;
+        let ids = st
+            .query_map([], |r| Ok(track_of(&r.get::<_, Vec<u8>>(0)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
     }
 
     // Blobs
 
-    /// Store a blob under its BLAKE3 name, written once (tmp + rename). On a store that
-    /// takes no writes it stays in RAM.
+    /// Store a blob under its BLAKE3 name, `blobs/<aa>/<hash>`, written once (tmp, sync,
+    /// rename) before any row names it. Without a writable folder it stays in RAM.
     pub fn put_blob(&mut self, bytes: &[u8]) -> BlobId {
         let id = BlobId::of(bytes);
-        if self.ram_blobs.contains_key(&id) {
-            return id;
-        }
-        if self.is_writable() {
-            let path = id.path();
-            match self.store.create(&path, bytes) {
-                Ok(()) => return id,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if self.read_blob(id).is_ok() {
-                        return id;
-                    }
-                    // A damaged copy under this name would fail every read: replace it.
-                    match self
-                        .store
-                        .remove(&path)
-                        .and_then(|()| self.store.create(&path, bytes))
-                    {
-                        Ok(()) => {
-                            self.warnings
-                                .push(format!("blob {id} was damaged and is rewritten"));
-                            return id;
-                        }
-                        Err(e) => self
-                            .warnings
-                            .push(format!("blob {id} is damaged and can't be rewritten ({e})")),
-                    }
-                }
-                Err(e) => self.stop_saving(e.to_string()),
+        self.store_blob(id, bytes.to_vec());
+        id
+    }
+
+    fn store_blob(&mut self, id: BlobId, bytes: Vec<u8>) {
+        if self.mode == Mode::Folder {
+            let dir = self.dir.as_ref().expect("a folder library");
+            match write_blob(dir, id, &bytes) {
+                Ok(()) => return,
+                // The row that names it must not be committed: fail the transaction.
+                Err(e) => self.fail(&e),
             }
         }
-        self.ram_blobs.insert(id, bytes.to_vec());
-        id
+        self.ram_blobs.insert(id, bytes);
     }
 
     /// A blob's bytes, checked against its name.
@@ -1096,153 +871,315 @@ impl Library {
         if let Some(b) = self.ram_blobs.get(&id) {
             return Ok(b.clone());
         }
-        let bytes = self.store.read_limited(&id.path(), MAX_BLOB_BYTES)?;
+        let Some(dir) = &self.dir else {
+            return Err(io::ErrorKind::NotFound.into());
+        };
+        let bytes = std::fs::read(dir.join(id.path()))?;
         if BlobId::of(&bytes) != id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("blob {id} is corrupt"),
+                format!("blob {id} is damaged"),
             ));
         }
         Ok(bytes)
     }
+}
 
-    // Snapshots
-
-    /// The current state as a snapshot file: a header with the version vector, one line per
-    /// register, element, tombstone and event with their original stamps, and an end line
-    /// with the count and hash of those lines, so a cut-short copy is never trusted.
-    pub fn snapshot_bytes(&self) -> Vec<u8> {
-        let header = SnapshotHeader {
-            device: self.opts.device,
-            format: FORMAT_VERSION,
-            hlc: self.state.max_hlc(),
-            vector: self.vector.clone(),
-            extra: Default::default(),
-        };
-        let mut out = codec::frame(&header.to_json()).into_bytes();
-        let mut body = Vec::new();
-        let mut ops = 0;
-        for op in self.state.ops() {
-            body.extend_from_slice(codec::frame(&op.to_json()).as_bytes());
-            ops += 1;
-        }
-        out.extend_from_slice(&body);
-        out.extend_from_slice(codec::frame(&SnapshotEnd::of(ops, &body).to_json()).as_bytes());
-        out
-    }
-
-    /// Write a snapshot to `snapshots/<hlc>-<device>.snap`. The segments it covers are left
-    /// in place (compaction comes later); mounting skips them.
-    pub fn snapshot(&mut self) -> io::Result<String> {
+impl Drop for Library {
+    /// Commit, mark the file cleanly closed and fold the WAL back into it. Edits that could
+    /// not be written wait in this process for the next mount of this library.
+    fn drop(&mut self) {
         self.flush();
-        let path = format!(
-            "snapshots/{:016x}-{}.snap",
-            self.state.max_hlc().0,
-            self.opts.device
-        );
-        self.store.create(&path, &self.snapshot_bytes())?;
-        Ok(path)
-    }
-}
-
-/// The highest HLC the clock may observe: a day ahead of a trusted wall clock, else
-/// anything plausible.
-fn observe_cutoff(opts: &MountOptions) -> Hlc {
-    let wall = (opts.now)();
-    if opts.trusted_clock && wall > 0 {
-        let ms = wall
-            .saturating_add(TRUSTED_CLOCK_AHEAD_MS)
-            .min(crate::hlc::MAX_PLAUSIBLE_MS);
-        Hlc::new(ms, u16::MAX)
-    } else {
-        Hlc::new(crate::hlc::MAX_PLAUSIBLE_MS, u16::MAX)
-    }
-}
-
-/// What mounting lets the clock observe.
-struct Seen {
-    cutoff: Hlc,
-    max: Hlc,
-    /// Plausible HLCs above the cutoff.
-    ahead: usize,
-}
-
-impl Seen {
-    fn new(cutoff: Hlc) -> Self {
-        Self {
-            cutoff,
-            max: Hlc::ZERO,
-            ahead: 0,
+        if self.mode == Mode::Folder {
+            // Still clean, or checked; a check that never ran is left for the next mount.
+            if (self.started || self.unclean) && !self.stats.needs_check {
+                let _ = db::set_clean(&self.conn, true);
+            }
+            let _ = self.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         }
-    }
-
-    fn see(&mut self, hlc: Hlc) {
-        if hlc <= self.cutoff {
-            self.max = self.max.max(hlc);
-        } else if hlc.is_plausible() {
-            self.ahead += 1;
+        if !self.queue.is_empty() || !self.ram_blobs.is_empty() {
+            let mut parked = lock_parked();
+            let p = parked.entry(self.id).or_default();
+            p.ops.append(&mut self.queue);
+            p.blobs.extend(self.ram_blobs.drain());
         }
     }
 }
 
-/// Apply `op`, counting one with an implausible HLC (which the state drops) as skipped.
-fn apply_counted(state: &mut State, op: &Op, stats: &mut MountStats, seen: &mut Seen) {
-    if op.stamp.hlc.is_plausible() {
-        state.apply(op);
-        stats.ops += 1;
-        seen.see(op.stamp.hlc);
+fn lock_parked() -> std::sync::MutexGuard<'static, BTreeMap<LibraryId, Parked>> {
+    PARKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Op {
+    /// Run this op's SQL. `now` and `device` stamp the rows it writes.
+    fn exec(&self, c: &Connection, device: [u8; 16], now: i64) -> rusqlite::Result<()> {
+        let dev = &device[..];
+        match self {
+            Op::Locate(t, f) => {
+                let t = resolve(c, *t)?;
+                c.prepare_cached(
+                    "INSERT INTO tracks(id, updated_at, device) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(id) DO NOTHING",
+                )?
+                .execute(params![&t.0[..], now, dev])?;
+                c.prepare_cached(
+                    "INSERT INTO locations(track, path, size, file_hash, updated_at, device) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(track, path) DO UPDATE SET \
+                     size = excluded.size, file_hash = excluded.file_hash, \
+                     updated_at = excluded.updated_at, device = excluded.device",
+                )?
+                .execute(params![
+                    &t.0[..],
+                    f.path,
+                    f.size as i64,
+                    &f.file_hash.0[..],
+                    now,
+                    dev
+                ])?;
+            }
+            Op::AudioHash(t, a) => {
+                c.prepare_cached(
+                    "UPDATE tracks SET audio_hash = ?2, audio_hash_v = ?3, updated_at = ?4, \
+                     device = ?5 WHERE id = ?1",
+                )?
+                .execute(params![
+                    &resolve(c, *t)?.0[..],
+                    &a.hash[..],
+                    a.v,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::Merge { from, into } => merge(c, *from, *into, dev, now)?,
+            Op::Rating(t, r) => {
+                c.prepare_cached(
+                    "UPDATE tracks SET rating = ?2, updated_at = ?3, device = ?4 WHERE id = ?1",
+                )?
+                .execute(params![&resolve(c, *t)?.0[..], r, now, dev])?;
+            }
+            Op::PutCue(t, id, cue) => {
+                c.prepare_cached(
+                    "INSERT INTO cues(id, track, kind, at, end_at, color, comment, updated_at, \
+                     device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                     ON CONFLICT(id) DO UPDATE SET track = excluded.track, kind = excluded.kind, \
+                     at = excluded.at, end_at = excluded.end_at, color = excluded.color, \
+                     comment = excluded.comment, updated_at = excluded.updated_at, \
+                     device = excluded.device",
+                )?
+                .execute(params![
+                    &id[..],
+                    &resolve(c, *t)?.0[..],
+                    cue.kind.as_str(),
+                    cue.at,
+                    cue.end,
+                    cue.color,
+                    cue.comment,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::RemoveCue(id) => {
+                c.prepare_cached("DELETE FROM cues WHERE id = ?1")?
+                    .execute([&id[..]])?;
+            }
+            Op::HotCue(t, slot, None) => {
+                c.prepare_cached("DELETE FROM hot_cues WHERE track = ?1 AND slot = ?2")?
+                    .execute(params![&resolve(c, *t)?.0[..], *slot as i64])?;
+            }
+            Op::HotCue(t, slot, Some(h)) => {
+                c.prepare_cached(
+                    "INSERT INTO hot_cues(track, slot, at, end_at, color, comment, updated_at, \
+                     device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(track, slot) DO UPDATE SET at = excluded.at, \
+                     end_at = excluded.end_at, color = excluded.color, \
+                     comment = excluded.comment, updated_at = excluded.updated_at, \
+                     device = excluded.device",
+                )?
+                .execute(params![
+                    &resolve(c, *t)?.0[..],
+                    *slot as i64,
+                    h.at,
+                    h.end,
+                    h.color,
+                    h.comment,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::Analysis(t, name, a) => {
+                c.prepare_cached(
+                    "INSERT INTO analysis(track, analyzer, version, params, blob, created, \
+                     updated_at, device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(track, analyzer) DO UPDATE SET version = excluded.version, \
+                     params = excluded.params, blob = excluded.blob, \
+                     created = excluded.created, updated_at = excluded.updated_at, \
+                     device = excluded.device",
+                )?
+                .execute(params![
+                    &resolve(c, *t)?.0[..],
+                    name,
+                    a.version,
+                    a.params,
+                    &a.blob.0[..],
+                    a.created,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::Waveform(t, w) => {
+                c.prepare_cached(
+                    "UPDATE tracks SET waveform = ?2, waveform_overview = ?3, updated_at = ?4, \
+                     device = ?5 WHERE id = ?1",
+                )?
+                .execute(params![
+                    &resolve(c, *t)?.0[..],
+                    &w.blob.0[..],
+                    &w.overview_blob.0[..],
+                    now,
+                    dev
+                ])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Move everything of `from` to `into`: locations and memory cues all; hot cues and
+/// analysis results where `into` has none for that slot or analyzer, or an older one; track
+/// fields where `into` has none. `from` is then deleted and becomes an alias of `into`, and
+/// aliases of `from` point to `into`.
+fn merge(
+    c: &Connection,
+    from: TrackId,
+    into: TrackId,
+    dev: &[u8],
+    now: i64,
+) -> rusqlite::Result<()> {
+    let into = resolve(c, into)?;
+    let from = resolve(c, from)?;
+    if from == into {
+        return Ok(());
+    }
+    let (f, i) = (&from.0[..], &into.0[..]);
+    c.execute(
+        "INSERT INTO locations(track, path, size, file_hash, updated_at, device) \
+         SELECT ?2, path, size, file_hash, updated_at, device FROM locations WHERE track = ?1 \
+         ON CONFLICT(track, path) DO NOTHING",
+        [f, i],
+    )?;
+    c.execute("UPDATE cues SET track = ?2 WHERE track = ?1", [f, i])?;
+    c.execute(
+        "INSERT INTO hot_cues(track, slot, at, end_at, color, comment, updated_at, device) \
+         SELECT ?2, slot, at, end_at, color, comment, updated_at, device FROM hot_cues h \
+         WHERE track = ?1 AND NOT EXISTS (SELECT 1 FROM hot_cues s WHERE s.track = ?2 \
+         AND s.slot = h.slot AND s.updated_at >= h.updated_at) \
+         ON CONFLICT(track, slot) DO UPDATE SET at = excluded.at, end_at = excluded.end_at, \
+         color = excluded.color, comment = excluded.comment, updated_at = excluded.updated_at, \
+         device = excluded.device",
+        [f, i],
+    )?;
+    c.execute(
+        "INSERT INTO analysis(track, analyzer, version, params, blob, created, updated_at, \
+         device) SELECT ?2, analyzer, version, params, blob, created, updated_at, device \
+         FROM analysis a WHERE track = ?1 AND NOT EXISTS (SELECT 1 FROM analysis s \
+         WHERE s.track = ?2 AND s.analyzer = a.analyzer AND s.updated_at >= a.updated_at) \
+         ON CONFLICT(track, analyzer) DO UPDATE SET version = excluded.version, \
+         params = excluded.params, blob = excluded.blob, created = excluded.created, \
+         updated_at = excluded.updated_at, device = excluded.device",
+        [f, i],
+    )?;
+    c.execute(
+        "UPDATE tracks SET \
+         rating = coalesce(rating, (SELECT rating FROM tracks WHERE id = ?1)), \
+         color = coalesce(color, (SELECT color FROM tracks WHERE id = ?1)), \
+         comment = coalesce(comment, (SELECT comment FROM tracks WHERE id = ?1)), \
+         waveform = coalesce(waveform, (SELECT waveform FROM tracks WHERE id = ?1)), \
+         waveform_overview = coalesce(waveform_overview, \
+           (SELECT waveform_overview FROM tracks WHERE id = ?1)) \
+         WHERE id = ?2",
+        [f, i],
+    )?;
+    c.execute("DELETE FROM tracks WHERE id = ?1", [f])?;
+    c.execute(
+        "UPDATE aliases SET new = ?2, updated_at = ?3, device = ?4 WHERE new = ?1",
+        params![f, i, now, dev],
+    )?;
+    c.execute(
+        "INSERT INTO aliases(old, new, updated_at, device) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(old) DO UPDATE SET new = excluded.new, updated_at = excluded.updated_at, \
+         device = excluded.device",
+        params![f, i, now, dev],
+    )?;
+    Ok(())
+}
+
+/// The track `id` was merged into (aliases point straight at the survivor).
+fn resolve(c: &Connection, id: TrackId) -> rusqlite::Result<TrackId> {
+    let new: Option<Vec<u8>> = c
+        .prepare_cached("SELECT new FROM aliases WHERE old = ?1")?
+        .query_row([&id.0[..]], |r| r.get(0))
+        .optional()?;
+    Ok(new.map_or(id, |b| track_of(&b)))
+}
+
+fn track_of(b: &[u8]) -> TrackId {
+    TrackId(b.try_into().unwrap_or([0; 16]))
+}
+
+fn blob_col(r: &Row, i: usize) -> rusqlite::Result<Option<BlobId>> {
+    let b: Option<Vec<u8>> = r.get(i)?;
+    Ok(b.and_then(|b| b.try_into().ok()).map(BlobId))
+}
+
+/// Write a blob unless it is there already: tmp file, sync, rename, sync the folder.
+fn write_blob(dir: &Path, id: BlobId, bytes: &[u8]) -> io::Result<()> {
+    let path = dir.join(id.path());
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() == bytes.len() as u64) {
+        return Ok(());
+    }
+    let folder = path.parent().expect("blobs/<aa>/");
+    std::fs::create_dir_all(folder)?;
+    let tmp = folder.join(format!(".{id}.tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &path)?;
+    sync_dir(folder)
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Move a damaged `library.db` (and its WAL) aside as `library.db.corrupt-<date>` and put
+/// the backup in its place, if there is one. Returns a line for the user.
+fn set_aside(dir: &Path, why: &str) -> io::Result<String> {
+    let stamp = rfc3339(system_ms()).replace(':', "");
+    let db = dir.join(DB_FILE);
+    let kept = dir.join(format!("{DB_FILE}.corrupt-{stamp}"));
+    std::fs::rename(&db, &kept)?;
+    let wal = dir.join(format!("{DB_FILE}-wal"));
+    if wal.exists() {
+        std::fs::rename(&wal, dir.join(format!("{DB_FILE}.corrupt-{stamp}-wal")))?;
+    }
+    let bak = dir.join(BACKUP_FILE);
+    let restored = bak.exists() && std::fs::copy(&bak, &db).is_ok();
+    sync_dir(dir)?;
+    let name = kept.file_name().unwrap_or_default().to_string_lossy();
+    Ok(if restored {
+        format!(
+            "library damaged ({why}): kept as {name}, back to the backup made at the last mount"
+        )
     } else {
-        stats.skipped_lines += 1;
-    }
-}
-
-/// True if a snapshot file ends with a [`SnapshotEnd`] that matches what is between it and
-/// the header, and no line was skipped: nothing was cut off or damaged.
-fn snapshot_is_whole(bytes: &[u8], decoded: &codec::Decoded) -> bool {
-    let Some(Line::SnapshotEnd(end)) = decoded.lines.last() else {
-        return false;
-    };
-    if decoded.skipped > 0 || !bytes.ends_with(b"\n") {
-        return false;
-    }
-    let Some(header_end) = bytes.iter().position(|&b| b == b'\n') else {
-        return false;
-    };
-    let last = bytes.len() - 1;
-    let Some(end_start) = bytes[..last].iter().rposition(|&b| b == b'\n') else {
-        return false;
-    };
-    let ops = decoded
-        .lines
-        .iter()
-        .filter(|l| matches!(l, Line::Op(_)))
-        .count();
-    end_start > header_end && end.matches(ops as u64, &bytes[header_end + 1..=end_start])
-}
-
-fn push_unique(v: &mut Vec<TrackId>, t: TrackId) {
-    if !v.contains(&t) {
-        v.push(t);
-    }
-}
-
-fn parse_format(bytes: &[u8]) -> Result<LibraryId, MountError> {
-    let bad = |e: &str| MountError::BadFormat(e.to_owned());
-    let v: Value = serde_json::from_slice(bytes).map_err(|e| bad(&e.to_string()))?;
-    if v.get("format").and_then(Value::as_str) != Some(FORMAT_NAME) {
-        return Err(bad("not a djplayer library"));
-    }
-    let version = v
-        .get("version")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| bad("no version"))?;
-    if version > u64::from(FORMAT_VERSION) {
-        return Err(MountError::NewerFormat(version));
-    }
-    v.get("library")
-        .and_then(Value::as_str)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| bad("no library id"))
+        format!("library damaged ({why}): kept as {name}, starting an empty library")
+    })
 }
 
 /// `ms` since the Unix epoch as RFC 3339 UTC, e.g. `2026-10-21T22:41:07Z`.
@@ -1267,55 +1204,11 @@ pub fn rfc3339(ms: u64) -> String {
     )
 }
 
-/// Every library a player sees (its own slots, later linked players' sticks and the cloud),
-/// by library id. Data stays per library: nothing merges across them.
-#[derive(Debug, Default)]
-pub struct Libraries {
-    libs: BTreeMap<LibraryId, Library>,
-}
-
-impl Libraries {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add a mounted library; returns its id. A library with the same id (a second copy)
-    /// replaces the first.
-    pub fn insert(&mut self, lib: Library) -> LibraryId {
-        let id = lib.id();
-        self.libs.insert(id, lib);
-        id
-    }
-
-    pub fn remove(&mut self, id: LibraryId) -> Option<Library> {
-        self.libs.remove(&id)
-    }
-
-    pub fn get(&self, id: LibraryId) -> Option<&Library> {
-        self.libs.get(&id)
-    }
-
-    pub fn get_mut(&mut self, id: LibraryId) -> Option<&mut Library> {
-        self.libs.get_mut(&id)
-    }
-
-    pub fn track(&mut self, r: TrackRef) -> Option<Track> {
-        self.libs.get_mut(&r.library)?.track(r.track)
-    }
-
-    pub fn ids(&self) -> impl Iterator<Item = LibraryId> + '_ {
-        self.libs.keys().copied()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn rfc3339_formats_civil_dates() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00Z");
-        assert_eq!(rfc3339(1_792_622_467_000), "2026-10-21T22:41:07Z");
+    fn rfc3339_formats_utc() {
+        assert_eq!(super::rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::rfc3339(1_792_621_267_000), "2026-10-21T22:21:07Z");
     }
 }

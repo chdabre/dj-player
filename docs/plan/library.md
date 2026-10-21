@@ -1,6 +1,6 @@
-# Library format (design, draft)
+# Library format (design)
 
-Status 2026-10-21: design settled with the owner (see "Decisions" below, which win over anything else in this doc); the first build is in `crates/library` and wired into `engined` (see "Status" at the end). It makes concrete the "Own library on the stick" and "Cloud library" sections of the engine research (`docs/research/engine.md`). The decisions marked **(to confirm)** are the owner's.
+Status 2026-10-21: rebuilt on SQLite after the spike (`library-sqlite.md`, summarised under "Why SQLite" below); the build is in `crates/library` and wired into `engined` (see "Status"). It makes concrete the "Own library on the stick" and "Cloud library" sections of the engine research (`docs/research/engine.md`). The owner's decisions below win over anything else in this doc.
 
 ## Decisions (owner, 2026-10-21)
 
@@ -9,7 +9,7 @@ These settle the open questions and extend the design; where this section and th
 **Libraries and writing**
 - A player sees several libraries at once: its own slots, linked players' sticks, later the cloud. Tracks are addressed as (library, track).
 - Data stays per library: no automatic merge across sticks, and no cross-encode cue copy in version 1.
-- One writer per stick: the player it's plugged into. Linked players forward operations (stamped with their own HLC and device id) and blobs to the holder.
+- One writer per stick: the player it's plugged into. Linked players can't write (merge strategies for sync come later).
 - Guest sticks are written by default. A per-stick lock flag (in the stick's settings, never copied by a settings import), or a write-protected stick, keeps edits in RAM, shown as unsaved.
 - With no writable library mounted, edits live in RAM only, shown as unsaved. There is no home library in version 1.
 
@@ -42,270 +42,110 @@ These settle the open questions and extend the design; where this section and th
 - Loading from another stick or from a linked player is a manual menu action.
 - A load replaces DJ preferences only (quantize, tempo range, waveform mode and theme, auto cue, hot-cue banks). Hardware and device settings are never imported.
 
-**Format and defaults**
-- `DJPLAYER/` folder; CRC-32C-framed JSON-lines journals and snapshots; BLAKE3 blobs; HLC-stamped `set` / `add` / `rm` / `event` operations.
-- Tuning: flush within 2 s; segment per mount and every 64 KB; snapshot past about 50 segments or 5 MB; tombstones kept 90 days; cloud segments sealed 30 s after their last write.
+**Format (owner, 2026-10-21, after the SQLite spike; replaces the journals)**
+- One SQLite file, `DJPLAYER/library.db`; blobs stay files. No op log, HLC, CRDT, version vectors or snapshots. Concurrent offline edits can't happen (a stick is in one player, and linked players don't write), so there is nothing to merge; a sync layer for the cloud is designed later, on the `updated_at` and `device` every row carries.
+- Yanks: edits are queued in RAM and committed about once a second; a failed write keeps the queue, shown as unsaved, and it is written when the same library mounts again.
+- A backup, `library.db.bak`, on each mount that writes.
+- `synchronous=FULL`.
+- After an unclean unmount, the integrity check runs in the background.
+- A stick with no library: the browser asks whether to scan it; otherwise it offers only the folder tree (records still come lazily, on load).
 
 **After the first build (owner, 2026-10-21)**
-- **Alias merges:** the older track survives (as above): the one with the earliest HLC among its location element ids, the lower id on a tie.
+- **Alias merges:** the older track survives (as above): the one this library saw first.
 - **Cue point at load:** the first stored memory cue if there is one; else, with auto cue on, the first sound at or above the auto cue level; else no cue point and the playhead at 0. Auto cue is a player setting (on by default at −36 dB; `--auto-cue off|<dB>`).
 - **Hot cue bank B:** stored and merged now; the deck's bank switch comes later.
 - **Snapshot size:** no smaller encoding or compression in version 1.
-- **Author field and audio hash:** each operation carries its author as `dev`; the audio hash lives in the location identity and is updated by rm + add.
 - **Default library location:** automatic only on removable volumes (USB sticks, SD cards), never internal storage. The internal-storage mode will name its own library folder.
 - **Stored analysis:** once one analyzer reruns, every later one reruns too.
 - **Device id on dev machines:** `~/.config/djplayer/device-id`, overridden by `$DJPLAYER_CONFIG`.
-- **Clock:** HLCs after 2200-01-01 are dropped. A player with a trusted clock (NTP-synchronised, or a kept RTC) also doesn't follow stamps more than a day ahead of it; that affects only what its clock observes, never the merge.
-
-**First build (scope)**
-- The `library` crate on a folder store: the record format, HLC and merge, with property tests.
-- Identity: content hash, versioned audio hash, aliases.
-- Lazy records for loaded files; cues, 16 hot cues, rating, analysis and waveform blobs.
-- Wired into `engined`, so cues and waveforms persist across loads. Snapshots as soon as the replay test needs them.
-- Later: Rekordbox import (needs the Rekordbox reader and a real stick), playlists, tags, history, settings, compaction, the link protocol and the cloud.
-
-## Short answer
-
-- **One folder at the root of the stick** (or of a cloud folder) holds everything we write. Rekordbox files are never touched.
-- **Four kinds of files:**
-  - one `FORMAT` file;
-  - snapshots;
-  - one append-only journal folder per device;
-  - content-addressed blobs.
-
-  A device only ever creates files in its own journal folder, so no two writers ever touch the same file.
-- **Journals are text:** one record per line, a CRC-32C and then a JSON object **(to confirm)**. A torn last line (a yanked stick) or a corrupt line is detected and skipped.
-- **The state is a merge of operations.** Every edit is one operation stamped with a hybrid logical clock (HLC). Replaying all journals in any order gives the same state:
-  - plain fields are last-writer-wins registers;
-  - cues, tags and playlist entries are sets with per-element ids and tombstones;
-  - play history is an append-only event log.
-- **Tracks have a stable id derived from their file hash at first sight.** Two devices that discover the same file give it the same id. A file whose tags were edited elsewhere is re-matched by its audio hash and merged.
-- **Big data lives in blobs.** Waveforms, analysis results and later stems are blobs named by their BLAKE3 hash, written once and never changed. Records only point at them.
-- **Positions are seconds** (f64) on the engine's timeline, the gapless-trimmed one. Every record that imports Rekordbox data converts with the track's recorded start trim.
-- **A player can hold several libraries at once:** its own USB and SD slots, the libraries in linked players, and a cloud library. Every track is addressed as (library, track). Each library has exactly one writer at a time: the player it is plugged into. Edits for a track in another player's library travel over the link to that player, which journals them.
 
 ## Layout
 
 ```
-<stick or cloud root>/
-  DJPLAYER/                       name to confirm
-    FORMAT                        format id, version, library id (UUID), created
-    devices/<device-id>.json      a device's name and model, written once by that device
-    journal/<device-id>/
-      00000001.log                append-only segments, one per mount (+ rotation)
-      00000002.log
-    snapshots/
-      <hlc>-<device-id>.snap      full state + version vector; newest wins, older ones deleted
-    blobs/<aa>/<hash>             content-addressed, BLAKE3 hex; <aa> = first two hex digits
-    tmp/                          partial writes, renamed into place when complete
+DJPLAYER/
+  library.db         SQLite, WAL with exclusive locking (no -shm file)
+  library.db-wal     only while mounted (or after a crash)
+  library.db.bak     the file as it was before this mount's first write
+  blobs/<aa>/<hash>  BLAKE3-named waveforms and analysis results, written once
 ```
 
-- **Device id:** a random UUID generated on first boot. It is kept on the device's boot storage, never on the stick, so a stick moved between players never mixes their journals.
-- **FORMAT:** a small JSON file: `{"format":"djplayer-library","version":1,"library":"<uuid>","created":"2026-10-21T…"}`. Readers refuse a higher major version and ignore unknown fields.
-- **Names stay within exFAT and FAT32 rules:** ASCII, no colons, short.
+## Schema (version 1)
 
-## Records
+| Table | Key | Holds |
+| --- | --- | --- |
+| `meta` | key | `library_id` (16 random bytes), `min_reader_version`, `clean_unmount` |
+| `tracks` | `id` (16 bytes, from the file hash at first sight) | tag cache (title, artist, album, genre, BPM, key, duration; not filled yet), rating, colour, comment, audio hash and its version, waveform and overview blob names |
+| `locations` | (track, path) | size, file hash; indexed by file hash |
+| `hot_cues` | (track, slot 0–15) | at, end, colour, comment |
+| `cues` | id (16 random bytes) | track, kind (memory or loop), at, end, colour, comment |
+| `analysis` | (track, analyzer) | version, params, blob, created |
+| `aliases` | old track id | the track it was merged into |
 
-A journal segment is a sequence of lines. Each line is `<crc32c, 8 hex> <json>\n`, where the CRC covers the JSON bytes. A line with a bad CRC or no newline is skipped, with a warning, and replay continues.
+Every row of an edit carries `updated_at` (wall-clock ms, 0 without a clock) and `device`. Playlists, tags, history, settings and the FTS5 search index come with the features that use them, as schema version 2 and later.
 
-The first line of a segment is a header:
+**Versions.** `PRAGMA user_version` is the schema version, and `meta.min_reader_version` the oldest version that may still read and write the file. A newer file whose `min_reader_version` this build meets is used as is: writes name their columns (`INSERT … ON CONFLICT DO UPDATE SET` the columns this version knows, never `INSERT OR REPLACE`), so columns a newer version added survive. Otherwise it is refused.
 
-```
-5e1a03c2 {"segment":7,"device":"3f2a…","format":1,"opened":{"hlc":"…"}}
-```
+## Writes and yanks
 
-Every other line is one operation:
-
-```
-a91c44e0 {"hlc":"0192f3c4a1b2-0003","op":"set","path":"track/9c4e1f0a2b3d4e5f/rating","value":4}
-17bd0e9f {"hlc":"0192f3c4a1b3-0000","op":"add","path":"track/9c4e1f0a2b3d4e5f/cue","id":"0192f3c4a1b3-0000@3f2a","value":{"kind":"memory","at":61.284,"color":"rose","comment":""}}
-c2f0aa13 {"hlc":"0192f3c4a1c0-0000","op":"rm","path":"track/9c4e1f0a2b3d4e5f/cue","id":"0192f3c4a1b3-0000@3f2a"}
-0e77b1d5 {"hlc":"0192f3c4a2f0-0000","op":"event","path":"history","value":{"track":"9c4e1f0a2b3d4e5f","at":"2026-10-21T22:41:07Z","deck":1,"played_s":312.4}}
-```
-
-- **`hlc`:** milliseconds since the Unix epoch (48 bits, hex) and a counter (16 bits). Ties are broken by the device id. Each device's HLC never goes backwards: on mount it starts above the highest HLC already in the library, so a player with no clock source (no RTC battery, no network) still orders its edits after everything it has seen.
-- **Four operations:**
-  - `set`: a register; `value: null` clears it.
-  - `add` / `rm`: an element of a set, by its `id`.
-  - `event`: appended to a log.
-
-  That is the whole grammar. A new feature adds paths, not operations.
-- **Paths** name an entity and a field. Unknown paths are kept and passed through (a newer device's data survives an older device's snapshot) but not interpreted.
-
-## Who sees what, when
-
-Journals are split by device for writing only. Every device reads all journal folders and merges them, so nothing one device writes is hidden from another.
-
-- **USB stick moved between players:** on mount, a player replays every device's journals, so last night's edits from another player are there.
-- **Cloud folder:** a running device picks up other devices' sealed segments through change notifications. They arrive within about 30 s (sealing) plus up to about 90 s (Dropbox long-poll lag); a device that was offline catches up on reconnect.
-- **The same field edited on two devices:** the later edit by HLC wins everywhere. **Sets** (memory cues, tags, playlist entries) keep both devices' additions.
-- **While a stick is mounted,** its player doesn't watch for changes: it is the stick's only writer. Linked players see its edits live over the link (next section), not through the files.
-
-## Multiple libraries and linked players
-
-Linked players share their sticks, as Pro DJ Link does: player B browses and loads tracks from the USB in player A. So a player works with a set of libraries, not one.
-
-- **Library id:** the UUID in `FORMAT`. A player's library set holds each mounted library with its id, where it is (a local slot, a linked player, the cloud) and whether it can be written. The browse tree shows them all.
-- **Track address:** `(library id, track id)`. Track ids come from the file hash, so the same file on two sticks has the same track id in both. Its data stays separate per library, and the UI can offer "copy cues from the other stick". Nothing merges across libraries on its own.
-- **One writer per stick:** the player a stick is plugged into is its only writer. Player B never writes A's stick directly. It sends its operations over the link, stamped with B's HLC and device id, and A appends them to its own journal segment on that stick. Each operation carries its origin device, and merging orders by HLC and origin, not by the folder the operation sits in. So the "one folder per device" rule stays true: a folder is per writer, and operations are per author.
-- **Blobs from linked players:** an analysis or waveform computed on B for a track on A's stick is sent to A as a blob, and A writes it. Until A confirms, B keeps it in RAM.
-- **Edits that can't be delivered:** if A or its stick goes away while B still has the track loaded, the track keeps playing from B's RAM. B queues the edits for that library id and delivers them when that library shows up on the link again. Undelivered edits are shown ("3 unsaved edits for USB 'Friday'") and are lost at power-off.
-- **History:** a play is recorded in the library that holds the track, with the playing device as the author. A session log across all libraries (what played tonight, from which sticks) is a later, separate record in the player's home library, if it has one.
-- **Two copies of the same library** on the link (the same library id, e.g. a stick prepared from the cloud and the cloud itself, or two copies of one stick): they are replicas. Each holder writes only its own copy, and the link shares edits live so both players show the merged state. The copies themselves converge the next time they sync (cloud upload, or a copy-back to the original).
-- **Depends on** the unit-to-unit link protocol (`engine-sync`), not designed yet. The library side needs four messages from it: browse, load (stream the audio file), apply-operations (with acknowledgement) and put-blob.
-
-## Data model
-
-| Path | Kind | Value | Notes |
-| --- | --- | --- | --- |
-| `track/<id>/file` | set of identities | `{path, size, file_hash, audio_hash?}` | Where the file is and what it is; see Identity |
-| `track/<id>/meta/<field>` | register | text | Only our edits (title, artist, …). Rekordbox and tags fill the rest at mount |
-| `track/<id>/rating`, `color`, `comment` | register | small | Overlay: ours wins when set |
-| `track/<id>/cue` | set | `{kind: memory \| loop, at, end?, color, comment}` | Memory cues and loops |
-| `track/<id>/hotcue/<0..15>` | register | `{at, end?, color, comment}` or null | 16 hot cues: two banks of 8 **(to confirm)** |
-| `track/<id>/cues_from` | register | `ours` \| `rekordbox` | Overlay switch per track: set to `ours` on the first cue edit; "revert to Rekordbox cues" sets it back |
-| `track/<id>/grid` | register | `{blob}` or `{first, bpm, bar_phase}` | A hand-edited grid; absent = use analysis |
-| `track/<id>/analysis/<analyzer>` | register | `{version, params, blob, created}` | One per analyzer (gridfit, tempocnn, hpcpkey); the selection policy picks among them and Rekordbox's |
-| `track/<id>/waveform` | register | `{blob, overview_blob}` | DJWF blobs; their header carries params and timeline |
-| `track/<id>/tag` | set | tag id | My Tag-style tags |
-| `tag/<id>/name`, `color` | register | text | |
-| `playlist/<id>/name`, `parent`, `order` | register | text | Folders are playlists with children |
-| `playlist/<id>/entry` | set | `{track, order}` | `order` is a fractional index, so concurrent inserts never collide |
-| `history` | log | `{track, at, deck, played_s}` | Play counts are derived from it |
-| `settings/<key>` | register | any | Per-stick settings (our MY SETTINGS) |
-| `alias/<id>` | register | `<id>` | A merged duplicate track points at the survivor |
-
-Rekordbox's data is never copied in. It is read at mount and overlaid: for each field, ours if we have a value, else Rekordbox's (cues switch per track via `cues_from`). So a re-export from Rekordbox never conflicts with anything.
-
-## Merge rules
-
-| Kind | Rule |
-| --- | --- |
-| Register | Highest HLC wins (last writer wins) |
-| Set | An element is present if its `add` has no `rm` with the same id (add-wins for a re-add, which gets a new id). Editing a cue is an `rm` + `add` |
-| Log | Union of events, ordered by HLC; duplicates (same HLC + device) dropped |
-| Track identity | Two track ids whose identities share a `file_hash` or `audio_hash` are merged: the older one (seen first) survives, the lower id on a tie; the other gets an `alias`. Each field merges by its own rule |
-
-The rules are commutative and idempotent. Replaying segments in any order, or twice, gives the same state; a property test checks this on random histories.
+- **One writer:** the library worker on the player holds the file with exclusive locking, which also keeps any second writer out.
+- **An edit** runs against the file at once, inside an open write transaction, so reads see it; it also goes into the RAM queue. `flush` (the worker calls it about 1 s after the first uncommitted edit) commits; the queue is cleared on commit.
+- **A failed write** (pulled, full or read-only stick) rolls the transaction back and keeps the queue; the status band shows UNSAVED (`Persistence::Unsaved`). Each later flush tries the whole queue again. When the library is dropped with edits queued, they wait in the process (with any blobs kept in RAM) and are written when a library with the same `library_id` mounts. A pulled stick loses nothing it had committed: decks keep playing from RAM, and with WAL + FULL the spike lost nothing in any crash or yank test.
+- **Unmount:** commit, set `clean_unmount`, `wal_checkpoint(TRUNCATE)`.
+- **Backup:** before the first write of a mount, `VACUUM INTO library.db.bak.tmp`, synced and renamed over `library.db.bak`. About 80 ms at 10k tracks on an SSD; seconds on a stick at 50k (est.).
+- **Check:** a mount that finds `clean_unmount` unset (crash or yank) runs `PRAGMA quick_check` after the loaded track's record is out, so the load isn't held up. A write that finds damage asks for the same check.
+- **Damage:** a file that is damaged or not a database is moved aside as `library.db.corrupt-<date>` (with its WAL), the backup copied in its place (or an empty library made), and this mount's edits written onto it.
+- **Read-only stick:** the file is read once into RAM (`immutable=1`, then the backup API); edits stay in RAM, unsaved, and are written when the stick mounts writable. A WAL left by a crash on a read-only stick is not read.
+- **No library:** an in-memory database; its edits carry over between loads in one process, and are lost at exit.
 
 ## Identity
 
-- **Track id:** the first 16 bytes of BLAKE3 over `"track" ‖ file_hash`, as hex, taken when the file is first seen. Two devices that find the same file independently create the same id.
+- **Track id:** the first 16 bytes of BLAKE3 over `"track" ‖ file_hash`, taken when the file is first seen. Two devices that find the same file independently create the same id.
 - **`file_hash`:** Dropbox's `content_hash`, computed locally for USB files too: SHA-256 over the concatenated SHA-256 digests of 4 MiB blocks. The same file on a stick and in Dropbox then matches without a download.
-- **`audio_hash`:** BLAKE3 over the decoded audio as 16-bit PCM at the file's own rate, computed once during analysis. A tag edit changes the file bytes but not this, so it re-matches an edited file, which then gets a new `file` identity on the same track.
-- **Paths:** the relative path from the stick root, with `/` separators, NFC-normalised. A path is a hint for finding the file, never its identity.
+- **Exact duplicate:** a file hash already known at a new path is another location of that track.
+- **`audio_hash`:** `{v: 1, hash}`, BLAKE3 over our decoder's interleaved output at the file's rate as 16-bit LE (`round(x·32768)`, clamped), computed once during analysis and kept on the track. Recomputed on load when its version is stale.
+- **Merge:** tracks with the same current audio hash (tag-edited copies) merge into the one this library saw first (lowest rowid). The other's locations and memory cues move over; its hot cues and analysis results fill empty slots or replace older ones (by `updated_at`); its rating, colour, comment and waveform fill empty fields. Its row is deleted and `aliases` points its id (and any ids aliased to it) at the survivor. Edits to an aliased id go to the survivor. A different encode stays a separate track.
+- **Paths:** relative to the folder holding `DJPLAYER/`, `/`-separated, NFC-normalised. A path is a hint for finding the file, never its identity. Missing files keep their record.
 
 ## Blobs
 
-- **Naming:** `blobs/<aa>/<64 hex>`, the BLAKE3 hash of the bytes. A blob's own header says what it is (waveforms are DJWF); analysis results are a small versioned JSON or binary per analyzer.
-- **Writing:** write into `tmp/`, flush, then rename into place. A reader never sees a half-written blob, and a blob that already exists is never written again.
-- **Garbage collection:** when a snapshot is written, any blob that no live record references (after the tombstone grace period) is deleted. Stems will dominate the space, so the UI gets a size display and "remove stems".
+- **Naming:** `blobs/<aa>/<64 hex>`, the BLAKE3 hash of the bytes. A blob's own header says what it is (waveforms are DJWF); analysis results are a small versioned format per analyzer.
+- **Writing:** tmp file in the same folder, sync, rename, sync the folder: before the row that names it is committed. A blob that can't be written fails the transaction (so no row names a missing blob) and stays in RAM with the queue.
+- **Reading** checks the bytes against the name.
 
-## Snapshots and compaction
+## Multiple libraries and linked players
 
-- **What a snapshot holds:** a header line with the version vector (per device, the highest segment and line it includes), then the current state as `set` / `add` / `event` lines with their original HLCs. It also keeps tombstones for 90 days, so a late journal can't resurrect a deleted cue.
-- **When:** any device writes one when replay passes about 50 segments or 5 MB of journal, under `tmp/`, then renames it into `snapshots/`.
-- **Deleting:** segments at or below a device's entry in the newest snapshot's vector are deleted. A device that was offline appends higher segment numbers, so nothing it wrote is lost.
-- **Concurrent snapshots:** two snapshots written at once are both loaded and merged; the one whose vector is dominated is deleted.
-
-## Durability on a USB stick
-
-- **Segments:** one per mount, plus rotation every 64 KB.
-- **Flushing:** small records (cue, rating, history) are flushed within 2 s of the edit; each analysis result once its blob is written.
-- **Yanked stick:** loses at most the unflushed seconds. The torn line fails its CRC and is skipped.
-- **Read-only or full stick:** the library runs from RAM for the session and says so on screen.
-- **Mount:** load the newest snapshot, replay newer segments, and build the in-RAM index. Rough size for 10,000 tracks: about 15 MB of snapshot, read and parsed in well under a second on a Pi 5 (to measure). zstd compression of snapshots is a later option, not version 1.
+A player sees several libraries (its slots, linked players' sticks, later the cloud); tracks are addressed as `TrackRef { library, track }`, and data stays per library. The player a stick is plugged into is its only writer; linked players read through the link and don't write (until a sync design says how). This depends on the link protocol (`engine-sync`), not designed yet.
 
 ## Cloud
 
-The same files work unchanged on a cloud folder. The difference is that cloud APIs (Dropbox) can't append:
+Later. The same `library.db` in a cloud folder can't be written by two devices at once; the sync layer (per-row `updated_at` and `device`, merge strategies) is designed when the cloud library is built.
 
-- **Sealed segments only:** a segment is sealed (closed, never written again) on unmount, on rotation, or 30 s after its last write. Only sealed segments are uploaded.
-- **Hold-back:** at most 30 s of edits stay unshared while a device is online.
-- **"Prepare for gig":** copies the folder to a stick byte for byte; the stick's new segments sync back later.
+## Why SQLite
 
-## Crate
+The first build (CRC-framed JSON-lines journals per device, HLC, CRDT merge, version vectors, snapshots, a writer lock: about 3,000 lines) solved concurrent offline writes, which can't happen here. The spike measured one SQLite file on the same workload: at 50k tracks, open in 3 ms, 4–31 MB of RAM, a 103 MB file, and a 20-edit batch on exFAT in 4.4 ms; WAL + FULL lost nothing in the crash, yank and fault-injection tests (ran). A torn page on a stick that lies about flushes costs that page's rows; the check and the backup cover it (a salvage path is still to do). rusqlite 0.40 with the bundled SQLite (3.53) cross-builds for the Pi.
 
-A new crate, `library`, with no I/O of its own beyond a storage trait, so it tests offline like `engine-core`.
-
-```rust
-pub trait Store {                       // a stick folder, RAM, later Dropbox
-    fn list(&self, dir: &str) -> io::Result<Vec<String>>;
-    fn read(&self, path: &str) -> io::Result<Vec<u8>>;
-    fn append(&self, path: &str, bytes: &[u8]) -> io::Result<()>;     // own segments only
-    fn create(&self, path: &str, bytes: &[u8]) -> io::Result<()>;     // write-once (tmp + rename)
-    fn remove(&self, path: &str) -> io::Result<()>;
-    fn flush(&self, path: &str) -> io::Result<()>;
-}
-
-pub struct Library { /* one mounted library: merged state, the open segment, HLC */ }
-pub struct Libraries { /* every library this player sees, by library id */ }
-impl Library {
-    pub fn mount(store: impl Store, device: DeviceId) -> Result<Self, MountError>;
-    pub fn track(&self, id: TrackId) -> Option<TrackView<'_>>;           // the merged fields
-    pub fn apply(&mut self, edit: Edit) -> Result<(), WriteError>;     // stamps, journals, merges
-    pub fn apply_remote(&mut self, ops: &[Op]) -> Result<(), WriteError>; // from a linked player
-    pub fn put_blob(&mut self, bytes: &[u8]) -> Result<BlobId, WriteError>;
-    pub fn flush(&mut self) -> Result<(), WriteError>;
-    pub fn snapshot(&mut self) -> Result<(), WriteError>;
-}
-```
-
-`engined` owns the `Library` on a worker thread. The deck never sees it: the deck gets cues, grids and waveforms as it does now, from the loader, the analysis and the commands.
-
-## Tests (planned)
-
-- **Codec:** each operation round-trips; torn and corrupt lines are skipped; unknown paths and fields survive a snapshot.
-- **Merge, property-tested:** random edit histories from three simulated devices give the same state under any replay order, duplicated segments and a snapshot taken at any point.
-- **Identity:** two devices discovering the same file get the same id; a tag-edited copy merges by audio hash; aliases resolve.
-- **Durability:** a store that fails or truncates writes at random points never loses a flushed record, and never shows a half-written blob.
-- **Compaction:** after a snapshot and segment deletion the state is unchanged; a late offline journal still applies; tombstones stop resurrection.
-- **Scale:** mount and replay 10,000 synthetic tracks, timed on the Mac and later on the Pi.
-
-## Open questions
-
-All answered on 2026-10-21; see "Decisions" at the top.
-
-## Status (first build, 2026-10-21)
+## Status (2026-10-21)
 
 **Built**
 
-- **`crates/library`**, no I/O beyond the `Store` trait (`list` / `read` / `read_limited` / `append` / `append_new`, which claims a new segment and fails if it exists / `create` write-once via `tmp/` + rename / `remove` / `flush`), with `FolderStore` and `MemStore` (which can be made to fail writes).
-- **Records:** the layout above (`FORMAT`, `devices/<id>.json`, `journal/<device>/<8 digits>.log`, `snapshots/<hlc>-<device>.snap`, `blobs/<aa>/<hash>`, `tmp/`). Lines are `<crc32c 8 hex> <json>\n`; a segment opens with its header; every operation carries `hlc` and its author `dev`. Unknown fields (on the line and inside values) and unknown operations are kept and written back. A torn or corrupt line is skipped and counted. An unreadable file or folder (or one over the size caps: 64 MB per segment, 2 GB per snapshot, 1 GB per blob) is skipped with a warning; the rest still mounts. A blob that exists under its name but fails its hash is rewritten the next time it is stored.
-- **HLC:** 48-bit ms + 16-bit counter, written `0192f3c4a1b2-0003`, ties broken by device id. On mount the clock starts above the highest HLC in the library (and observes linked players' operations). An HLC after 2200-01-01 is implausible: such an operation is dropped by every replica alike and never observed, so one corrupt or hostile line can't pin every device's clock at the top of the range. A wall clock set beyond that counts as no clock (the device stamps just above what it has seen), so it can't pin the library at the ceiling either. Two mounts as one device in one process share the last stamp handed out, so they never make the same stamp or element id; each claims its own segment.
-- **Merge:** registers LWW, sets with per-element ids (`<hlc>@<device>`) and tombstones, logs as unions. Property tests (proptest, 256 cases each): random histories from three devices (equal HLCs across devices, wall clocks going backwards, clock observation) give the same state under any replay order, with duplicated segments, from a snapshot taken at any point (also with the covered segments deleted), and from two concurrent snapshots.
-- **Identity:** track id = first 16 bytes of BLAKE3(`"track"` ‖ the 32 raw bytes of the Dropbox `content_hash`). An exact duplicate is a second location on the same track. The audio hash `{v: 1, hash}` is BLAKE3 over our decoder's interleaved stereo output at the file's rate as 16-bit LE (`round(x·32768)`, clamped); it lives in the location's identity and is replaced (rm + add) when stale. Two tracks with the same current audio hash are merged: the one seen first survives, the other gets `alias/<id>`; fields merge across them by their own rules, and edits to an alias go to the survivor. A different encode stays a separate track. Missing files keep their record.
-- **Data:** lazy track records on first load (folder mode), memory cues and loops (set), 16 hot cues (registers), rating, the latest analysis result per analyzer (blob + version + params), waveform (DJWF detail and overview blobs). Positions are f64 seconds on the gapless-trimmed engine timeline.
-- **Snapshots:** version vector (per writer, the highest segment held with every lower one: a gap, such as a segment not synced yet, is never covered) plus the state, then an end line `{"end":1,"ops":N,"body":"<BLAKE3 of the lines between>"}`. Mount loads every snapshot, skips covered segments, replays the rest. A snapshot without a matching end line (cut short or damaged) still gives its operations, but its vector is ignored. A device's next segment is numbered above both its segments on disk and its entry in the vector, so compaction can't make it reuse a number. No compaction or GC yet.
-- **Several libraries:** `Libraries` holds them by library id; tracks are addressed as `TrackRef { library, track }`.
-- **Durability:** a read-only stick, or one that fails a write mid-session, keeps every edit (and blob) in RAM and reports `Persistence::Unsaved { edits, reason }`.
-- **`engined`:** the `Player` runs the library on a worker thread (`persist.rs`). `--library <dir>` (or `--no-library`); the default is `DJPLAYER/` at the root of the track's volume if writable (an existing read-only one is mounted read-only), else RAM only, and it says which. On load it finds or creates the record and restores hot cues 1–8, the cue point and a stored loop into the deck through the new `DeckCommand::SetCues` (plain data: no allocation in the callback). The first restore only fills what the deck doesn't have, so cues the DJ set while the library was being read stay and are written back. It uses the stored waveform (the decode tap stops computing) and stored analysis results whose analyzer version and parameters match (no decode at all if the audio hash is current too), and writes new waveform and analysis blobs, the audio hash, hot-cue edits and memory cues (key `m`) back, small edits flushed within 1 s. The UI takes the same flags and key.
+- **`crates/library`** (about 2,100 lines of source, 1,200 of them `library.rs`, plus 560 of tests; the journal version had 3,700 and 1,060): the schema above (`db.rs`), `Library` (`library.rs`): `mount(dir, MountOptions)`, `ram`, `find_or_create`, `set_audio_hash`, `apply(Edit)`, `track`, `tracks`, `put_blob`, `read_blob`, `flush`, `check`, `persistence`; the queue, replay on remount, backup, check and damage handling as described. Tests: identity, duplicates, merges, every edit kind, the folder layout and backup, a read-only stick, a failing write and its retry, RAM carry-over, an unclean close, a damaged page restored from the backup, a file that isn't a database, and a newer schema.
+- **`engined`:** the `Player` runs the library on a worker thread (`persist.rs`). `--library <dir>` (or `--no-library`); the default is `DJPLAYER/` at the root of the track's volume if it is removable and writable (an existing read-only one is read-only), else RAM only, and it says which. On load it finds or creates the record and restores hot cues 1–8, the cue point and a stored loop into the deck through `DeckCommand::SetCues`. The first restore only fills what the deck doesn't have, so cues the DJ set while the library was being read stay and are written back. It uses the stored waveform and stored analysis results whose analyzer version and parameters match (no decode at all if the audio hash is current too), and writes new waveform and analysis blobs, the audio hash, hot-cue edits and memory cues (key `m`) back, committed within about 1 s. The check runs on the worker after the record is out. The UI's status band shows SAVED / SAVING / UNSAVED.
 
-**Measured** (`cargo run --release -p library --example scale`, Linux cloud container, 4 Xeon cores; Mac and Pi still to do). 10,000 synthetic tracks, each with a location and audio hash, 8 hot cues, 3 memory cues, a rating, 3 analysis results and a waveform, written by 3 devices over 50 sessions: 190,000 operations in 750 segments, 48.2 MB of journal.
+**Measured** (`cargo run --release -p library --example scale`, Linux cloud container, SSD; Mac and Pi still to do). 10,000 synthetic tracks, each with a location and audio hash, 8 hot cues, 3 memory cues, a rating, 3 analysis results and a waveform, written in 20 mounts:
 
-| Step | Time |
+| Step | Result |
 | --- | --- |
-| Mount + replay from the journals | 431 ms |
-| First track lookup (builds the identity index) | 23 ms |
-| Write a snapshot (44.6 MB) | 554 ms |
-| Mount from the snapshot alone | 606 ms |
-
-The snapshot is about 3× the 15 MB estimated above: every line carries the full author UUID, and element ids repeat it.
-
-**After the review and the owner's answers (2026-10-21)**
-
-- **Durability:** `FolderStore` syncs the folder after a rename and after making a file or folder. A writable mount removes files in `tmp/` older than an hour (left by interrupted writes; a live writer's are newer).
-- **Writer lock:** before its first segment, a library takes `journal/<device>/writer.lock` (an OS file lock, released if the program dies, so never stale). Another program journaling as the same device keeps its edits in RAM, reported unsaved; libraries in one process share the lock. A file system without locks journals anyway, each mount in its own segment.
-- **Unsaved status:** a RAM-only session reports `Unsaved`, and the UI's status band shows SAVED / SAVING / UNSAVED.
-- **Fields kept:** `AnalysisRef` and `WaveformRef` keep unknown fields. A hot cue moved on the deck keeps its colour, comment, unknown fields and loop end (dropped only if it would now come before the start).
-- **Auto cue:** the decode tap finds the first frame at or above the level; it is applied once the library has said there is no memory cue (or there is no library), filling only, so a cue point the DJ set stays.
-- **Clock:** `MountOptions::trusted_clock`; `engined` trusts the clock when `timedatectl` says it is NTP-synchronised, and on macOS.
-- **Rust 1.89** is the minimum (the writer lock uses `File::try_lock`).
+| `library.db` | 17.8 MB (folder with blobs 33.5 MB) |
+| Open | 0.6 ms |
+| Read one track | 0.16 ms |
+| First commit of a mount (20 edits + the backup) | 81 ms |
+| A later commit of 20 edits | 0.8 ms |
 
 **Left**
 
-- Rekordbox import and overlay, playlists, tags, history and play counts, settings, "remove from library", compaction (deleting covered segments, dominated snapshots), tombstone expiry, blob GC, the link protocol (`apply_remote` exists; nothing calls it) and the cloud.
-- Hot cues 9–16 (bank B) are stored and merged but the deck has 8 pads and no bank switch yet. Memory cues are stored and restored as the load cue point, but there is no CALL / memory-delete on the deck yet.
-- A durability test with a store that truncates writes at random points; the scale numbers on the Mac and the Pi.
-- A smaller line encoding or zstd for snapshots, if the Pi's mount time asks for it.
-
+- The "scan this stick?" question and the folder-tree browser (there is no browser yet); filling the tag cache.
+- Rekordbox import and overlay, playlists, tags, history and play counts, settings, "remove from library", blob GC, the link protocol and the cloud with its sync layer.
+- Hot cues 9–16 (bank B) are stored but the deck has 8 pads and no bank switch yet. Memory cues are stored and restored as the load cue point, but there is no CALL / memory-delete on the deck yet.
+- A salvage path (the recovery extension) for a damaged file with no usable backup; today it starts empty and keeps the damaged file.
+- Two decks loading from one stick at once: both workers would open the file, and the second waits up to 5 s for the lock. Share one library per stick when the player gets its second deck.
+- The scale numbers on the Mac and the Pi, and on a real stick.

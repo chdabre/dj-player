@@ -1,42 +1,31 @@
-//! Our own library format: what the player writes (cues, hot cues, ratings, analysis,
-//! waveforms), on a USB stick or a cloud folder, next to a read-only Rekordbox export.
+//! Our own library: what the player writes (cues, hot cues, ratings, analysis, waveforms),
+//! on a USB stick or a cloud folder, next to a read-only Rekordbox export.
 //!
 //! See `docs/plan/library.md` for the design. In short:
 //!
-//! - **Layout:** one `DJPLAYER/` folder: a `FORMAT` file, `devices/`, one journal folder per
-//!   writer device (`journal/<device>/<segment>.log`), `snapshots/` and BLAKE3-named
-//!   `blobs/<aa>/<hash>`, written once via `tmp/` and a rename.
-//! - **Records** ([`codec`]): CRC-32C-framed JSON lines; four HLC-stamped operations, `set`,
-//!   `add`, `rm` and `event`, each carrying its author device.
-//! - **Merge** ([`state`]): registers are last-writer-wins by HLC, sets have per-element ids
-//!   and tombstones, logs are unions. Replaying journals in any order, twice, or after a
-//!   snapshot gives the same state.
+//! - **Layout:** one `DJPLAYER/` folder holding `library.db` (SQLite, WAL with exclusive
+//!   locking, `synchronous=FULL`), `library.db.bak` (made before each mount's first write)
+//!   and BLAKE3-named `blobs/<aa>/<hash>` files (waveforms, analysis results).
+//! - **Writes** ([`Library`]): the library worker is the only writer. Edits are queued and
+//!   committed in one transaction about once a second; if the stick fails, the queue stays
+//!   in RAM and is written when the same library is opened again.
 //! - **Identity** ([`hash`]): a track id comes from the file's content hash at first sight;
-//!   an exact duplicate is another location of the same track; a tag-edited copy merges
-//!   by its audio hash through an alias; a different encode is a separate track.
-//!
-//! There is no I/O here except through [`Store`], so everything tests offline.
+//!   an exact duplicate is another location of the same track; a tag-edited copy merges by
+//!   its audio hash into the track seen first; a different encode is a separate track.
 
-pub mod codec;
+pub mod db;
 pub mod hash;
-pub mod hlc;
 pub mod ids;
 mod library;
 pub mod model;
-pub mod state;
-pub mod store;
 
-pub use codec::{FORMAT_VERSION, Op, OpKind};
 pub use hash::{AUDIO_HASH_VERSION, AudioHash, ContentHasher, FileHash, track_id};
-pub use hlc::{Clock, Hlc, Stamp};
 pub use ids::{BadId, BlobId, DeviceId, LibraryId, TrackId, TrackRef};
 pub use library::{
-    Edit, Found, Libraries, Library, MountError, MountOptions, MountStats, Persistence,
-    SEGMENT_ROTATE_BYTES, TRUSTED_CLOCK_AHEAD_MS, WriteError, rfc3339, system_ms,
+    Edit, Found, Library, MountError, MountOptions, MountStats, Persistence, ReadError, WriteError,
+    rfc3339, system_ms,
 };
 pub use model::{AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Track, WaveformRef};
-pub use state::State;
-pub use store::{FolderStore, MemStore, Store};
 
 /// A file's path as the library stores it: `/` separators and Unicode NFC, so the same
 /// name written by macOS (NFD) and anything else compares equal.

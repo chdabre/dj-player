@@ -338,9 +338,7 @@ impl Player {
                 }
                 self.lib.waveform_stored = true;
             }
-            let need_hash = !l.record.locations.iter().any(|(_, f)| {
-                f.file_hash == l.file_hash && f.audio_hash.is_some_and(|a| a.is_current())
-            });
+            let need_hash = !l.record.audio_hash.is_some_and(|a| a.is_current());
             self.start_analysis(l.analysis, need_hash);
         }
     }
@@ -957,7 +955,6 @@ mod tests {
                     params: f.params.clone(),
                     blob: library::BlobId::of(&f.blob),
                     created: String::new(),
-                    extra: Default::default(),
                 };
                 (f.name.clone(), (r, f.blob.clone()))
             })

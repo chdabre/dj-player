@@ -1,12 +1,12 @@
 //! The library worker against a real folder and a real (synthetic) audio file: a loaded
 //! track gets a record, and cues, the waveform and analysis written back come back on the
-//! next load, from another device too. No audio device needed.
+//! next load, on another device too. No audio device needed.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engined::persist::{FreshAnalysis, LibraryChoice, LibraryWorker, Loaded, Reply};
-use library::{DeviceId, Edit, FolderStore, HotCue, Library, MountOptions};
+use library::{DeviceId, Edit, HotCue, Persistence};
 
 fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("engined-{name}-{}", std::process::id()));
@@ -65,26 +65,22 @@ fn edits_waveform_and_analysis_come_back_on_the_next_load() {
     .unwrap();
     let first = wait_loaded(&w);
     assert_eq!(first.record.locations.len(), 1);
-    assert_eq!(first.record.locations[0].1.path, "Music/tone.wav");
+    assert_eq!(first.record.locations[0].path, "Music/tone.wav");
     assert!(first.waveform.is_none() && first.analysis.is_empty());
     let t = first.track.track;
 
     w.edit(Edit::SetHotCue(t, 2, Some(HotCue::at(1.25))));
-    // Flushed within 2 s without the worker stopping: another device mounting the folder
-    // now sees the edit.
-    std::thread::sleep(Duration::from_millis(1500));
-    let mut other = Library::mount(
-        FolderStore::new(&lib_dir),
-        MountOptions {
-            read_only: true,
-            ..MountOptions::new(DeviceId::random())
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        other.track(t).unwrap().hot_cues[2].as_ref().unwrap().at,
-        1.25
-    );
+    // Committed within 2 s without the worker stopping.
+    let until = Instant::now() + Duration::from_secs(2);
+    let mut saved = false;
+    while !saved && Instant::now() < until {
+        match w.try_recv() {
+            Some(Reply::Status(Persistence::Saved)) => saved = true,
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    assert!(saved, "the edit was committed");
 
     let wf = waveform::compute::compute(&vec![0.25; 2 * 44_100], 44_100, &Default::default());
     w.waveform(wf.clone());
@@ -113,7 +109,7 @@ fn edits_waveform_and_analysis_come_back_on_the_next_load() {
         (stored.version.as_str(), blob.as_slice()),
         ("1", &b"{}"[..])
     );
-    assert!(again.record.audio_hash().is_some());
+    assert!(again.record.audio_hash.is_some());
     drop(w);
 
     // An exact copy elsewhere on the stick is the same track at a second location.

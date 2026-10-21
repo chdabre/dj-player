@@ -1,5 +1,5 @@
 //! Identifiers: devices and libraries (random UUIDs), tracks (from the file hash) and blobs
-//! (BLAKE3 of their bytes). All are written as lowercase hex in the files.
+//! (BLAKE3 of their bytes). The database holds them as bytes; text forms are lowercase hex.
 
 use std::fmt;
 use std::str::FromStr;
@@ -83,6 +83,15 @@ macro_rules! uuid_id {
             pub fn from_bytes(b: [u8; 16]) -> Self {
                 Self(b)
             }
+
+            /// All zeros: not a UUID anyone makes.
+            pub const fn nil() -> Self {
+                Self([0; 16])
+            }
+
+            pub fn bytes(&self) -> [u8; 16] {
+                self.0
+            }
         }
 
         impl fmt::Display for $name {
@@ -113,7 +122,7 @@ uuid_id!(
 );
 
 uuid_id!(
-    /// A library: the UUID in its `FORMAT` file.
+    /// A library: the UUID in its `meta` table.
     LibraryId
 );
 

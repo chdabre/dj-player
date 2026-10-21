@@ -10,12 +10,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use library::{
-    AnalysisRef, AudioHash, ContentHasher, DeviceId, Edit, FileHash, FileIdentity, FolderStore,
-    Library, MemStore, MountOptions, Persistence, Track, TrackRef, WaveformRef,
+    AnalysisRef, AudioHash, ContentHasher, DeviceId, Edit, FileHash, FileIdentity, Library,
+    MountOptions, Persistence, Track, TrackRef, WaveformRef,
 };
 use waveform::compute::Waveform;
 
-/// Small edits are flushed this long after the first unflushed one (the design allows 2 s).
+/// Edits are committed this long after the first uncommitted one.
 const FLUSH_AFTER: Duration = Duration::from_secs(1);
 
 /// The name of our library folder at the root of a stick.
@@ -182,14 +182,18 @@ fn run(
     };
     let stats = loc.lib.stats().clone();
     say(format!(
-        "library: {} ({} tracks, {} ops from {} segments and {} snapshots in {:.0} ms)",
+        "library: {} ({} tracks, opened in {:.0} ms{})",
         loc.what,
-        loc.lib.tracks().len(),
-        stats.ops,
-        stats.segments,
-        stats.snapshots,
+        stats.tracks,
         started.elapsed().as_secs_f64() * 1e3,
+        if stats.created { ", new" } else { "" },
     ));
+    if stats.replayed > 0 {
+        say(format!(
+            "library: {} edits kept from an earlier mount written",
+            stats.replayed
+        ));
+    }
     for w in loc.lib.take_warnings() {
         say(format!("library: {w}"));
     }
@@ -202,9 +206,16 @@ fn run(
         }
     };
     let path = stored_path(file, loc.root.as_deref());
-    let found = loc
+    let found = match loc
         .lib
-        .find_or_create(FileIdentity::new(path, size, identity));
+        .find_or_create(FileIdentity::new(path, size, identity))
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = replies.send(Reply::Failed(e.to_string()));
+            return;
+        }
+    };
     let mut track = found.track;
     if found.created {
         say(format!("library: new track {track}"));
@@ -224,7 +235,10 @@ fn run(
         last: None,
     };
     report(&mut loc.lib, &say, &mut status);
-    let mut deadline: Option<Instant> = None;
+    // After an unclean close: the record is out, so the check doesn't hold up the load.
+    check(&mut loc.lib, &say);
+    // A new record or location is committed like an edit.
+    let mut deadline = found.new_location.then(|| Instant::now() + FLUSH_AFTER);
     loop {
         let req = match deadline {
             Some(d) => match requests.recv_timeout(d.saturating_duration_since(Instant::now())) {
@@ -239,6 +253,7 @@ fn run(
         };
         let Some(req) = req else {
             loc.lib.flush();
+            check(&mut loc.lib, &say);
             deadline = None;
             report(&mut loc.lib, &say, &mut status);
             continue;
@@ -251,7 +266,13 @@ fn run(
                 deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
             }
             Request::AudioHash(h) => {
-                let survivor = loc.lib.set_audio_hash(track, identity, h);
+                let survivor = match loc.lib.set_audio_hash(track, h) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        say(format!("library: {e}"));
+                        track
+                    }
+                };
                 deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
                 if survivor != track {
                     say(format!(
@@ -268,11 +289,7 @@ fn run(
             Request::Waveform(w) => {
                 let detail = w.to_blob();
                 let overview = w.overview().to_blob(&w.params, w.provenance);
-                let r = WaveformRef {
-                    blob: loc.lib.put_blob(&detail),
-                    overview_blob: loc.lib.put_blob(&overview),
-                    extra: Default::default(),
-                };
+                let r = WaveformRef::new(loc.lib.put_blob(&detail), loc.lib.put_blob(&overview));
                 if let Err(e) = loc.lib.apply(Edit::SetWaveform(track, r)) {
                     say(format!("library: {e}"));
                 }
@@ -285,7 +302,6 @@ fn run(
                         params: f.params,
                         blob: loc.lib.put_blob(&f.blob),
                         created: library::rfc3339(library::system_ms()),
-                        extra: Default::default(),
                     };
                     if let Err(e) = loc.lib.apply(Edit::SetAnalysis(track, f.name, a)) {
                         say(format!("library: {e}"));
@@ -298,6 +314,13 @@ fn run(
     }
     loc.lib.flush();
     report(&mut loc.lib, &say, &mut status);
+}
+
+/// Run the library's integrity check if it wants one, and say what it found.
+fn check(lib: &mut Library, say: &dyn Fn(String)) {
+    if let Some(problem) = lib.check() {
+        say(format!("library: integrity check failed: {problem}"));
+    }
 }
 
 fn report(lib: &mut Library, say: &dyn Fn(String), status: &mut Status) {
@@ -319,7 +342,11 @@ struct Status {
 
 /// The record of `track`, with its stored waveform and analysis blobs read.
 fn loaded(lib: &mut Library, track: library::TrackId, file_hash: FileHash) -> Loaded {
-    let record = lib.track(track).unwrap_or_else(|| empty_track(track));
+    let record = lib
+        .track(track)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Track::empty(track));
     let waveform = record
         .waveform
         .as_ref()
@@ -339,19 +366,6 @@ fn loaded(lib: &mut Library, track: library::TrackId, file_hash: FileHash) -> Lo
         record,
         waveform,
         analysis,
-    }
-}
-
-fn empty_track(id: library::TrackId) -> Track {
-    Track {
-        id,
-        locations: Vec::new(),
-        rating: None,
-        cues: Vec::new(),
-        hot_cues: Default::default(),
-        analysis: BTreeMap::new(),
-        waveform: None,
-        merged: Vec::new(),
     }
 }
 
@@ -451,40 +465,16 @@ fn is_removable(root: &Path) -> bool {
     }
 }
 
-/// True if the system clock is known to be right: on Linux, systemd says it is
-/// NTP-synchronised; macOS keeps its clock synchronised. Anything else (a Pi without network
-/// and without an RTC battery) is not trusted.
-fn clock_is_trusted() -> bool {
-    if cfg!(target_os = "macos") {
-        return true;
-    }
-    std::process::Command::new("timedatectl")
-        .args(["show", "-p", "NTPSynchronized", "--value"])
-        .output()
-        .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"yes")
-}
-
 fn mount_options(device: DeviceId, read_only: bool) -> MountOptions {
     MountOptions {
         read_only,
-        trusted_clock: clock_is_trusted(),
-        device_info: serde_json::json!({ "name": "engined", "model": "dev" }),
         ..MountOptions::new(device)
     }
 }
 
-fn mount_folder(dir: &Path, device: DeviceId, read_only: bool) -> Result<Library, String> {
-    Library::mount(FolderStore::new(dir), mount_options(device, read_only))
-        .map_err(|e| format!("{}: {e}", dir.display()))
-}
-
 fn ram(device: DeviceId, why: String) -> Located {
-    let mut lib = Library::mount(MemStore::new(), mount_options(device, false))
-        .expect("an empty RAM library always mounts");
-    // Nothing reaches a stick: say so, edit by edit.
-    lib.keep_in_ram(format!("no library: {why}"));
     Located {
-        lib,
+        lib: Library::ram(mount_options(device, false), format!("no library: {why}")),
         root: None,
         what: format!("RAM only, edits are not saved ({why})"),
     }
@@ -494,7 +484,8 @@ fn locate(choice: &LibraryChoice, file: &Path, device: DeviceId) -> Result<Locat
     let folder = |dir: &Path| -> Result<Located, String> {
         let _ = std::fs::create_dir_all(dir);
         let read_only = !writable(dir);
-        let lib = mount_folder(dir, device, read_only)?;
+        let lib = Library::mount(dir, mount_options(device, read_only))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
         let what = if read_only {
             format!("{} (read-only: edits stay in RAM, unsaved)", dir.display())
         } else {
