@@ -1,6 +1,57 @@
 # Library format (design, draft)
 
-Status 2026-10-21: design for review, no code yet. It makes concrete the "Own library on the stick" and "Cloud library" sections of the engine research (`docs/research/engine.md`). The decisions marked **(to confirm)** are the owner's.
+Status 2026-10-21: design settled with the owner (see "Decisions" below, which win over anything else in this doc), no code yet. It makes concrete the "Own library on the stick" and "Cloud library" sections of the engine research (`docs/research/engine.md`). The decisions marked **(to confirm)** are the owner's.
+
+## Decisions (owner, 2026-10-21)
+
+These settle the open questions and extend the design; where this section and the rest of the doc disagree, this section wins.
+
+**Libraries and writing**
+- A player sees several libraries at once: its own slots, linked players' sticks, later the cloud. Tracks are addressed as (library, track).
+- Data stays per library: no automatic merge across sticks, and no cross-encode cue copy in version 1.
+- One writer per stick: the player it's plugged into. Linked players forward operations (stamped with their own HLC and device id) and blobs to the holder.
+- Guest sticks are written by default. A per-stick lock flag (in the stick's settings, never copied by a settings import), or a write-protected stick, keeps edits in RAM, shown as unsaved.
+- With no writable library mounted, edits live in RAM only, shown as unsaved. There is no home library in version 1.
+
+**Rekordbox**
+- Rekordbox data is read-only and overlaid at mount. Rekordbox's tree is always browsable.
+- Tracks are imported explicitly: importing creates our record plus a mapping to the Rekordbox id. Their cues, grid and rating stay overlaid live until edited.
+- The first cue edit switches a track to our cues; "revert to Rekordbox cues" switches back.
+- A track that isn't imported plays fine. Its first edit or first counted play auto-imports it.
+- Folder-mode files (no Rekordbox) get their record lazily, on first load, edit or analysis. There is no import step and no scan of the whole stick.
+
+**Identity**
+- Track id derived from the file's content hash at first sight (Dropbox `content_hash` algorithm).
+- An exact duplicate is one track with several locations, marked as a duplicate in the UI.
+- Same decoded audio with different tags is the same track (an alias to the older id). A different encode is a separate track.
+- The audio hash is versioned (`{v, hash}`) and recomputed on load when stale.
+- Missing files keep their record and cues, shown as missing; only a DJ deletes records. "Remove from library" deletes our data, never the file. A later load gets a fresh, empty record.
+
+**Data**
+- Positions in f64 seconds on the gapless-trimmed timeline; Rekordbox values are converted with the start trim.
+- 16 hot cues per track (two banks of 8).
+- Analysis: only the latest result per analyzer; older blobs are collected.
+- History: full play events.
+  - A play counts after 60 s of cumulative playback per load (Pioneer's rule, XDJ-1000MK2 manual p. 31). Loading or cueing alone never counts. A track played again right after itself on the same deck adds no second entry.
+  - Each mount starts a history session (event with date and player), shown as "History › date (player)".
+  - Marking a track played or unplayed in a playlist adds or removes an entry flagged `manual`.
+
+**Settings**
+- The player's current settings persist in a small config file on its boot storage (next to the device id), not in a library.
+- Saving settings to a stick is an explicit action. When the stick in the player's own slot has different saved settings, the player asks once per mount (Yes / No / show differences).
+- Loading from another stick or from a linked player is a manual menu action.
+- A load replaces DJ preferences only (quantize, tempo range, waveform mode and theme, auto cue, hot-cue banks). Hardware and device settings are never imported.
+
+**Format and defaults**
+- `DJPLAYER/` folder; CRC-32C-framed JSON-lines journals and snapshots; BLAKE3 blobs; HLC-stamped `set` / `add` / `rm` / `event` operations.
+- Tuning: flush within 2 s; segment per mount and every 64 KB; snapshot past about 50 segments or 5 MB; tombstones kept 90 days; cloud segments sealed 30 s after their last write.
+
+**First build (scope)**
+- The `library` crate on a folder store: the record format, HLC and merge, with property tests.
+- Identity: content hash, versioned audio hash, aliases.
+- Lazy records for loaded files; cues, 16 hot cues, rating, analysis and waveform blobs.
+- Wired into `engined`, so cues and waveforms persist across loads. Snapshots as soon as the replay test needs them.
+- Later: Rekordbox import (needs the Rekordbox reader and a real stick), playlists, tags, history, settings, compaction, the link protocol and the cloud.
 
 ## Short answer
 
@@ -200,12 +251,6 @@ impl Library {
 - **Compaction:** after a snapshot and segment deletion the state is unchanged; a late offline journal still applies; tombstones stop resurrection.
 - **Scale:** mount and replay 10,000 synthetic tracks, timed on the Mac and later on the Pi.
 
-## Open questions (to confirm)
+## Open questions
 
-0. **Multiple libraries:** confirm the "one writer per stick, operations forwarded over the link" rule, and that data stays per library (no automatic cross-stick merge of the same track).
-
-1. **Encoding:** JSON lines with a CRC (readable, easy to debug and to document as an open format, about 2× bigger) or CBOR (compact, binary)? Recommended: JSON lines; the journals are small either way, and blobs are already binary.
-2. **Folder name** at the stick root: `DJPLAYER/` (recommended; plain and visible), or a hidden `.djplayer/` (hidden on Mac and Linux, but visible on Windows anyway).
-3. **Hot cues:** 16 (two banks of 8, as the research says), or 8 like the reference?
-4. **History:** store full play history (when, which deck, how long it played), or only play counts and a last-played date?
-5. **Scope of the first implementation:** I'd start with the crate on a folder store: identity, cues, hot cues, ratings, analysis and waveform blobs, wired into `engined` so cues and waveforms persist across loads. Playlists, tags, history and the cloud come after. The API addresses tracks as (library, track) from the start, so multiple libraries and the link slot in later without changes.
+All answered on 2026-10-21; see "Decisions" at the top.
