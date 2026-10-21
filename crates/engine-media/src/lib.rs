@@ -147,6 +147,15 @@ pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, Lo
     }
 }
 
+/// Decode `path` completely at the file's own sample rate. Returns interleaved stereo and that
+/// rate. Analysis uses this, so its results do not depend on the device the engine runs on.
+pub fn decode_native(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32), LoadError> {
+    let mut decoding = Decoding::open(path.as_ref())?;
+    let mut collected = Vec::new();
+    decoding.run(&mut |s: &[f32]| collected.extend_from_slice(s))?;
+    Ok((collected, decoding.sample_rate))
+}
+
 /// Decode `path` completely and return interleaved stereo at `sample_rate` (tests, tools).
 pub fn decode_to_vec(path: impl AsRef<Path>, sample_rate: u32) -> Result<Vec<f32>, LoadError> {
     let mut decoding = Decoding::open(path.as_ref())?;
@@ -157,6 +166,15 @@ pub fn decode_to_vec(path: impl AsRef<Path>, sample_rate: u32) -> Result<Vec<f32
     } else {
         resample_all(&collected, decoding.sample_rate, sample_rate)
     }
+}
+
+/// Resample interleaved stereo from `from` Hz to `to` Hz in one go, with the same resampler
+/// (and delay trimming, so the output lines up with the input) as track loading.
+pub fn resample(stereo: &[f32], from: u32, to: u32) -> Result<Vec<f32>, LoadError> {
+    if from == to {
+        return Ok(stereo.to_vec());
+    }
+    resample_all(stereo, from, to)
 }
 
 fn resample_all(stereo: &[f32], from: u32, to: u32) -> Result<Vec<f32>, LoadError> {
