@@ -3,6 +3,7 @@
 //! ```text
 //! keylock-shootout bench [--track FILE] [--seconds N]
 //! keylock-shootout render --out DIR FILE...
+//! keylock-shootout compare
 //! ```
 //!
 //! `bench` plays each candidate in 128-frame blocks at 0.92x, 1.0x, 1.08x, the WIDE extremes
@@ -16,6 +17,7 @@
 mod allocs;
 mod bungee;
 mod candidate;
+mod compare;
 mod rubberband;
 mod track;
 
@@ -23,20 +25,19 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candidate::{Candidate, Signalsmith};
+use candidate::Candidate;
 use rubberband::{Engine, RubberBand};
 use track::{CHANNELS, Track};
 
-const SR: u32 = 48_000;
+pub const SR: u32 = 48_000;
 const BLOCK: usize = 128;
 /// Half of a 128-frame callback at 48 kHz, the deck + mixer budget from the research doc.
 const BUDGET_US: f64 = 1333.0;
 
 fn candidates() -> Vec<Box<dyn Candidate>> {
     vec![
-        Box::new(Signalsmith::default_preset(SR)),
-        Box::new(Signalsmith::cheaper_preset(SR)),
-        Box::new(bungee::Bungee::new(SR)),
+        Box::new(bungee::Bungee::cpp(SR)),
+        Box::new(bungee::Bungee::rust(SR)),
         Box::new(RubberBand::new(Engine::R2, SR)),
         Box::new(RubberBand::new(Engine::R3, SR)),
         Box::new(RubberBand::new(Engine::R3Short, SR)),
@@ -48,9 +49,11 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("bench") => bench(&args[1..]),
         Some("render") => render(&args[1..]),
+        Some("compare") => compare::compare(&args[1..]),
         _ => Err(
             "usage: keylock-shootout bench [--track FILE] [--seconds N]\n       \
-                  keylock-shootout render --out DIR FILE..."
+                  keylock-shootout render --out DIR FILE...\n       \
+                  keylock-shootout compare"
                 .into(),
         ),
     };
@@ -60,7 +63,7 @@ fn main() {
     }
 }
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // ---------------------------------------------------------------------------------------------
 // bench

@@ -1,6 +1,6 @@
 [package]
 name = "keylock-shootout"
-description = "Keylock spike: CPU, latency, alignment and listening renders for Signalsmith, Bungee and Rubber Band."
+description = "Keylock spike: CPU, latency, alignment and listening renders for Bungee (C++ and the Rust port) and Rubber Band; Signalsmith was removed after the decision."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,7 @@ publish = false
 engine-stretch.workspace = true
 engine-media.workspace = true
 hound.workspace = true
+rustfft.workspace = true
 bungee-rs = "0.1.1"
 rubberband-sys = "0.1.4"
 

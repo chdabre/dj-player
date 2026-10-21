@@ -7,7 +7,8 @@
 //! - [`Source`]: resident sample store with per-chunk ready flags.
 //! - [`Transport`]: playhead, rate, direction and the slip shadow playhead.
 //! - [`Scaler`]: cubic-Hermite reader at fractional positions, any rate.
-//! - [`Keylock`]: the keylock path through a time-stretcher, latency-compensated.
+//! - [`Keylock`]: the keylock path through a time-stretcher (Bungee), aligned with
+//!   the playhead.
 //! - [`Deck`]: the three together.
 //! - [`Engine`]: owns the decks; [`Engine::process`] is the audio callback body.
 

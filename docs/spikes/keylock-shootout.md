@@ -1,6 +1,6 @@
 # Keylock shootout (spike 2)
 
-Status 2026-10-21: Mac numbers and blind listening in (no audible difference at ±8 %; Bungee chosen); the Pi 5 run outstanding. Plan: `docs/research/engine.md`, "Crates, budget and spikes", item 2.
+Status 2026-10-21: Mac numbers and blind listening in (no audible difference at ±8 %; Bungee chosen); Bungee ported to Rust and verified against the C++; the Pi 5 run outstanding. Plan: `docs/research/engine.md`, "Crates, budget and spikes", item 2.
 
 ## Provisional read (Mac only)
 
@@ -30,17 +30,95 @@ CPU doesn't decide it on the Mac: every candidate's mean is under 20 % of the 1.
 ```sh
 cargo run -p keylock-shootout --release -- bench --track <file> [--seconds 20]
 cargo run -p keylock-shootout --release -- render --out target/keylock-shootout/listening <ten files>
+cargo run -p keylock-shootout --release -- compare
 ```
 
-`render` writes `NN-ref.wav` (the untouched excerpt) and `NN-<rate>-<A..F>.wav` (20 s from 60 s in, at 0.92x and 1.08x, candidates shuffled per track and rate), plus `listening-sheet.csv` to score and `key.csv`. Score the sheet before opening the key. Needs CMake for Bungee.
+`render` writes `NN-ref.wav` (the untouched excerpt) and `NN-<rate>-<A..E>.wav` (20 s from 60 s in, at 0.92x and 1.08x, candidates shuffled per track and rate), plus `listening-sheet.csv` to score and `key.csv`. Score the sheet before opening the key. `compare` runs the Rust port of Bungee against the C++ library (see below). Needs CMake ≥ 3.30 for the C++ Bungee; `bench` and `render` include the port as `bungee-rust`.
+
+Signalsmith was removed from the code base on 2026-10-21, once Bungee became the keylock (owner decision); its rows below are from runs before that. To rerun them, check out a commit before the removal.
 
 ## Listening result (2026-10-21)
 
 Blind A/B on the ten rendered tracks at 0.92x and 1.08x: the listener could not hear a difference between any of the six candidates. At DJ-normal tempo changes quality does not separate them, so the decision rests on the measured properties: **Bungee becomes the default** (keylock in reverse, 27 ms rate response, CPU close to Signalsmith's, no allocations). Differences are more likely to show at the WIDE extremes; worth a listen at 0.7x/1.3x if WIDE matters.
 
+## Pure-Rust port of Bungee (2026-10-21)
+
+The owner wants no CMake in the workspace, so Bungee Basic is ported to Rust (`engine_stretch::bungee`, MPL-2.0 like the original) rather than wrapped. `cargo run -p keylock-shootout --release -- compare` drives the port and the C++ library (through `bungee-rs`) grain by grain with the same requests and the same input chunks: three synthetic stereo signals (a kick/hat/bass/pad mix, a log sine sweep, a harmonic chord sequence), at the deck's speeds plus two pitch shifts that exercise the output resampler.
+
+Float operation order differs (rustfft vs kissfft, Eigen's vectorised maths), so the output is close, not bit-identical. To tell port bugs from that, each row also runs a **control**: the C++ against itself with its input scaled by 1 + 2⁻²⁰. Bungee's decisions are scale-invariant, so the control changes nothing but float rounding.
+
+- **Request tags and chunk lengths match exactly** in every row, so a deck reading positions off the chunks gets the same timing from either.
+- **Port vs C++ is as close as C++ vs itself** in every row (in brackets below): 55–138 dB SNR on the mix and the chord, spectra within 0.02 dB.
+- **The sweep is chaotic in Bungee itself**: at most speeds the output tracks the C++ to over 100 dB for a few dozen grains, then a single grain jumps (at 1.08x, grain 56: from ~115 dB to 18 dB). That is a discrete decision (a peak pick or the `energy > 1.5 × previous` transient test) tipping on a rounding difference; from there the phases follow a different, equally valid track. The control diverges the same way, so the low SNR there is not a port error. At 1.0x and 0.5x the sweep matches to 117–138 dB.
+
+Rust vs C++, then in brackets the control: C++ vs C++ on input × (1 + 2⁻²⁰).
+
+| signal | speed | pitch | tags equal | frame counts equal | SNR dB | max abs diff | spectral diff mean dB | spectral diff p99 dB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| mix | 0.92 | 1 | yes | yes | 71.6 (72.0) | 5.5e-4 (4.7e-4) | 0.001 (0.000) | 0.000 (0.000) |
+| mix | 1 | 1 | yes | yes | 137.4 (138.8) | 2.4e-7 (2.4e-7) | 0.000 (0.000) | 0.000 (0.000) |
+| mix | 1.08 | 1 | yes | yes | 80.5 (81.5) | 4.8e-4 (4.9e-4) | 0.000 (0.000) | 0.000 (0.000) |
+| mix | 0.5 | 1 | yes | yes | 101.9 (103.7) | 4.2e-5 (3.2e-5) | 0.000 (0.000) | 0.000 (0.000) |
+| mix | 2 | 1 | yes | yes | 64.7 (52.2) | 2.1e-3 (1.0e-2) | 0.001 (0.004) | 0.001 (0.002) |
+| mix | -1 | 1 | yes | yes | 137.4 (138.8) | 2.4e-7 (2.4e-7) | 0.000 (0.000) | 0.000 (0.000) |
+| mix | 1 | 1.5 | yes | yes | 97.6 (87.4) | 3.3e-5 (2.1e-4) | 0.000 (0.000) | 0.000 (0.000) |
+| mix | 1 | 0.75 | yes | yes | 55.1 (55.2) | 9.7e-3 (9.7e-3) | 0.004 (0.004) | 0.004 (0.005) |
+| sweep | 0.92 | 1 | yes | yes | 0.6 (3.0) | 9.8e-1 (9.8e-1) | 0.617 (0.579) | 9.009 (9.152) |
+| sweep | 1 | 1 | yes | yes | 137.7 (138.9) | 3.0e-7 (2.1e-7) | 0.000 (0.000) | 0.000 (0.000) |
+| sweep | 1.08 | 1 | yes | yes | -2.8 (-4.7) | 1.0e0 (1.0e0) | 1.069 (1.180) | 11.965 (12.576) |
+| sweep | 0.5 | 1 | yes | yes | 118.3 (117.0) | 9.6e-6 (1.2e-5) | 0.000 (0.000) | 0.000 (0.000) |
+| sweep | 2 | 1 | yes | yes | 2.1 (2.6) | 1.2e0 (1.1e0) | 1.242 (1.265) | 15.443 (15.296) |
+| sweep | -1 | 1 | yes | yes | 137.7 (138.9) | 2.7e-7 (2.4e-7) | 0.000 (0.000) | 0.000 (0.000) |
+| sweep | 1 | 1.5 | yes | yes | 8.9 (-0.0) | 9.1e-1 (9.1e-1) | 0.113 (0.180) | 4.526 (6.622) |
+| sweep | 1 | 0.75 | yes | yes | -2.8 (-5.2) | 1.1e0 (1.1e0) | 2.576 (2.458) | 18.349 (18.218) |
+| chord | 0.92 | 1 | yes | yes | 70.9 (73.8) | 2.5e-3 (1.5e-3) | 0.004 (0.003) | 0.000 (0.000) |
+| chord | 1 | 1 | yes | yes | 137.6 (138.8) | 2.4e-7 (1.8e-7) | 0.000 (0.000) | 0.000 (0.000) |
+| chord | 1.08 | 1 | yes | yes | 73.1 (71.4) | 2.1e-3 (2.5e-3) | 0.003 (0.002) | 0.000 (0.000) |
+| chord | 0.5 | 1 | yes | yes | 76.7 (75.0) | 2.4e-3 (1.9e-3) | 0.004 (0.003) | 0.000 (0.000) |
+| chord | 2 | 1 | yes | yes | 69.8 (68.5) | 2.1e-3 (3.0e-3) | 0.018 (0.013) | 0.025 (0.018) |
+| chord | -1 | 1 | yes | yes | 137.6 (138.7) | 2.1e-7 (1.8e-7) | 0.000 (0.000) | 0.000 (0.000) |
+| chord | 1 | 1.5 | yes | yes | 84.2 (84.5) | 8.3e-5 (8.1e-5) | 0.000 (0.000) | 0.001 (0.001) |
+| chord | 1 | 0.75 | yes | yes | 74.2 (72.3) | 2.4e-3 (3.2e-3) | 0.005 (0.003) | 0.025 (0.018) |
+
+### Bench: port vs C++
+
+`cargo run -p keylock-shootout --release -- bench --seconds 5`, in a Linux x86_64 cloud container (4 vCPU Xeon @ 2.8 GHz, shared, no RT priority), 48 kHz, 128-frame blocks, the generated CPU track (no music library there), no allocation counter (macOS only). `bungee-rust` is the port driven exactly like `bungee`; Signalsmith for scale. Read the ratios, not the absolute numbers: the Mac and Pi runs above and outstanding are the ones that count.
+
+| candidate | rate | mean µs | p99 µs | max µs | mean % of budget | start µs | allocs start / run | read-ahead ms | underruns |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| signalsmith-default | 0.92 | 49.4 | 575.2 | 1090.4 | 3.7 % | 1204 | n/a / n/a | 115.2 | 0 |
+| signalsmith-default | 1 | 55.1 | 748.8 | 5969.4 | 4.1 % | 1132 | n/a / n/a | 120.0 | 0 |
+| signalsmith-default | 1.08 | 48.8 | 563.4 | 749.7 | 3.7 % | 1195 | n/a / n/a | 124.8 | 0 |
+| signalsmith-default | 0.1 | 56.4 | 704.3 | 1068.0 | 4.2 % | 1244 | n/a / n/a | 66.0 | 0 |
+| signalsmith-default | 2 | 50.4 | 576.1 | 1011.7 | 3.8 % | 1221 | n/a / n/a | 180.0 | 0 |
+| signalsmith-default | -1 | — | — | — | — | — | — | — | resampler fallback |
+| bungee | 0.92 | 60.8 | 325.9 | 949.6 | 4.6 % | 1650 | n/a / n/a | 62.3 | 0 |
+| bungee | 1 | 62.3 | 380.3 | 483.8 | 4.7 % | 821 | n/a / n/a | 64.0 | 0 |
+| bungee | 1.08 | 60.1 | 348.7 | 529.5 | 4.5 % | 806 | n/a / n/a | 65.7 | 0 |
+| bungee | 0.1 | 67.8 | 446.8 | 612.3 | 5.1 % | 940 | n/a / n/a | 44.8 | 0 |
+| bungee | 2 | 59.2 | 292.7 | 952.9 | 4.4 % | 833 | n/a / n/a | 85.3 | 0 |
+| bungee | -1 | 57.1 | 268.4 | 685.7 | 4.3 % | 860 | n/a / n/a | 64.0 | 0 |
+| bungee-rust | 0.92 | 36.8 | 191.9 | 660.5 | 2.8 % | 483 | n/a / n/a | 62.3 | 0 |
+| bungee-rust | 1 | 33.5 | 169.0 | 359.4 | 2.5 % | 448 | n/a / n/a | 64.0 | 0 |
+| bungee-rust | 1.08 | 36.1 | 185.2 | 313.5 | 2.7 % | 685 | n/a / n/a | 65.7 | 0 |
+| bungee-rust | 0.1 | 42.7 | 260.6 | 1755.5 | 3.2 % | 440 | n/a / n/a | 44.8 | 0 |
+| bungee-rust | 2 | 40.9 | 249.9 | 336.4 | 3.1 % | 514 | n/a / n/a | 85.3 | 0 |
+| bungee-rust | -1 | 35.7 | 219.0 | 355.7 | 2.7 % | 411 | n/a / n/a | 64.0 | 0 |
+
+| candidate | align 0.92 ms | align 1.08 ms | align reverse ms | rate response ms |
+| --- | --- | --- | --- | --- |
+| signalsmith-default | -0.1 (-0.1) | +0.1 (+0.1) | — | 60.2 |
+| bungee | +0.0 (+0.0) | +0.0 (+0.0) | -0.0 (-0.0) | 26.7 |
+| bungee-rust | +0.0 (+0.0) | +0.0 (+0.0) | +0.0 (-0.0) | 26.7 |
+
+- **The port is cheaper than the C++ here**: mean 34–43 µs vs 57–68 µs per block, p99 169–261 µs vs 268–447 µs, start (pre-roll) 0.4–0.7 ms vs 0.8–1.6 ms. Re-run on the Mac and the Pi before reading much into it; Eigen and kissfft are built by CMake's Release profile, rustfft has NEON and AVX paths.
+- **Timing is identical**: same read-ahead, alignment and 26.7 ms rate response, as the identical chunk tags predict.
+- **In the deck** (`cargo bench -p engine-core --bench render`, `keylock_1.08`, one second of output with one seek): 17.2 ms with Bungee vs 21.0 ms with the previous Signalsmith keylock on the same machine (rate 1.08 without keylock: 1.08 ms).
+
 ## Outstanding
 
-- The same `bench` on a Pi 5, built natively there, with RT priority.
+- The same `bench` on a Pi 5, built natively there, with RT priority, now with `bungee-rust` in it.
+- `bench` and `compare` on the Mac, to check the port's CPU lead holds on aarch64.
 
 ## Raw results, macOS aarch64
 

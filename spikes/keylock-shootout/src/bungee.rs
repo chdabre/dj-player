@@ -1,18 +1,159 @@
-//! Bungee Basic (MPL-2.0) through its native, pull-based grain API.
+//! Bungee Basic (MPL-2.0) through its native, pull-based grain API: the C++ library through
+//! `bungee-rs`, and the pure-Rust port in `engine_stretch::bungee`, driven identically.
 //!
 //! Each grain asks for a position and speed; Bungee says which input range it needs, we hand
 //! it that range straight from the resident track, and it returns a chunk of output tagged
 //! with the positions it covers. Positions may move backwards, so reverse keeps the pitch too.
 
-use bungee_rs::{OutputChunk, Request, Stretcher};
+use engine_stretch::bungee::{self as port, Request};
 
 use crate::candidate::Candidate;
 use crate::track::{CHANNELS, Fifo, Track};
 
 const FIFO_FRAMES: usize = 16_384;
 
-pub struct Bungee {
-    stretcher: Stretcher,
+/// The grain API both implementations share.
+pub trait GrainApi {
+    fn max_input_frame_count(&self) -> usize;
+    fn preroll(&mut self, request: &mut Request);
+    fn next(&mut self, request: &mut Request);
+    fn is_flushed(&self) -> bool;
+    /// Input range `[begin, end)` the grain needs.
+    fn specify_grain(&mut self, request: &Request) -> (i64, i64);
+    fn analyse_grain(&mut self, data: &mut [f32], stride: usize);
+    /// Hand the output chunk to `f`: planar data, frame count, channel stride and the two
+    /// request tags (`None` where the C++ API gives a null pointer).
+    fn synthesise_grain<R>(
+        &mut self,
+        f: impl FnOnce(&[f32], usize, usize, [Option<Request>; 2]) -> R,
+    ) -> R;
+}
+
+/// The C++ library through `bungee-rs`.
+pub struct Cpp(bungee_rs::Stretcher);
+
+impl Cpp {
+    pub fn new(sample_rate: u32) -> Self {
+        Self(bungee_rs::Stretcher::new(sample_rate as usize, CHANNELS).expect("bungee stretcher"))
+    }
+}
+
+fn to_cpp(r: &Request) -> bungee_rs::Request {
+    bungee_rs::Request {
+        position: r.position,
+        speed: r.speed,
+        pitch: r.pitch,
+        reset: r.reset,
+    }
+}
+
+fn from_cpp(r: &bungee_rs::Request) -> Request {
+    Request {
+        position: r.position,
+        speed: r.speed,
+        pitch: r.pitch,
+        reset: r.reset,
+    }
+}
+
+impl GrainApi for Cpp {
+    fn max_input_frame_count(&self) -> usize {
+        self.0.max_input_frame_count()
+    }
+
+    fn preroll(&mut self, request: &mut Request) {
+        let mut r = to_cpp(request);
+        self.0.preroll(&mut r);
+        *request = from_cpp(&r);
+    }
+
+    fn next(&mut self, request: &mut Request) {
+        let mut r = to_cpp(request);
+        self.0.next(&mut r);
+        *request = from_cpp(&r);
+    }
+
+    fn is_flushed(&self) -> bool {
+        self.0.is_flushed()
+    }
+
+    fn specify_grain(&mut self, request: &Request) -> (i64, i64) {
+        let chunk = self.0.specify_grain(&to_cpp(request));
+        (chunk.begin as i64, chunk.end as i64)
+    }
+
+    fn analyse_grain(&mut self, data: &mut [f32], stride: usize) {
+        self.0.analyse_grain(data, stride);
+    }
+
+    fn synthesise_grain<R>(
+        &mut self,
+        f: impl FnOnce(&[f32], usize, usize, [Option<Request>; 2]) -> R,
+    ) -> R {
+        let mut empty: [f32; 0] = [];
+        let mut out = bungee_rs::OutputChunk::new(&mut empty, 0);
+        self.0.synthesise_grain(&mut out);
+        let request = out.request.map(|r| r.as_ref().map(from_cpp));
+        f(out.data, out.frame_count, out.channel_stride, request)
+    }
+}
+
+/// The pure-Rust port.
+pub struct Rust(port::Stretcher);
+
+impl Rust {
+    pub fn new(sample_rate: u32) -> Self {
+        let rates = port::SampleRates {
+            input: sample_rate,
+            output: sample_rate,
+        };
+        Self(port::Stretcher::new(rates, CHANNELS))
+    }
+}
+
+impl GrainApi for Rust {
+    fn max_input_frame_count(&self) -> usize {
+        self.0.max_input_frame_count()
+    }
+
+    fn preroll(&mut self, request: &mut Request) {
+        self.0.preroll(request);
+    }
+
+    fn next(&mut self, request: &mut Request) {
+        self.0.next(request);
+    }
+
+    fn is_flushed(&self) -> bool {
+        self.0.is_flushed()
+    }
+
+    fn specify_grain(&mut self, request: &Request) -> (i64, i64) {
+        let chunk = self.0.specify_grain(request, 0.0);
+        (chunk.begin, chunk.end)
+    }
+
+    fn analyse_grain(&mut self, data: &mut [f32], stride: usize) {
+        self.0.analyse_grain(data, stride, 0, 0);
+    }
+
+    fn synthesise_grain<R>(
+        &mut self,
+        f: impl FnOnce(&[f32], usize, usize, [Option<Request>; 2]) -> R,
+    ) -> R {
+        let out = self.0.synthesise_grain();
+        f(
+            out.data,
+            out.frame_count,
+            out.channel_stride,
+            out.request.map(Some),
+        )
+    }
+}
+
+pub struct Bungee<S: GrainApi> {
+    name: &'static str,
+    stretcher: S,
     request: Request,
     input: Vec<f32>,
     stride: usize,
@@ -25,11 +166,23 @@ pub struct Bungee {
     underruns: u64,
 }
 
-impl Bungee {
-    pub fn new(sample_rate: u32) -> Self {
-        let stretcher = Stretcher::new(sample_rate as usize, CHANNELS).expect("bungee stretcher");
+impl Bungee<Cpp> {
+    pub fn cpp(sample_rate: u32) -> Self {
+        Self::with("bungee", Cpp::new(sample_rate))
+    }
+}
+
+impl Bungee<Rust> {
+    pub fn rust(sample_rate: u32) -> Self {
+        Self::with("bungee-rust", Rust::new(sample_rate))
+    }
+}
+
+impl<S: GrainApi> Bungee<S> {
+    fn with(name: &'static str, stretcher: S) -> Self {
         let stride = stretcher.max_input_frame_count();
         Self {
+            name,
             stretcher,
             request: Request {
                 position: f64::NAN,
@@ -49,57 +202,61 @@ impl Bungee {
     }
 
     fn grain(&mut self, track: &Track) {
-        let chunk = self.stretcher.specify_grain(&self.request);
-        let frames = chunk.len().min(self.stride);
-        track.copy_planar(chunk.begin as i64, frames, &mut self.input, self.stride);
+        let (begin, end) = self.stretcher.specify_grain(&self.request);
+        let frames = ((end - begin).max(0) as usize).min(self.stride);
+        track.copy_planar(begin, frames, &mut self.input, self.stride);
         self.stretcher.analyse_grain(&mut self.input, self.stride);
-        let mut empty: [f32; 0] = [];
-        let mut out = OutputChunk::new(&mut empty, 0);
-        self.stretcher.synthesise_grain(&mut out);
-
-        if let [Some(r0), Some(r1)] = out.request
-            && !r0.position.is_nan()
-            && !r1.position.is_nan()
-            && out.frame_count > 0
-        {
-            let n = out.frame_count;
-            let forward = r1.position >= r0.position;
-            let mut skip = 0;
-            if !self.started {
-                let before = if forward {
-                    self.start - r0.position
-                } else {
-                    r0.position - self.start
+        let (fifo, started, start, read_ahead) = (
+            &mut self.fifo,
+            &mut self.started,
+            self.start,
+            &mut self.read_ahead,
+        );
+        self.stretcher
+            .synthesise_grain(|data, frame_count, channel_stride, request| {
+                let [Some(r0), Some(r1)] = request else {
+                    return;
                 };
-                let span = (r1.position - r0.position).abs();
-                if before >= span {
-                    skip = n;
-                } else {
-                    self.started = true;
-                    if before > 0.0 && span > 0.0 {
-                        skip = ((before / span) * n as f64).round() as usize;
+                if r0.position.is_nan() || r1.position.is_nan() || frame_count == 0 {
+                    return;
+                }
+                let n = frame_count;
+                let forward = r1.position >= r0.position;
+                let mut skip = 0;
+                if !*started {
+                    let before = if forward {
+                        start - r0.position
+                    } else {
+                        r0.position - start
+                    };
+                    let span = (r1.position - r0.position).abs();
+                    if before >= span {
+                        skip = n;
+                    } else {
+                        *started = true;
+                        if before > 0.0 && span > 0.0 {
+                            skip = ((before / span) * n as f64).round() as usize;
+                        }
                     }
                 }
-            }
-            if skip < n {
-                let take = (n - skip).min(self.fifo.room());
-                self.fifo
-                    .push_planar(&out.data[skip..], take, out.channel_stride);
-            }
-            let ahead = if forward {
-                chunk.end as f64 - r0.position
-            } else {
-                r0.position - chunk.begin as f64
-            };
-            self.read_ahead = self.read_ahead.max(ahead);
-        }
+                if skip < n {
+                    let take = (n - skip).min(fifo.room());
+                    fifo.push_planar(&data[skip..], take, channel_stride);
+                }
+                let ahead = if forward {
+                    end as f64 - r0.position
+                } else {
+                    r0.position - begin as f64
+                };
+                *read_ahead = read_ahead.max(ahead);
+            });
         self.stretcher.next(&mut self.request);
     }
 }
 
-impl Candidate for Bungee {
+impl<S: GrainApi> Candidate for Bungee<S> {
     fn name(&self) -> &'static str {
-        "bungee"
+        self.name
     }
 
     fn reverse(&self) -> bool {

@@ -1,14 +1,13 @@
-//! Keylock through the real engine, offline: pitch is kept, the audio lines up
-//! with the reported playhead (latency compensation), reverse falls back to the resampler, and
-//! switching paths does not click.
+//! Keylock through the real engine, offline: pitch is kept, the audio lines up with the
+//! reported playhead (latency compensation), reverse keeps the pitch, and switching paths or
+//! wrapping a loop does not click.
 //!
-//! In debug builds every `process` call runs inside `assert_no_alloc` (Rust allocations only;
-//! the C++ stretcher's own `malloc` calls are not visible to it).
+//! In debug builds every `process` call runs inside `assert_no_alloc`. The stretcher is pure
+//! Rust, so that covers the whole keylock path.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use engine_core::render::index_ramp;
 use engine_core::{CHANNELS, DeckCommand, Engine, EngineConfig, EngineHandle, Source};
 
 #[cfg(debug_assertions)]
@@ -126,10 +125,10 @@ fn onset(out: &[f32], from: usize) -> usize {
 
 #[test]
 fn audio_lines_up_with_the_reported_playhead() {
+    let (mut eng, mut h) = engine();
     // Bursts at 2, 4, 8 and 12 s of the track.
     let marks = [2 * S, 4 * S, 8 * S, 12 * S];
     let source = Source::from_interleaved(SR, &bursts(20 * S, &marks));
-    let (mut eng, mut h) = engine();
     eng.deck_mut(0).set_declick(false);
     let mut out = vec![0.0; 10 * S * CHANNELS];
     let state = Arc::clone(h.deck_state(0));
@@ -175,32 +174,109 @@ fn audio_lines_up_with_the_reported_playhead() {
 }
 
 #[test]
-fn reverse_falls_back_to_the_resampler() {
-    let scale = (1u32 << 21) as f32;
-    let source = Source::from_interleaved(SR, &index_ramp(10 * S, scale, 440.0, SR));
+fn reverse_keeps_the_pitch() {
+    let source = Source::from_interleaved(SR, &sine(10 * S, 1000.0, 0.5));
     let (mut eng, mut h) = engine();
-    eng.deck_mut(0).set_declick(false);
-    let mut out = vec![0.0; S / 2 * CHANNELS];
-    let reverse_at = 100 * BLOCK;
-    let mut at_reverse = 0.0;
-    let state = Arc::clone(h.deck_state(0));
+    let mut out = vec![0.0; 2 * S * CHANNELS];
+    let reverse_at = 200 * BLOCK;
     render(&mut eng, &mut h, &mut out, |f, h| {
         if f == 0 {
             send(h, DeckCommand::Load(Arc::clone(&source)));
             send(h, DeckCommand::SetKeylock(true));
-            send(h, DeckCommand::Seek(S as f64));
+            send(h, DeckCommand::SetRate(1.08));
+            send(h, DeckCommand::Seek(5.0 * S as f64));
             send(h, DeckCommand::Play);
         } else if f == reverse_at {
-            at_reverse = state.position.load();
             send(h, DeckCommand::SetReverse(true));
         }
     });
-    assert!(state.keylock_enabled.load(Ordering::Relaxed));
-    assert!(!state.stretching.load(Ordering::Relaxed));
-    for (k, f) in out.chunks_exact(CHANNELS).enumerate().skip(reverse_at) {
-        let expected = at_reverse - (k - reverse_at) as f64;
-        assert_eq!(f64::from(f[0]) * f64::from(scale), expected, "frame {k}");
+    let state = h.deck_state(0);
+    assert!(
+        state.stretching.load(Ordering::Relaxed),
+        "reverse went to the resampler"
+    );
+    let f = frequency(&out[(reverse_at + S / 4) * CHANNELS..]);
+    assert!((f - 1000.0).abs() < 5.0, "{f} Hz in reverse");
+    let expected = 5.0 * S as f64 + 1.08 * (2 * reverse_at as i64 - 2 * S as i64) as f64;
+    assert!((state.position.load() - expected).abs() < 1e-6);
+}
+
+#[test]
+fn reverse_audio_lines_up_with_the_reported_playhead() {
+    // Bursts starting at 2, 4 and 6 s; played backwards, each is heard from its end.
+    let marks = [2 * S, 4 * S, 6 * S];
+    let len = S / 10;
+    let source = Source::from_interleaved(SR, &bursts(20 * S, &marks));
+    let (mut eng, mut h) = engine();
+    eng.deck_mut(0).set_declick(false);
+    let mut out = vec![0.0; 6 * S * CHANNELS];
+    let state = Arc::clone(h.deck_state(0));
+    let mut positions = Vec::new();
+    render(&mut eng, &mut h, &mut out, |f, h| {
+        positions.push((f, state.position.load()));
+        match f {
+            0 => {
+                send(h, DeckCommand::Load(Arc::clone(&source)));
+                send(h, DeckCommand::SetKeylock(true));
+                send(h, DeckCommand::SetRate(0.92));
+                send(h, DeckCommand::Seek(7.0 * S as f64));
+                send(h, DeckCommand::SetReverse(true));
+                send(h, DeckCommand::Play);
+            }
+            // Tempo change on the fly, between the 6 s and 4 s bursts.
+            f if f == 2 * S => send(h, DeckCommand::SetRate(1.08)),
+            _ => {}
+        }
+    });
+    let when = |mark: usize| -> f64 {
+        let w = positions
+            .windows(2)
+            .find(|w| w[1].1 <= mark as f64)
+            .unwrap();
+        let ((f0, p0), (f1, p1)) = (w[0], w[1]);
+        f0 as f64 + (mark as f64 - p0) / (p1 - p0) * (f1 - f0) as f64
+    };
+    let mut from = 0;
+    for &mark in marks.iter().rev() {
+        let expected = when(mark + len);
+        let got = onset(&out, from);
+        let err_ms = (got as f64 - expected) * 1000.0 / f64::from(SR);
+        eprintln!(
+            "burst ending at {}: heard at {got}, playhead there at {expected:.0} ({err_ms:+.1} ms)",
+            mark + len
+        );
+        assert!(err_ms.abs() < 5.0, "burst {mark} off by {err_ms:.1} ms");
+        from = got + S / 5;
     }
+}
+
+#[test]
+fn keylock_loop_wraps_without_a_click() {
+    // A 100 Hz sine; the wrap lands at an arbitrary phase.
+    let source = Source::from_interleaved(SR, &sine(20 * S, 100.0, 0.5));
+    let (mut eng, mut h) = engine();
+    let mut out = vec![0.0; 2 * S * CHANNELS];
+    render(&mut eng, &mut h, &mut out, |f, h| {
+        if f == 0 {
+            send(h, DeckCommand::Load(Arc::clone(&source)));
+            send(h, DeckCommand::SetKeylock(true));
+            send(h, DeckCommand::SetRate(1.04));
+            send(h, DeckCommand::SetQuantize(None));
+            send(h, DeckCommand::Seek(12_345.0));
+            send(h, DeckCommand::Play);
+            send(h, DeckCommand::BeatLoop(0.5));
+        }
+    });
+    assert!(h.deck_state(0).stretching.load(Ordering::Relaxed));
+    assert!(h.deck_state(0).looping.load(Ordering::Relaxed));
+    // Natural steps of this sine are up to ~0.0065; a raw wrap could jump by up to 1.0.
+    let max_step = out
+        .chunks_exact(CHANNELS)
+        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .skip(BLOCK)
+        .map(|(a, b)| (b[0] - a[0]).abs())
+        .fold(0.0, f32::max);
+    assert!(max_step < 0.03, "max step {max_step}");
 }
 
 #[test]
