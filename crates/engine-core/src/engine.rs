@@ -212,6 +212,14 @@ impl Engine {
                 DeckCommand::Load(src) => d.swap_source(Some(src)),
                 DeckCommand::Unload => d.swap_source(None),
                 DeckCommand::SetGrid { source_id, grid } => (None, d.set_grid(source_id, grid)),
+                DeckCommand::SetCues {
+                    source_id,
+                    serial,
+                    ref cues,
+                } => {
+                    d.set_cues(source_id, serial, cues);
+                    (None, None)
+                }
                 ref other => {
                     d.apply(other);
                     (None, None)
@@ -250,12 +258,15 @@ impl EngineHandle {
     }
 
     /// Queue a command for the next callback.
+    // A full ring hands the command back by value; boxing it would allocate for nothing.
+    #[allow(clippy::result_large_err)]
     pub fn send(&mut self, cmd: Command) -> Result<(), CommandRingFull> {
         self.commands
             .push(cmd)
             .map_err(|rtrb::PushError::Full(c)| CommandRingFull(c))
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn send_deck(&mut self, deck: usize, cmd: DeckCommand) -> Result<(), CommandRingFull> {
         self.send(Command::deck(deck, cmd))
     }

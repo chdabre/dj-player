@@ -8,14 +8,14 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::cue::CueState;
+use crate::cue::{CueState, TrackCues};
 use crate::grid::DeckGrid;
 use crate::keylock::Keylock;
 use crate::looping::LoopControl;
 use crate::scaler::Scaler;
 use crate::source::{CHANNELS, Source};
 use crate::state::DeckState;
-use crate::transport::{Segment, Transport};
+use crate::transport::{Loop, Segment, Transport};
 
 /// Largest block a deck renders in one go. [`crate::Engine::process`] splits longer device
 /// buffers into blocks of at most this many frames, so the deck's scratch space is fixed.
@@ -41,6 +41,15 @@ pub enum DeckCommand {
     SetGrid {
         source_id: u64,
         grid: Arc<DeckGrid>,
+    },
+    /// The stored cues of the source with this id, from the library: replaces the cue
+    /// point, the hot cues and the stored loop. A paused deck still at the track start moves
+    /// to the cue. `serial` is published in [`DeckState::cues_serial`] once applied, so the
+    /// owner knows which deck cues are the library's. Ignored if another track is loaded.
+    SetCues {
+        source_id: u64,
+        serial: u64,
+        cues: TrackCues,
     },
     Play,
     Pause,
@@ -93,6 +102,8 @@ pub struct Deck {
     source: Option<Arc<Source>>,
     grid: Option<Arc<DeckGrid>>,
     cues: CueState,
+    /// Serial of the last [`DeckCommand::SetCues`] applied.
+    cues_serial: u64,
     loops: LoopControl,
     sample_rate: u32,
     transport: Transport,
@@ -122,6 +133,7 @@ impl Deck {
             source: None,
             grid: None,
             cues: CueState::default(),
+            cues_serial: 0,
             loops: LoopControl::default(),
             sample_rate,
             transport: Transport::default(),
@@ -172,6 +184,30 @@ impl Deck {
         }
     }
 
+    /// Apply the stored cues of source `source_id` (see [`DeckCommand::SetCues`]). Returns
+    /// false, changing nothing, if another track is loaded.
+    pub fn set_cues(&mut self, source_id: u64, serial: u64, cues: &TrackCues) -> bool {
+        if self.source.as_ref().map(|s| s.id()) != Some(source_id) {
+            return false;
+        }
+        if self.fade_from.is_none() {
+            self.fade_from = Some(self.transport);
+        }
+        let t = &mut self.transport;
+        if let Some(cue) = cues.cue {
+            self.cues.cue = cue.max(0.0);
+            if !t.is_playing() && t.position() == 0.0 {
+                t.seek(self.cues.cue);
+            }
+        }
+        self.cues.hot = cues.hot;
+        if let Some((start, end)) = cues.stored_loop {
+            t.store_loop(Loop { start, end });
+        }
+        self.cues_serial = serial;
+        true
+    }
+
     /// Replace the loaded source and return the previous one and its grid, which the caller
     /// must not drop on the audio thread. The new track starts paused at frame 0, gridless.
     pub fn swap_source(
@@ -210,7 +246,10 @@ impl Deck {
         let sr = self.sample_rate;
         let grid = self.grid.as_deref();
         match *cmd {
-            DeckCommand::Load(_) | DeckCommand::Unload | DeckCommand::SetGrid { .. } => {}
+            DeckCommand::Load(_)
+            | DeckCommand::Unload
+            | DeckCommand::SetGrid { .. }
+            | DeckCommand::SetCues { .. } => {}
             DeckCommand::Play => {
                 cues.play_pressed();
                 t.play();
@@ -415,6 +454,10 @@ impl Deck {
         s.rate.store(t.rate());
         s.cue.store(self.cues.cue);
         s.hot_cues.store(self.cues.hot_mask(), Ordering::Relaxed);
+        for (slot, hot) in s.hot_cue_positions.iter().zip(self.cues.hot) {
+            slot.store(hot.unwrap_or(f64::NAN));
+        }
+        s.cues_serial.store(self.cues_serial, Ordering::Relaxed);
         s.quantize.store(self.cues.quantize.unwrap_or(0.0));
         let (looping, l) = match (t.active_loop(), t.stored_loop()) {
             (Some(l), _) => (true, Some(l)),

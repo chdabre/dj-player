@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use engine_core::render::index_ramp;
-use engine_core::{CHANNELS, DeckCommand, DeckGrid, Engine, EngineConfig, EngineHandle, Source};
+use engine_core::{
+    CHANNELS, DeckCommand, DeckGrid, Engine, EngineConfig, EngineHandle, HOT_CUES, Source,
+    TrackCues,
+};
 
 #[cfg(debug_assertions)]
 #[global_allocator]
@@ -220,4 +223,60 @@ fn loop_wraps_without_a_click() {
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);
     assert!(max_step < 0.03, "max step {max_step}");
+}
+
+#[test]
+fn stored_cues_restore_into_the_deck() {
+    let mut r = rig(false);
+    let id = r.engine.deck(0).source().unwrap().id();
+    let mut hot = [None; HOT_CUES];
+    hot[0] = Some(48_000.0);
+    hot[5] = Some(96_000.5);
+    let cues = TrackCues {
+        cue: Some(24_000.0),
+        hot,
+        stored_loop: Some((200_000.0, 248_000.0)),
+    };
+    // Cues of another track are ignored.
+    r.send(DeckCommand::SetCues {
+        source_id: id + 1,
+        serial: 1,
+        cues,
+    });
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    assert_eq!(st.cues_serial.load(Ordering::Relaxed), 0);
+    assert_eq!(st.hot_cues.load(Ordering::Relaxed), 0);
+
+    r.send(DeckCommand::SetCues {
+        source_id: id,
+        serial: 2,
+        cues,
+    });
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    assert_eq!(st.cues_serial.load(Ordering::Relaxed), 2);
+    assert_eq!(st.cue.load(), 24_000.0);
+    assert_eq!(
+        r.position(),
+        24_000.0,
+        "a paused deck at the start moves to the cue"
+    );
+    assert_eq!(st.hot_cues.load(Ordering::Relaxed), 0b10_0001);
+    assert_eq!(st.hot_cue_positions[5].load(), 96_000.5);
+    assert!(st.hot_cue_positions[1].load().is_nan());
+    assert!(
+        !st.looping.load(Ordering::Relaxed),
+        "the loop is stored, not entered"
+    );
+    assert_eq!(st.loop_start.load(), 200_000.0);
+
+    // The restored hot cue plays like one set on the deck; RELOOP enters the stored loop.
+    r.send(DeckCommand::HotCue(5));
+    r.render(BLOCK);
+    assert_eq!(r.position(), 96_000.5);
+    r.send(DeckCommand::ReloopExit);
+    r.render(BLOCK);
+    assert!(r.handle.deck_state(0).looping.load(Ordering::Relaxed));
+    assert_eq!(r.position(), 200_000.0);
 }

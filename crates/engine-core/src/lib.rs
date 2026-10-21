@@ -24,7 +24,7 @@ pub mod source;
 pub mod state;
 pub mod transport;
 
-pub use cue::{CueState, HOT_CUES, QUANTIZE_RESOLUTIONS};
+pub use cue::{CueState, HOT_CUES, QUANTIZE_RESOLUTIONS, TrackCues};
 pub use deck::{BlockOutcome, DECLICK_FRAMES, Deck, DeckCommand, MAX_BLOCK_FRAMES};
 pub use engine::{Command, CommandRingFull, Engine, EngineConfig, EngineHandle, Retired};
 pub use grid::{DeckGrid, FALLBACK_BPM};
