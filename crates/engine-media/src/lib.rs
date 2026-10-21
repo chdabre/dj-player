@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -18,7 +19,7 @@ use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 
 /// Frames per resampler call.
@@ -35,6 +36,8 @@ pub enum LoadError {
     NoAudioTrack,
     UnknownSampleRate,
     Resample(String),
+    /// The file opened and its stream looked valid, but not one frame decoded.
+    NoAudio,
 }
 
 impl fmt::Display for LoadError {
@@ -45,6 +48,7 @@ impl fmt::Display for LoadError {
             LoadError::NoAudioTrack => f.write_str("file has no decodable audio track"),
             LoadError::UnknownSampleRate => f.write_str("file does not state its sample rate"),
             LoadError::Resample(e) => write!(f, "resampler error: {e}"),
+            LoadError::NoAudio => f.write_str("no audio could be decoded from the file"),
         }
     }
 }
@@ -228,7 +232,7 @@ struct Decoding {
 
 impl Decoding {
     fn open(path: &Path) -> Result<Self, LoadError> {
-        let file = File::open(path)?;
+        let file = AfterId3::open(path)?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -268,6 +272,7 @@ impl Decoding {
     fn run(&mut self, mut sink: impl StereoSink) -> Result<(), LoadError> {
         let mut interleaved: Vec<f32> = Vec::new();
         let mut stereo: Vec<f32> = Vec::new();
+        let mut decoded = 0usize;
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
@@ -293,9 +298,85 @@ impl Decoding {
             interleaved.resize(buf.samples_interleaved(), 0.0);
             buf.copy_to_slice_interleaved(&mut interleaved);
             to_stereo(&interleaved, channels, &mut stereo);
+            decoded += stereo.len();
             sink.push(&stereo)?;
         }
+        // Skipping corrupt packets must not turn a file we cannot read into silence.
+        if decoded == 0 {
+            return Err(LoadError::NoAudio);
+        }
         Ok(())
+    }
+}
+
+/// A file with any leading ID3v2 tags skipped: offset 0 is the first byte after them.
+///
+/// Symphonia 0.6.1 does not skip some large ID3v2.3 tags (seen with 150 KB of artwork): it
+/// finds a false frame sync inside the picture, takes the wrong stream parameters and then
+/// fails to decode every packet. Audio never needs the tag, and gapless (LAME/Xing) info sits
+/// in the first audio frame after it, so skipping it ourselves loses nothing.
+struct AfterId3 {
+    file: File,
+    offset: u64,
+    len: u64,
+}
+
+impl AfterId3 {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let mut file = File::open(path)?;
+        let total = file.metadata()?.len();
+        let mut offset = 0u64;
+        let mut header = [0u8; 10];
+        // A file may carry more than one tag back to back.
+        for _ in 0..4 {
+            file.seek(SeekFrom::Start(offset))?;
+            if file.read_exact(&mut header).is_err() || &header[..3] != b"ID3" {
+                break;
+            }
+            let size = header[6..10]
+                .iter()
+                .fold(0u64, |acc, &b| (acc << 7) | u64::from(b & 0x7f));
+            let footer = if header[5] & 0x10 != 0 { 10 } else { 0 };
+            let end = offset + 10 + size + footer;
+            if end >= total {
+                break;
+            }
+            offset = end;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        Ok(Self {
+            file,
+            offset,
+            len: total - offset,
+        })
+    }
+}
+
+impl Read for AfterId3 {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for AfterId3 {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(p) => self.offset + p,
+            SeekFrom::End(d) => (self.offset + self.len).saturating_add_signed(d),
+            SeekFrom::Current(d) => self.file.stream_position()?.saturating_add_signed(d),
+        };
+        let at = self.file.seek(SeekFrom::Start(target.max(self.offset)))?;
+        Ok(at - self.offset)
+    }
+}
+
+impl MediaSource for AfterId3 {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
     }
 }
 
@@ -567,6 +648,47 @@ mod tests {
             .map(|i| (whole[2 * i] - src.frame(i as i64)[0]).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-3, "{max_diff}");
+    }
+
+    /// An ID3v2.3 tag of `size` bytes whose payload is full of fake MPEG frame syncs, like
+    /// embedded artwork can be.
+    fn id3_tag(size: usize) -> Vec<u8> {
+        let mut tag = b"ID3\x03\x00\x00".to_vec();
+        tag.extend((0..4).rev().map(|k| ((size >> (7 * k)) & 0x7f) as u8));
+        tag.extend((0..size).map(|i| {
+            if i % 417 == 0 {
+                0xff
+            } else if i % 417 == 1 {
+                0xfb
+            } else {
+                0x90
+            }
+        }));
+        tag
+    }
+
+    #[test]
+    fn files_behind_a_large_id3_tag_decode_completely() {
+        let wav = tmp("tagged-src.wav");
+        let frames = 48_000;
+        write_wav(&wav, 48_000, 2, &[0.25; 2 * 48_000]);
+        let mut bytes = id3_tag(150_000);
+        bytes.extend(std::fs::read(&wav).unwrap());
+        let tagged = tmp("tagged.wav");
+        std::fs::write(&tagged, bytes).unwrap();
+        let (audio, rate) = decode_native(&tagged).unwrap();
+        assert_eq!(rate, 48_000);
+        assert_eq!(audio.len(), 2 * frames);
+    }
+
+    #[test]
+    fn a_file_that_decodes_to_nothing_is_an_error() {
+        // A tag and then nothing decodable.
+        let path = tmp("empty.mp3");
+        let mut bytes = id3_tag(1000);
+        bytes.extend(std::iter::repeat_n(0u8, 4000));
+        std::fs::write(&path, bytes).unwrap();
+        assert!(decode_native(&path).is_err());
     }
 
     #[test]
