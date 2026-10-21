@@ -1,6 +1,6 @@
 # Keylock shootout (spike 2)
 
-Status 2026-10-21: Mac numbers and blind listening in (no audible difference at ±8 %; Bungee chosen); the Pi 5 run outstanding. Plan: `docs/research/engine.md`, "Crates, budget and spikes", item 2.
+Status 2026-10-21: Mac numbers and blind listening in (no audible difference at ±8 %; Bungee chosen); Bungee ported to Rust and verified against the C++; the Pi 5 run outstanding. Plan: `docs/research/engine.md`, "Crates, budget and spikes", item 2.
 
 ## Provisional read (Mac only)
 
@@ -78,9 +78,45 @@ Rust vs C++, then in brackets the control: C++ vs C++ on input × (1 + 2⁻²⁰
 | chord | 1 | 1.5 | yes | yes | 84.2 (84.5) | 8.3e-5 (8.1e-5) | 0.000 (0.000) | 0.001 (0.001) |
 | chord | 1 | 0.75 | yes | yes | 74.2 (72.3) | 2.4e-3 (3.2e-3) | 0.005 (0.003) | 0.025 (0.018) |
 
+### Bench: port vs C++
+
+`cargo run -p keylock-shootout --release -- bench --seconds 5`, in a Linux x86_64 cloud container (4 vCPU Xeon @ 2.8 GHz, shared, no RT priority), 48 kHz, 128-frame blocks, the generated CPU track (no music library there), no allocation counter (macOS only). `bungee-rust` is the port driven exactly like `bungee`; Signalsmith for scale. Read the ratios, not the absolute numbers: the Mac and Pi runs above and outstanding are the ones that count.
+
+| candidate | rate | mean µs | p99 µs | max µs | mean % of budget | start µs | allocs start / run | read-ahead ms | underruns |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| signalsmith-default | 0.92 | 49.4 | 575.2 | 1090.4 | 3.7 % | 1204 | n/a / n/a | 115.2 | 0 |
+| signalsmith-default | 1 | 55.1 | 748.8 | 5969.4 | 4.1 % | 1132 | n/a / n/a | 120.0 | 0 |
+| signalsmith-default | 1.08 | 48.8 | 563.4 | 749.7 | 3.7 % | 1195 | n/a / n/a | 124.8 | 0 |
+| signalsmith-default | 0.1 | 56.4 | 704.3 | 1068.0 | 4.2 % | 1244 | n/a / n/a | 66.0 | 0 |
+| signalsmith-default | 2 | 50.4 | 576.1 | 1011.7 | 3.8 % | 1221 | n/a / n/a | 180.0 | 0 |
+| signalsmith-default | -1 | — | — | — | — | — | — | — | resampler fallback |
+| bungee | 0.92 | 60.8 | 325.9 | 949.6 | 4.6 % | 1650 | n/a / n/a | 62.3 | 0 |
+| bungee | 1 | 62.3 | 380.3 | 483.8 | 4.7 % | 821 | n/a / n/a | 64.0 | 0 |
+| bungee | 1.08 | 60.1 | 348.7 | 529.5 | 4.5 % | 806 | n/a / n/a | 65.7 | 0 |
+| bungee | 0.1 | 67.8 | 446.8 | 612.3 | 5.1 % | 940 | n/a / n/a | 44.8 | 0 |
+| bungee | 2 | 59.2 | 292.7 | 952.9 | 4.4 % | 833 | n/a / n/a | 85.3 | 0 |
+| bungee | -1 | 57.1 | 268.4 | 685.7 | 4.3 % | 860 | n/a / n/a | 64.0 | 0 |
+| bungee-rust | 0.92 | 36.8 | 191.9 | 660.5 | 2.8 % | 483 | n/a / n/a | 62.3 | 0 |
+| bungee-rust | 1 | 33.5 | 169.0 | 359.4 | 2.5 % | 448 | n/a / n/a | 64.0 | 0 |
+| bungee-rust | 1.08 | 36.1 | 185.2 | 313.5 | 2.7 % | 685 | n/a / n/a | 65.7 | 0 |
+| bungee-rust | 0.1 | 42.7 | 260.6 | 1755.5 | 3.2 % | 440 | n/a / n/a | 44.8 | 0 |
+| bungee-rust | 2 | 40.9 | 249.9 | 336.4 | 3.1 % | 514 | n/a / n/a | 85.3 | 0 |
+| bungee-rust | -1 | 35.7 | 219.0 | 355.7 | 2.7 % | 411 | n/a / n/a | 64.0 | 0 |
+
+| candidate | align 0.92 ms | align 1.08 ms | align reverse ms | rate response ms |
+| --- | --- | --- | --- | --- |
+| signalsmith-default | -0.1 (-0.1) | +0.1 (+0.1) | — | 60.2 |
+| bungee | +0.0 (+0.0) | +0.0 (+0.0) | -0.0 (-0.0) | 26.7 |
+| bungee-rust | +0.0 (+0.0) | +0.0 (+0.0) | +0.0 (-0.0) | 26.7 |
+
+- **The port is cheaper than the C++ here**: mean 34–43 µs vs 57–68 µs per block, p99 169–261 µs vs 268–447 µs, start (pre-roll) 0.4–0.7 ms vs 0.8–1.6 ms. Re-run on the Mac and the Pi before reading much into it; Eigen and kissfft are built by CMake's Release profile, rustfft has NEON and AVX paths.
+- **Timing is identical**: same read-ahead, alignment and 26.7 ms rate response, as the identical chunk tags predict.
+- **In the deck** (`cargo bench -p engine-core --bench render`, `keylock_1.08`, one second of output with one seek): 17.2 ms with Bungee vs 21.0 ms with the previous Signalsmith keylock on the same machine (rate 1.08 without keylock: 1.08 ms).
+
 ## Outstanding
 
-- The same `bench` on a Pi 5, built natively there, with RT priority.
+- The same `bench` on a Pi 5, built natively there, with RT priority, now with `bungee-rust` in it.
+- `bench` and `compare` on the Mac, to check the port's CPU lead holds on aarch64.
 
 ## Raw results, macOS aarch64
 
