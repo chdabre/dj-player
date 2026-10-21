@@ -234,6 +234,21 @@ impl Stretcher {
         self.grains.iter().all(|g| !g.valid())
     }
 
+    /// The input [`Stretcher::specify_grain`] would ask for, without starting a grain. Not in
+    /// Bungee's C++ API: it lets a real-time caller check that the audio is there first.
+    pub fn input_chunk(&self, request: &Request, buffer_start_position: f64) -> InputChunk {
+        if request.position.is_nan() {
+            return InputChunk::default();
+        }
+        // Without input resampling (autoOut) the chunk is one transform long, centred.
+        let half = (4i64) << self.timing.log2_synthesis_hop;
+        let offset = (request.position - buffer_start_position).round() as i64;
+        InputChunk {
+            begin: offset - half,
+            end: offset + half,
+        }
+    }
+
     /// Storage index of Bungee's `grains[i]` (0 is the newest).
     fn index(&self, i: usize) -> usize {
         (3 - i + self.rotation) % 4

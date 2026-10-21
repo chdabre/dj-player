@@ -1,14 +1,14 @@
 //! Time-stretchers for keylock: change speed without changing pitch.
 //!
-//! Every backend sits behind [`Stretcher`], so the keylock spike can compare Signalsmith,
-//! Bungee and Rubber Band in the same deck. See `docs/research/engine.md` ("Rate, scratching
-//! and keylock"). Two backends: Signalsmith Stretch through its C++ wrapper behind the push
-//! API, and [`bungee`], a pure-Rust port of Bungee Basic with its own pull (grain) API.
+//! Two kinds of backend. [`bungee`] is a pure-Rust port of Bungee Basic with its own pull
+//! (grain) API; it is the decks' default keylock (see `docs/spikes/keylock-shootout.md`).
+//! Push backends sit behind [`Stretcher`]: so far Signalsmith Stretch through its C++
+//! wrapper. See `docs/research/engine.md` ("Rate, scratching and keylock").
 //!
-//! Construct stretchers off the audio thread: construction allocates. After that,
-//! [`Stretcher::seek`], [`Stretcher::process`] and [`Stretcher::reset`] must be real-time
-//! safe. Note that `assert_no_alloc` only sees Rust's allocator; allocations inside a C++
-//! backend go straight to `malloc` and are invisible to it.
+//! Construct stretchers off the audio thread: construction allocates. After that, Bungee's
+//! grain calls and [`Stretcher::seek`], [`Stretcher::process`] and [`Stretcher::reset`] must
+//! be real-time safe. Note that `assert_no_alloc` only sees Rust's allocator; allocations
+//! inside a C++ backend go straight to `malloc` and are invisible to it.
 
 pub mod bungee;
 
@@ -53,7 +53,8 @@ pub trait Stretcher: Send {
     fn process(&mut self, input: &[f32], output: &mut [f32]);
 }
 
-/// The stretcher decks use by default, or `None` if no backend is compiled in.
+/// The push-API stretcher for `engine_core::Keylock::new` (Signalsmith), or `None` if no push
+/// backend is compiled in. Decks default to the [`bungee`] port, which is always present.
 pub fn default_stretcher(channels: usize, sample_rate: u32) -> Option<Box<dyn Stretcher>> {
     #[cfg(feature = "signalsmith")]
     {

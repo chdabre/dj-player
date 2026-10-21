@@ -17,7 +17,7 @@ Any MP3, AAC/M4A, ALAC, FLAC, WAV, AIFF or Ogg file works. Keys: space play/paus
 | Crate | What it holds |
 | --- | --- |
 | `crates/engine-core` | Source, Transport (with slip), Scaler, Keylock, Deck, Engine; no I/O, no threads |
-| `crates/engine-stretch` | `Stretcher` trait for keylock; Signalsmith Stretch (C++, built with `cc` and bindgen) |
+| `crates/engine-stretch` | Time-stretchers for keylock: Bungee Basic ported to Rust (MPL-2.0, the default) and, behind the `Stretcher` trait, Signalsmith Stretch (C++, built with `cc` and bindgen) |
 | `crates/engine-analysis` | Tempo, beatgrid and key behind pluggable backends (stratum-dsp first), a selection policy and a ground-truth scorer (`engine-analyze`) |
 | `crates/engine-media` | Symphonia decode and load-time resample on a loader thread |
 | `crates/engine-io` | `AudioBackend` trait and its cpal implementation |

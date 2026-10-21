@@ -32,7 +32,9 @@ fn play(input: &[f32], start: f64, speed: f64, chunks: usize) -> (Vec<f32>, Vec<
     s.preroll(&mut request);
     let (mut out, mut tags) = (Vec::new(), Vec::new());
     for _ in 0..chunks {
+        let predicted = s.input_chunk(&request, 0.0);
         let chunk = s.specify_grain(&request, 0.0);
+        assert_eq!(predicted, chunk);
         let n = chunk.len();
         let (mut head, mut tail) = (0, 0);
         for (k, x) in buf[..n].iter_mut().enumerate() {
