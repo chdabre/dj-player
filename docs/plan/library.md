@@ -20,6 +20,7 @@ Status 2026-10-21: design for review, no code yet. It makes concrete the "Own li
 - **Tracks have a stable id derived from their file hash at first sight.** Two devices that discover the same file give it the same id. A file whose tags were edited elsewhere is re-matched by its audio hash and merged.
 - **Big data lives in blobs.** Waveforms, analysis results and later stems are blobs named by their BLAKE3 hash, written once and never changed. Records only point at them.
 - **Positions are seconds** (f64) on the engine's timeline, the gapless-trimmed one. Every record that imports Rekordbox data converts with the track's recorded start trim.
+- **A player can hold several libraries at once:** its own USB and SD slots, the libraries in linked players, and a cloud library. Every track is addressed as (library, track). Each library has exactly one writer at a time: the player it is plugged into. Edits for a track in another player's library travel over the link to that player, which journals them.
 
 ## Layout
 
@@ -68,6 +69,28 @@ c2f0aa13 {"hlc":"0192f3c4a1c0-0000","op":"rm","path":"track/9c4e1f0a2b3d4e5f/cue
 
   That is the whole grammar. A new feature adds paths, not operations.
 - **Paths** name an entity and a field. Unknown paths are kept and passed through (a newer device's data survives an older device's snapshot) but not interpreted.
+
+## Who sees what, when
+
+Journals are split by device for writing only. Every device reads all journal folders and merges them, so nothing one device writes is hidden from another.
+
+- **USB stick moved between players:** on mount, a player replays every device's journals, so last night's edits from another player are there.
+- **Cloud folder:** a running device picks up other devices' sealed segments through change notifications. They arrive within about 30 s (sealing) plus up to about 90 s (Dropbox long-poll lag); a device that was offline catches up on reconnect.
+- **The same field edited on two devices:** the later edit by HLC wins everywhere. **Sets** (memory cues, tags, playlist entries) keep both devices' additions.
+- **While a stick is mounted,** its player doesn't watch for changes: it is the stick's only writer. Linked players see its edits live over the link (next section), not through the files.
+
+## Multiple libraries and linked players
+
+Linked players share their sticks, as Pro DJ Link does: player B browses and loads tracks from the USB in player A. So a player works with a set of libraries, not one.
+
+- **Library id:** the UUID in `FORMAT`. A player's library set holds each mounted library with its id, where it is (a local slot, a linked player, the cloud) and whether it can be written. The browse tree shows them all.
+- **Track address:** `(library id, track id)`. Track ids come from the file hash, so the same file on two sticks has the same track id in both. Its data stays separate per library, and the UI can offer "copy cues from the other stick". Nothing merges across libraries on its own.
+- **One writer per stick:** the player a stick is plugged into is its only writer. Player B never writes A's stick directly. It sends its operations over the link, stamped with B's HLC and device id, and A appends them to its own journal segment on that stick. Each operation carries its origin device, and merging orders by HLC and origin, not by the folder the operation sits in. So the "one folder per device" rule stays true: a folder is per writer, and operations are per author.
+- **Blobs from linked players:** an analysis or waveform computed on B for a track on A's stick is sent to A as a blob, and A writes it. Until A confirms, B keeps it in RAM.
+- **Edits that can't be delivered:** if A or its stick goes away while B still has the track loaded, the track keeps playing from B's RAM. B queues the edits for that library id and delivers them when that library shows up on the link again. Undelivered edits are shown ("3 unsaved edits for USB 'Friday'") and are lost at power-off.
+- **History:** a play is recorded in the library that holds the track, with the playing device as the author. A session log across all libraries (what played tonight, from which sticks) is a later, separate record in the player's home library, if it has one.
+- **Two copies of the same library** on the link (the same library id, e.g. a stick prepared from the cloud and the cloud itself, or two copies of one stick): they are replicas. Each holder writes only its own copy, and the link shares edits live so both players show the merged state. The copies themselves converge the next time they sync (cloud upload, or a copy-back to the original).
+- **Depends on** the unit-to-unit link protocol (`engine-sync`), not designed yet. The library side needs four messages from it: browse, load (stream the audio file), apply-operations (with acknowledgement) and put-blob.
 
 ## Data model
 
@@ -153,11 +176,13 @@ pub trait Store {                       // a stick folder, RAM, later Dropbox
     fn flush(&self, path: &str) -> io::Result<()>;
 }
 
-pub struct Library { /* merged state, this device's open segment, HLC */ }
+pub struct Library { /* one mounted library: merged state, the open segment, HLC */ }
+pub struct Libraries { /* every library this player sees, by library id */ }
 impl Library {
     pub fn mount(store: impl Store, device: DeviceId) -> Result<Self, MountError>;
     pub fn track(&self, id: TrackId) -> Option<TrackView<'_>>;           // the merged fields
     pub fn apply(&mut self, edit: Edit) -> Result<(), WriteError>;     // stamps, journals, merges
+    pub fn apply_remote(&mut self, ops: &[Op]) -> Result<(), WriteError>; // from a linked player
     pub fn put_blob(&mut self, bytes: &[u8]) -> Result<BlobId, WriteError>;
     pub fn flush(&mut self) -> Result<(), WriteError>;
     pub fn snapshot(&mut self) -> Result<(), WriteError>;
@@ -177,8 +202,10 @@ impl Library {
 
 ## Open questions (to confirm)
 
+0. **Multiple libraries:** confirm the "one writer per stick, operations forwarded over the link" rule, and that data stays per library (no automatic cross-stick merge of the same track).
+
 1. **Encoding:** JSON lines with a CRC (readable, easy to debug and to document as an open format, about 2× bigger) or CBOR (compact, binary)? Recommended: JSON lines; the journals are small either way, and blobs are already binary.
 2. **Folder name** at the stick root: `DJPLAYER/` (recommended; plain and visible), or a hidden `.djplayer/` (hidden on Mac and Linux, but visible on Windows anyway).
 3. **Hot cues:** 16 (two banks of 8, as the research says), or 8 like the reference?
 4. **History:** store full play history (when, which deck, how long it played), or only play counts and a last-played date?
-5. **Scope of the first implementation:** I'd start with the crate on a folder store: identity, cues, hot cues, ratings, analysis and waveform blobs, wired into `engined` so cues and waveforms persist across loads. Playlists, tags, history and the cloud come after.
+5. **Scope of the first implementation:** I'd start with the crate on a folder store: identity, cues, hot cues, ratings, analysis and waveform blobs, wired into `engined` so cues and waveforms persist across loads. Playlists, tags, history and the cloud come after. The API addresses tracks as (library, track) from the start, so multiple libraries and the link slot in later without changes.
