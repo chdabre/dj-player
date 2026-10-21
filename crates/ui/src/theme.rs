@@ -221,7 +221,7 @@ impl Theme {
                 style: waveform::display::Style::default(),
                 background: Rgba::hex(0x07080a),
                 background_glow: Rgba::hex(0x1f2430),
-                opacity: 0.85,
+                opacity: 0.7,
                 center_line: Rgba::hex(0x15171b),
                 beat_line: Rgba::hex(0x262a30),
                 bar_line: Rgba::hex(0x48505a),
