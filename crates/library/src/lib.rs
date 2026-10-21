@@ -25,7 +25,10 @@ pub use library::{
     Edit, Found, Library, MountError, MountOptions, MountStats, Persistence, ReadError, WriteError,
     rfc3339, system_ms,
 };
-pub use model::{AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Track, WaveformRef};
+pub use model::{
+    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Track, TrackTags,
+    WaveformRef,
+};
 
 /// A file's path as the library stores it: `/` separators and Unicode NFC, so the same
 /// name written by macOS (NFD) and anything else compares equal.

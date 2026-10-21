@@ -19,7 +19,8 @@ use crate::db::{self, BACKUP_FILE, DB_FILE, DbError};
 use crate::hash::{AudioHash, FileHash, track_id};
 use crate::ids::{BlobId, DeviceId, LibraryId, TrackId, TrackRef, hex, unhex};
 use crate::model::{
-    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Track, WaveformRef, is_component,
+    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Track, TrackTags,
+    WaveformRef, is_component,
 };
 
 /// How to open a library.
@@ -144,6 +145,8 @@ pub enum Edit {
     SetHotCue(TrackId, usize, Option<HotCue>),
     SetAnalysis(TrackId, String, AnalysisRef),
     SetWaveform(TrackId, WaveformRef),
+    /// The tag cache: every field as given.
+    SetTags(TrackId, TrackTags),
 }
 
 /// Whether edits reach the folder.
@@ -198,6 +201,7 @@ enum Op {
     HotCue(TrackId, usize, Option<HotCue>),
     Analysis(TrackId, String, AnalysisRef),
     Waveform(TrackId, WaveformRef),
+    Tags(TrackId, TrackTags),
 }
 
 /// Edits and blobs a dropped library could not write, by library.
@@ -567,7 +571,8 @@ impl Library {
             | Edit::RemoveCue(t, _)
             | Edit::SetHotCue(t, _, _)
             | Edit::SetAnalysis(t, _, _)
-            | Edit::SetWaveform(t, _) => *t,
+            | Edit::SetWaveform(t, _)
+            | Edit::SetTags(t, _) => *t,
         };
         // Without a readable file (a pulled stick) the edit is queued unchecked.
         let t = resolve(&self.conn, track).unwrap_or(track);
@@ -612,6 +617,7 @@ impl Library {
                 (Op::Analysis(t, name, a), None)
             }
             Edit::SetWaveform(_, w) => (Op::Waveform(t, w), None),
+            Edit::SetTags(_, tags) => (Op::Tags(t, tags), None),
         };
         self.write(op);
         Ok(id)
@@ -716,8 +722,8 @@ impl Library {
         let key = &id.0[..];
         let Some(mut t) = c
             .query_row(
-                "SELECT rating, audio_hash, audio_hash_v, waveform, waveform_overview \
-                 FROM tracks WHERE id = ?1",
+                "SELECT rating, audio_hash, audio_hash_v, waveform, waveform_overview, \
+                 title, artist, album, genre, bpm, key, duration FROM tracks WHERE id = ?1",
                 [key],
                 |r| {
                     let mut t = Track::empty(id);
@@ -736,6 +742,7 @@ impl Library {
                         }),
                         _ => None,
                     };
+                    t.tags = tags_at(r, 5)?;
                     Ok(t)
                 },
             )
@@ -830,6 +837,29 @@ impl Library {
             .query_map([key], |r| Ok(track_of(&r.get::<_, Vec<u8>>(0)?)))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(Some(t))
+    }
+
+    /// Every location of every track with the track's tags, by path: what the browser lists
+    /// and searches.
+    pub fn listing(&self) -> Result<Vec<Listed>, ReadError> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT l.track, l.path, t.title, t.artist, t.album, t.genre, t.bpm, t.key, \
+             t.duration, t.rating, \
+             (t.waveform IS NOT NULL AND EXISTS (SELECT 1 FROM analysis a WHERE a.track = t.id)) \
+             FROM locations l JOIN tracks t ON t.id = l.track ORDER BY l.path",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(Listed {
+                    track: track_of(&r.get::<_, Vec<u8>>(0)?),
+                    path: r.get(1)?,
+                    tags: tags_at(r, 2)?,
+                    rating: r.get(9)?,
+                    analysed: r.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Every track id (merged tracks resolve to their survivor and are not listed), in the
@@ -1028,6 +1058,25 @@ impl Op {
                     dev
                 ])?;
             }
+            Op::Tags(t, g) => {
+                c.prepare_cached(
+                    "UPDATE tracks SET title = ?2, artist = ?3, album = ?4, genre = ?5, \
+                     bpm = ?6, key = ?7, duration = ?8, updated_at = ?9, device = ?10 \
+                     WHERE id = ?1",
+                )?
+                .execute(params![
+                    &resolve(c, *t)?.0[..],
+                    g.title,
+                    g.artist,
+                    g.album,
+                    g.genre,
+                    g.bpm,
+                    g.key,
+                    g.duration,
+                    now,
+                    dev
+                ])?;
+            }
             Op::Waveform(t, w) => {
                 c.prepare_cached(
                     "UPDATE tracks SET waveform = ?2, waveform_overview = ?3, updated_at = ?4, \
@@ -1122,6 +1171,19 @@ fn resolve(c: &Connection, id: TrackId) -> rusqlite::Result<TrackId> {
         .query_row([&id.0[..]], |r| r.get(0))
         .optional()?;
     Ok(new.map_or(id, |b| track_of(&b)))
+}
+
+/// The seven tag cache columns starting at column `i`.
+fn tags_at(r: &Row, i: usize) -> rusqlite::Result<TrackTags> {
+    Ok(TrackTags {
+        title: r.get(i)?,
+        artist: r.get(i + 1)?,
+        album: r.get(i + 2)?,
+        genre: r.get(i + 3)?,
+        bpm: r.get(i + 4)?,
+        key: r.get(i + 5)?,
+        duration: r.get(i + 6)?,
+    })
 }
 
 fn track_of(b: &[u8]) -> TrackId {

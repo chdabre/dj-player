@@ -397,3 +397,47 @@ fn without_a_library_edits_carry_over_between_loads() {
     let lib = Library::ram(opts, "no stick");
     assert_eq!(lib.track(t).unwrap().unwrap().rating, Some(2));
 }
+
+#[test]
+fn tags_are_kept_and_listed_by_path() {
+    let dir = temp("tags");
+    let (a, b) = (file("UKG/a.mp3", b"aaaa"), file("b.mp3", b"bbbb"));
+    let tags = library::TrackTags {
+        title: Some("Red Flag".into()),
+        artist: Some("Sunship".into()),
+        bpm: Some(132.0),
+        key: Some("8A".into()),
+        duration: Some(142.1),
+        ..Default::default()
+    };
+    {
+        let mut lib = mount(&dir);
+        let ta = lib.find_or_create(a).unwrap().track;
+        let tb = lib.find_or_create(b).unwrap().track;
+        lib.apply(Edit::SetTags(ta, tags.clone())).unwrap();
+        // b gets a waveform and an analysis: analysed.
+        let blob = lib.put_blob(b"analysis");
+        let a = AnalysisRef {
+            version: "1".into(),
+            params: "p".into(),
+            blob,
+            created: "2026-10-21T00:00:00Z".into(),
+        };
+        lib.apply(Edit::SetAnalysis(tb, "gridfit".into(), a))
+            .unwrap();
+        let wf = lib.put_blob(b"waveform");
+        lib.apply(Edit::SetWaveform(tb, WaveformRef::new(wf, wf)))
+            .unwrap();
+        lib.flush();
+    }
+    let lib = mount(&dir);
+    let listed = lib.listing().unwrap();
+    let paths: Vec<&str> = listed.iter().map(|l| l.path.as_str()).collect();
+    assert_eq!(paths, ["UKG/a.mp3", "b.mp3"]);
+    assert_eq!(listed[0].tags, tags);
+    assert!(!listed[0].analysed, "no waveform or analysis yet");
+    assert_eq!(listed[1].tags, library::TrackTags::default());
+    assert!(listed[1].analysed);
+    assert_eq!(lib.track(listed[0].track).unwrap().unwrap().tags, tags);
+    cleanup(&dir);
+}

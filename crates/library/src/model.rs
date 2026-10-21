@@ -18,6 +18,33 @@ pub fn is_component(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
 }
 
+/// What the browser lists for a track (the `tracks` table's tag cache): the file's tags,
+/// with the BPM and key from our analysis once the track has been analysed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+    /// Seconds.
+    pub duration: Option<f64>,
+}
+
+/// One location of a track with its tags, as [`crate::Library::listing`] gives them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed {
+    pub track: TrackId,
+    /// As in [`FileIdentity::path`].
+    pub path: String,
+    pub tags: TrackTags,
+    /// The DJ's rating, 0–5 stars.
+    pub rating: Option<u8>,
+    /// The track has a stored waveform and at least one stored analysis result.
+    pub analysed: bool,
+}
+
 /// Where a file is and what it is: one location of a track.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileIdentity {
@@ -161,6 +188,7 @@ pub struct Track {
     pub waveform: Option<WaveformRef>,
     /// Tracks merged into this one (their ids resolve to it).
     pub merged: Vec<TrackId>,
+    pub tags: TrackTags,
 }
 
 impl Track {
@@ -176,6 +204,7 @@ impl Track {
             analysis: BTreeMap::new(),
             waveform: None,
             merged: Vec::new(),
+            tags: TrackTags::default(),
         }
     }
 
