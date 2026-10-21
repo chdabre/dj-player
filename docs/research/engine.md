@@ -1,6 +1,6 @@
 # DJ Player Engine – Research
 
-Exported 2026-10-20 from the living doc: https://claude.ai/code/artifact/271c7e09-9192-49d3-bcdb-abe21dd9447d — the doc is the source of truth; re-export when it changes.
+Exported 2026-10-21 from the living doc: https://claude.ai/code/artifact/271c7e09-9192-49d3-bcdb-abe21dd9447d — the doc is the source of truth; re-export when it changes.
 
 ## Summary
 
@@ -8,7 +8,7 @@ Build the engine as one Rust library (`engine-core`) with a single real-time aud
 
 - **Audio I/O:** cpal on ALSA directly (no PipeWire) on the Pi, 48 kHz, 128-frame periods, on a PREEMPT\_RT kernel. That gives a 2.67 ms callback budget and single-digit-ms output latency.
 - **Decks:** decode the whole track into RAM ahead of playback. Seeks, hot cues, reverse and scratching then never wait on disk or decoder.
-- **Rate:** two paths. A variable-rate interpolating resampler for pitch fader without keylock and for all scratching; a time-stretcher for keylock behind a trait, starting with Signalsmith Stretch (MIT) and benchmarking Rubber Band and Bungee against it.
+- **Rate:** two paths. A variable-rate interpolating resampler for pitch fader without keylock and for all scratching; a time-stretcher for keylock: Bungee Basic (MPL-2.0), ported to pure Rust, whose granular API also keeps keylock in reverse (scratch later).
 - **Sync:** an internal beat clock per engine, beatgrids from the Rekordbox ANLZ files (rbox) or own analysis, Ableton Link via rusty\_link.
 - **Stems:** play NI `.stem.mp4` and a native multi-track format; separate on a PC or overnight on the device, since HTDemucs on the Pi 5 CPU is roughly 3× slower than real time.
 - **License:** plan for GPL-3.0-or-later. rbox is GPL-3.0-only, and Rubber Band and Ableton Link are GPL too, which fits an open-source project.
@@ -71,7 +71,7 @@ The audio callback never allocates, frees, locks, logs, or touches the filesyste
 
 The same pattern is used in Rust audio hosts today: MIDI events pushed onto a lock-free queue, real-time safety tested with assert\_no\_alloc, and basedrop to keep deallocation off the audio thread ([audio-processor-standalone-midi](https://docs.rs/audio-processor-standalone-midi/)).
 
-FFI libraries (Signalsmith, Rubber Band, Bungee, Link) are C++: confirm each one's real-time path is allocation-free in the configuration you use, under assert\_no\_alloc, before trusting it.
+FFI libraries (Rubber Band in the shootout spike, Link) are C++: confirm each one's real-time path is allocation-free in the configuration you use, under assert\_no\_alloc, before trusting it.
 
 ## Deck pipeline
 
@@ -103,7 +103,7 @@ Give every deck two scalers and let the transport pick per block: an interpolati
 
 **Resampler path (write it yourself).** Read the resident buffer at fractional positions, so negative, zero and extreme rates all work — that is what reverse, brake and scratch need. Use cubic Hermite while the platter is touched (cheap, fine for scratch) and a short windowed-sinc kernel for normal play above 1.0× to avoid aliasing. Mixxx keeps a linear scaler and only uses it when the rate change is under one cent ([Mixxx EngineBuffer](https://github.com/mixxxdj/mixxx/blob/752b3cc3f64c3597b78a5818b3533a1ec82d5f26/src/engine/enginebuffer.cpp)). Rubato is for load-time sample-rate conversion, not this: it processes a stream in chunks, not random-access reads in reverse.
 
-**Keylock path (behind a `Stretcher` trait).** Three candidates, benchmarked on the Pi in the keylock spike:
+**Keylock path.** Three candidates were benchmarked in the keylock spike (Bungee won; see the decision below):
 
 | Library | License | Latency / CPU | Fit |
 | --- | --- | --- | --- |
@@ -111,11 +111,13 @@ Give every deck two scalers and let the transport pick per block: an interpolati
 | [Bungee](https://github.com/bungee-audio-stretch/bungee) | MPL-2.0 | About 20 ms for speed/pitch changes, 40 ms input to output ([JUCE forum](https://forum.juce.com/t/looking-for-a-timestretching-pitchshifting-library-that-has-very-low-latency/45404)) | Its granular API allows any playhead movement, including reverse and scratch, so it may remove the scaler switch. Rust: [bungee-rs](https://rust-digger.code-maven.com/crates/bungee-rs) |
 | [Rubber Band](https://github.com/arthenica/rubberband) | GPL or commercial | R2 is cheap; R3 sounds better at much higher CPU; R3 short-window mode cuts CPU and delay | What Mixxx ships. No maintained Rust crate checked; bind via bindgen |
 
-**Latency compensation.** A stretcher outputs audio tens of ms behind its input. The transport must offset the reported playhead by the stretcher's output latency, or waveforms, beat sync and quantized cues drift by that amount whenever keylock is on.
+**Decision (2026-10-21): Bungee.** The shootout on the Mac found no audible difference between Signalsmith and Bungee on club tracks (`docs/spikes/keylock-shootout.md`). Bungee wins on its API: its granular playhead also handles reverse, rate 0 and scratch, which Signalsmith hands to the resampler. It is ported to pure Rust (no C++ or CMake in the build) and matches the C++ library to float rounding; it is the deck's only keylock, and Signalsmith was removed from the code base (owner decision, 2026-10-21). Pi CPU numbers are still to measure.
+
+**Latency compensation.** A stretcher outputs audio tens of ms behind its input. Because the track is resident, the keylock path reads that far ahead of the transport, so the audio heard is the reported playhead; waveforms, beat sync and quantized cues need no keylock offset.
 
 **Platter to audio.** The RP2040 sends timestamped encoder counts and the touch flag at \~1 kHz. The engine estimates platter angle at each callback start, maps it to a target track position, and steers playback toward it with a small tracking filter, so the sound follows the hand within a callback or two without zipper noise. xwax does the same job from timecode vinyl and is the reference for how that feel should behave ([xwax](https://www.mankier.com/package/xwax)). When the platter is released, apply a configurable spin-up; on stop, a configurable brake.
 
-**Scratch with keylock on.** Switch to the resampler path on touch, then crossfade back into the stretcher on release after priming it with `seek()` at the new position. If Bungee handles scratch directly at acceptable CPU, drop the switch.
+**Scratch with keylock on.** Switch to the resampler path on touch, then crossfade back into the stretcher on release after re-priming it at the new position. If Bungee handles scratch directly at acceptable CPU, drop the switch.
 
 ## Sync and beatgrid
 
@@ -171,8 +173,18 @@ Prefer Rekordbox's own analysis when the stick carries it, and run your own anal
 | Rekordbox data | [rbox](https://docs.rs/crate/rbox/latest) | Reads OneLibrary `exportLibrary.db`, `master.db`, XML and all three ANLZ files (waveforms, beatgrid, cues) |
 | BPM, key, beatgrid | [stratum-dsp](https://docs.rs/crate/stratum-dsp/latest) | Pure Rust, MIT/Apache. Self-reported 87.7% within ±2 BPM on 155 DJ tracks, against 98.1% for Mixed In Key on the same set. Promising, not yet good enough alone |
 | Higher-accuracy fallback | [Essentia](https://essentia.upf.edu/licensing_information.html) | C++, AGPL-3.0 (fine here). Its pretrained models are CC BY-NC-ND, so use only the classic DSP algorithms |
-| Waveform overview + 3-band detail | Own code | Computed during decode, one pass, stored with the track cache; the UI uploads it to the GPU once |
+| Waveform overview + 3-band detail | Own code | Always computed, for every track, during decode (decided 2026-10-21); see the waveform note under Parity |
 | Loudness | Own code (EBU R128) | Auto-gain on load |
+
+**Status (2026-10-21).** `engine-analysis` has its own backends behind an `Analyzer` trait, scored against a hand-corrected Rekordbox set (162 tracks; Rekordbox keys are taken as ground truth):
+
+| Task | Backend | Result |
+| --- | --- | --- |
+| Tempo | TempoCNN (deeptemp-k16-3, AGPL), ONNX run with tract, refined by gridfit | 94.4 % tempo accuracy; matches Essentia's TempoCNN on 100/100 tracks |
+| Beatgrid | gridfit: constant-tempo grid from folded onset envelopes, phase from log bands below 4.5 kHz | Beat F 0.939, downbeat F 0.607 |
+| Key | hpcpkey, a Rust port of Essentia's KeyExtractor (AGPL file, `hpcpkey` feature) | Same key as Essentia on 162/162 |
+
+A BPM range setting folds octave errors, and MP3 grids are shifted by the gapless start trim, which Rekordbox does not apply. Full plan and numbers: `docs/plan/analysis.md`.
 
 Build a small ground-truth set early (100–200 tracks with Rekordbox grids and keys) and score every analyser against it. The stratum-dsp numbers come from its own README, so treat them as a claim to verify.
 
@@ -203,12 +215,12 @@ Checked against the [XDJ reference spec](https://claude.ai/code/artifact/29b7351
 | Write-back to USB | History (track logged after \~1 min of play), tag list, ratings, memory cues and hot cues saved to the stick; safe eject by USB STOP | A `library` writer behind a queue; written only to our own library on the stick (next section), never to the Rekordbox files. Engine emits play-time events for history |
 | Keep playing without the stick | The reference keeps an emergency loop if the read fails | Free with a fully resident track: pulling the stick only blocks loading and writes. Expose per-chunk "loaded" state in fast state for the cache meter and jog display |
 | Tempo ranges | ±6 % in 0.02 % steps, ±10 % and ±16 % in 0.05 %, WIDE ±100 % in 0.5 % | Fader value quantized to the range's step with hysteresis in the engine, not the firmware. WIDE means rates near 0 and up to 2× with keylock: test stretchers at the extremes, not only near 1.0 |
-| Reverse with keylock | DIRECTION REV, slip reverse | Signalsmith and Rubber Band only run forward. Reverse uses the resampler path (no keylock) unless Bungee handles it |
+| Reverse with keylock | DIRECTION REV, slip reverse | Bungee keeps keylock in reverse (any velocity up to 4× either way); rate 0 and anything faster than 4× use the resampler path |
 | Cue details | Back cue, cue sampler, real-time cue, 0.5-frame (\~6.7 ms) fine adjust, auto cue skipping silence at −36 to −78 dB or first memory cue, hot cue auto load | Transport commands with sample-accurate targets; analysis adds a first-audible-sample per threshold; load sequence applies auto cue and hot cue auto load |
 | Sync extras | INST.D. instant double jumps to the master's position; pitch bend breaks sync; phase meter shows bar and beat offset | `BeatClock` exposes bar phase per deck; jog nudge drops follower mode |
 | Jog scale | One platter turn = 1.8 s of audio (scratch, frame search, centre display) | Fixed counts-per-1.8 s constant in the platter mapping; the GC9A01 indicator uses the same constant |
 
-**3-band waveforms from Rekordbox.** rbox reads all three ANLZ files, including the extended ones that carry colour waveforms. Use those when present and compute your own only for unanalysed tracks.
+**Waveforms: always our own (decided 2026-10-21).** Every track gets its own waveform, computed during decode from exactly the frames the deck plays: three bands of peak level (low < 250 Hz, mid, high > 2.5 kHz, Linkwitz-Riley crossovers) at 150 entries per second, one `u8` per band on a square-root curve, about 135 KB per 5 minutes, stored as a versioned content-addressed blob (crate `waveform`). Rekordbox's 3-band tags (PWV7 detail, PWV6 overview) import entry for entry, but only as a placeholder until ours exists. The display has three modes from the same data (3-band, RGB, single colour), with per-track auto gain and themable colours; the 3-band default is blue low, orange mid, white high (`docs/spikes/waveforms.md`).
 
 ## Own library on the stick
 
@@ -313,6 +325,8 @@ Later backends (Google Drive, OneDrive, WebDAV, S3) only need range reads, file 
 
 License the engine GPL-3.0-or-later. rbox is GPL-3.0-only, so any build that links it must be GPLv3, and every other dependency below is compatible with that.
 
+**AGPL accepted (2026-10-21).** The TempoCNN model (deeptemp-k16-3) and the `hpcpkey` port of Essentia's key extractor are AGPL-3.0. That is compatible with GPL-3.0-or-later; the project accepts it, and the analysis crate's licence reads "GPL-3.0-or-later AND AGPL-3.0-or-later".
+
 | Component | License | Constraint |
 | --- | --- | --- |
 | [rbox](https://docs.rs/crate/rbox/latest) | GPL-3.0-only (earlier 0.1.x releases were MIT/Apache) | Forces GPLv3 for the engine binary |
@@ -346,22 +360,24 @@ Split the engine into crates so that `engine-core` has no I/O and no threads. It
 | Crate | Holds |
 | --- | --- |
 | `engine-core` | Source, Transport, Scaler, mixer, FX, BeatClock; pure and deterministic |
-| `engine-stretch` | `Stretcher` trait; Signalsmith, Bungee, Rubber Band behind features |
+| `engine-stretch` | Bungee Basic, ported to pure Rust (MPL-2.0); the deck's keylock |
 | `engine-io` | `AudioBackend` trait; cpal implementation |
-| `engine-media` | Symphonia decoding, load-time resample, track cache, waveform data |
-| `engine-analysis` | BPM, key, grid, loudness wrappers and the ground-truth scorer |
+| `engine-media` | Symphonia decoding, load-time resample, and a tap that feeds the waveform builder during decode |
+| `engine-analysis` | Analyzer trait and backends (gridfit, TempoCNN via tract, hpcpkey), Rekordbox ground truth and the scorer |
 | `engine-stems` | Separation worker (ort); runs as its own process |
 | `engine-sync` | Link adapter and the unit-to-unit protocol |
 | `library` | Read-only Rekordbox reader (rbox + legacy PDB) and our own library store |
 | `protocol` | Commands, fast-state layout, events (shared with `ui` and `controller-fw`) |
 | `engined` | The daemon binary that wires it all together |
 
+Added since (2026-10-21): `waveform` (3-band data, blob format, display modes, CPU reference renderer; no dependencies) and `ui` (the raw-wgpu UI shell, `dj-ui`).
+
 **Callback budget.** At 128 frames and 48 kHz each callback has 2.67 ms; aim to use at most half, about 1.3 ms, for decks + mixer. How many keylocked stem decks fit in that on a Pi 5 is the main unknown; the spikes answer it.
 
 **Spikes, in order:**
 
 1. **Audio path:** RT kernel + cpal on ALSA `hw:` with an I2S DAC, two decoded decks playing, UI load on the other cores. Log a callback-time histogram and xruns for an hour. Pass: zero xruns at 128 frames.
-2. **Keylock shootout:** Signalsmith (default, cheaper), Bungee, Rubber Band R2 and R3 short-window. Per-deck CPU at 0.92×, 1.0×, 1.08× and the WIDE extremes (0.1×, 2×); latency; blind A/B on ten club tracks; clean under assert\_no\_alloc.
+2. **Keylock shootout:** done on the Mac (2026-10-21): no audible difference, Bungee chosen; Pi CPU still to measure. Planned set: Signalsmith (default, cheaper), Bungee, Rubber Band R2 and R3 short-window. Per-deck CPU at 0.92×, 1.0×, 1.08× and the WIDE extremes (0.1×, 2×); latency; blind A/B on ten club tracks; clean under assert\_no\_alloc.
 3. **Platter loop:** RP2040 + encoder over HID into the engine. Measure hand-to-sound latency with a contact sensor and a mic on the output. Target under 10 ms.
 4. **Rekordbox stick:** load from a real Rekordbox 7 export, play against the ANLZ beatgrid, and check cue offsets on MP3 and AAC files.
 5. **Stems:** two decks × four stems with keylock on the Pi; NI `.stem.mp4` demux through Symphonia; HTDemucs via ort, wall time per track.
