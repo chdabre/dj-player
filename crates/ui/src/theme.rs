@@ -131,9 +131,15 @@ pub struct WaveformTokens {
     /// Opacity of the drawn waveform over its panel and grid (0..=1).
     pub opacity: f32,
     pub center_line: Rgba,
+    /// Beat ticks along the zoom's top and bottom edges.
     pub beat_line: Rgba,
-    /// Downbeats (the first beat of a bar) in the zoom's grid.
+    /// Downbeat (first beat of a bar) ticks.
     pub downbeat_line: Rgba,
+    /// Length of a beat tick from the edge, design pixels.
+    pub tick_length: f32,
+    /// Width of a beat tick and of a downbeat tick.
+    pub tick_width: f32,
+    pub downbeat_tick_width: f32,
     /// The overview's 16-bar ticks.
     pub bar_line: Rgba,
     pub playhead: Rgba,
@@ -226,8 +232,11 @@ impl Theme {
                 background_glow: Rgba::hex(0x1f2430),
                 opacity: 0.7,
                 center_line: Rgba::hex(0x15171b),
-                beat_line: Rgba::hex(0x262a30),
+                beat_line: Rgba::hex(0xffffff),
                 downbeat_line: Rgba::hex(0xd93a3a),
+                tick_length: 12.0,
+                tick_width: 1.5,
+                downbeat_tick_width: 2.5,
                 bar_line: Rgba::hex(0x48505a),
                 playhead: Rgba::hex(0xe6e6e6),
                 cue: amber,

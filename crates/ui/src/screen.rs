@@ -710,20 +710,6 @@ fn zoom(ui: &mut Ui, v: &View) {
     let to_x = |pos: f64| x0 + ((pos - left) / fpp) as f32;
     let visible = |x: f32| x >= x0 && x <= x0 + w;
 
-    if let Some(g) = v.grid {
-        let first = g.beat_at(left).ceil() as i64;
-        let last = g.beat_at(left + span).floor() as i64;
-        for b in first..=last.min(first + 256) {
-            let pos = g.position_of(b as f64);
-            let x = to_x(pos);
-            if g.bar_position(pos + 0.5) == 1 {
-                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.downbeat_line);
-            } else {
-                ui.scene
-                    .fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, wf.beat_line);
-            }
-        }
-    }
     if let Some(wave) = &v.wave {
         let draw = crate::waves::zoom(
             wave.entries,
@@ -756,6 +742,24 @@ fn zoom(ui: &mut Ui, v: &View) {
                     ui.scene.fill(e - 1.0, y0, 2.0, h, edge);
                 }
             }
+        }
+    }
+    // Beat grid: ticks along the top and bottom edges, over the waveform.
+    if let Some(g) = v.grid {
+        let first = g.beat_at(left).ceil() as i64;
+        let last = g.beat_at(left + span).floor() as i64;
+        for b in first..=last.min(first + 256) {
+            let pos = g.position_of(b as f64);
+            let x = to_x(pos);
+            let (color, width) = if g.bar_position(pos + 0.5) == 1 {
+                (wf.downbeat_line, wf.downbeat_tick_width)
+            } else {
+                (wf.beat_line, wf.tick_width)
+            };
+            let len = wf.tick_length;
+            ui.scene.fill(x - width * 0.5, y0, width, len, color);
+            ui.scene
+                .fill(x - width * 0.5, y0 + h - len, width, len, color);
         }
     }
     let cue = to_x(v.cue);

@@ -24,7 +24,7 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
 - **Input:**
   - mouse and touch (winit `Touch`) on SLIP, CALL ◀ ▶ (beat jump ∓4, or loop ½X / 2X in a loop), ZOOM, and the overview for needle search, with drag;
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
-- **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view draws them on the analysed beat grid (bar lines brighter), under the loop, cue, slip shadow and centred playhead. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
+- **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view marks the analysed beat grid with ticks along its top and bottom edges, drawn over the waveform: white for beats, solid red for downbeats. The loop, cue, slip shadow and centred playhead are drawn on top. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
 
 ## Design tokens
 
@@ -44,7 +44,7 @@ Every colour, font size, corner radius and line width the screen uses lives in o
 - **Columns on the CPU, pixels on the GPU.** `waves.rs` builds the columns with the waveform crate's own `display::column`, so modes, gains, themes, layouts and alignment match its reference renderer. Each zoom column covers a fixed slice of the timeline. The columns are placed at their exact fractional position for the interpolated playhead. The waveform shader reads each column's segments (from, to, opacity, colour) from a small float texture. It blends a column's bands in sRGB values, as the reference does, and box-filters across the columns under each pixel. So the zoom scrolls smoothly, with no whole-pixel judder and no shimmer. A test checks that a column keeps its value and moves by exactly the playhead's fraction. The overview caches its per-pixel maxima until the waveform grows.
 - **Defaults:** the zoom is mirrored, with the bands overlaid, and is not dimmed on either side of the playhead (`zoom_dims_played` turns dimming on). The overview is bottom-aligned with the bands stacked (lows on the baseline, as on the CDJ-3000), and its played part dimmed.
 - **Panel:** a vertical gradient behind the waveform, from `background` at the edges to `background_glow` at the baseline (the centre line, or the bottom for a bottom-aligned view). It's theme tokens, drawn by the rectangle pipeline (`Gradient::Mirrored` / `Gradient::Down`). The waveform is drawn at the theme's `opacity` (70 %) over the panel and grid, so the gradient and beat lines show faintly through it.
-- **Paint order:** panel and grid, then the waveform, then the loop, cues, slip shadow and playhead (`Scene` interleaves rectangle batches and waveform draws).
+- **Paint order:** panel, then the waveform, then the beat ticks, loop, cues, slip shadow and playhead (`Scene` interleaves rectangle batches and waveform draws).
 - **Cost:** with both waveforms the main screen takes about 1.2 ms of CPU per frame at 120 fps on the M1 Max (0.8 ms without). Building the columns is about 0.1 ms of that.
 
 ## Measurements (Mac)
