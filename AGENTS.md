@@ -38,7 +38,7 @@ Known gap (2026-10-21): `docs/research/findings.md` predates these decisions, an
 
 ## Current step
 
-Designing our own library format (the overlay library on the stick or a cloud folder: snapshot + per-device journals + content-addressed blobs), so that cues, analysis and waveforms persist. Earlier steps:
+Designing our own library format (the overlay library on the stick or a cloud folder: snapshot + per-device journals + content-addressed blobs), so that cues, analysis and waveforms persist. Draft: [`docs/plan/library.md`](docs/plan/library.md). Earlier steps:
 
 - **Step 1:** code-complete ([`docs/plan/step-1.md`](docs/plan/step-1.md)).
 - **Step 2:** the engine part is done; known gaps are in its Status section ([`docs/plan/step-2.md`](docs/plan/step-2.md)). Analysis work is in [`docs/plan/analysis.md`](docs/plan/analysis.md).
