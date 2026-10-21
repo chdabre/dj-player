@@ -1,0 +1,13 @@
+[package]
+name = "waveform"
+description = "Track waveforms: 3-band peak data, its blob encoding, display modes and a CPU reference renderer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
