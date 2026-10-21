@@ -43,7 +43,7 @@ Designing our own library format (the overlay library on the stick or a cloud fo
 - **Step 1:** code-complete ([`docs/plan/step-1.md`](docs/plan/step-1.md)).
 - **Step 2:** the engine part is done; known gaps are in its Status section ([`docs/plan/step-2.md`](docs/plan/step-2.md)). Analysis work is in [`docs/plan/analysis.md`](docs/plan/analysis.md).
 - **UI shell spike:** the main screen at 1024×600 with real waveforms ([`docs/spikes/ui-shell.md`](docs/spikes/ui-shell.md)).
-- **In progress elsewhere:** the Bungee keylock port to pure Rust, in a separate session.
+- **Keylock:** Bungee Basic ported to pure Rust is the only keylock (PR #2); Signalsmith is gone.
 
 ## Working conventions
 
