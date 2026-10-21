@@ -4,7 +4,9 @@
 
 - Rust stable via rustup (`rustup default stable`).
 - Xcode command line tools (`xcode-select --install`) and CMake (`brew install cmake`, ≥ 3.30), for the keylock shootout spike, which builds the C++ Bungee with CMake and Rubber Band's bindings with bindgen (libclang).
-- Build and run: `cargo run -p engined --release -- <path to audio file>`.
+- Build and run: `cargo run -p engined --release -- <path to audio file>` (terminal), or `cargo run -p ui --release -- <file>` for the UI shell at 1024×600.
+- UI options: `--fullscreen`, `--theme <name>`, `--wave-theme default|findings|spectrum|blended`, `--wave-mode 3band|rgb|single`, `--at <seconds>`, `--play`, `--run-for <seconds>` (timing runs), `--screenshot <out.png>` (renders the frame offscreen at exactly 1024×600 once the track is decoded and analysed, then exits). Frame timing prints every 2 s; `d` toggles the overlay.
+- Waveform previews without the UI: `cargo run --release -p waveform --bin waveform-preview -- <file> --out <dir>` (`--theme`, `--synth track|tones|sweep`).
 - Options: `--list-devices`, `--device <id or name substring>`, `--buffer <frames>` (e.g. `--buffer 128`; must be in the device's supported range).
 - Debug builds (`cargo run -p engined -- <file>`) install `assert_no_alloc`'s allocator and abort if the audio callback allocates. Use them to check new callback code; use `--release` for listening and load numbers.
 - Before every commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.

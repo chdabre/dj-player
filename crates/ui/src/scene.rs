@@ -36,6 +36,15 @@ pub struct Rect {
     pub border: f32,
     pub fill: Rgba,
     pub stroke: Rgba,
+    /// A vertical gradient from `fill` to this colour, if any.
+    pub gradient: Option<(Rgba, Gradient)>,
+}
+
+/// How a gradient runs: from the top down, or from both edges to the centre line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gradient {
+    Down,
+    Mirrored,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,6 +103,7 @@ impl Scene {
             border: 0.0,
             fill: color,
             stroke: Rgba::TRANSPARENT,
+            gradient: None,
         });
     }
 
@@ -118,6 +128,34 @@ impl Scene {
             border,
             fill,
             stroke,
+            gradient: None,
+        });
+    }
+
+    /// A rectangle filled with a vertical gradient from `from` (top, or edges) to `to`
+    /// (bottom, or centre line).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        from: Rgba,
+        to: Rgba,
+        kind: Gradient,
+    ) {
+        self.rects.push(Rect {
+            x,
+            y,
+            w,
+            h,
+            radius,
+            border: 0.0,
+            fill: from,
+            stroke: Rgba::TRANSPARENT,
+            gradient: Some((to, kind)),
         });
     }
 

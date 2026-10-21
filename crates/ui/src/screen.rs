@@ -9,9 +9,9 @@
 
 use engine_core::DeckGrid;
 
-use crate::scene::{Align, Rgba, Scene, Text, Weight};
+use crate::scene::{Align, Gradient, Rgba, Scene, Text, Weight};
 use crate::theme::Theme;
-use crate::waves::{OverviewCache, WaveSettings};
+use crate::waves::{OverviewCache, WaveDraw, WaveSettings};
 
 /// Things on screen that can be touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -672,21 +672,33 @@ fn meter(ui: &mut Ui, x: f32, y: f32, active: Option<u8>, filled: bool) {
     }
 }
 
+/// The panel behind a waveform: a gradient towards the waveform's baseline (the centre line
+/// for a mirrored view, the bottom for a bottom-aligned one).
+fn panel(ui: &mut Ui, (x, y, w, h): (f32, f32, f32, f32), align: Option<crate::waves::Align>) {
+    let t = ui.t;
+    let wf = &t.waveform;
+    let kind = match align {
+        Some(crate::waves::Align::Bottom) => Gradient::Down,
+        _ => Gradient::Mirrored,
+    };
+    ui.scene.gradient(
+        x,
+        y,
+        w,
+        h,
+        t.shape.panel_radius,
+        wf.background,
+        wf.background_glow,
+        kind,
+    );
+}
+
 /// Zoomed view around the playhead: beat grid, loop, cue, hot cue strip, playhead.
 fn zoom(ui: &mut Ui, v: &View) {
     let t = ui.t;
     let wf = &t.waveform;
     let (x0, y0, w, h) = ZOOM;
-    ui.scene.rounded(
-        x0,
-        y0,
-        w,
-        h,
-        t.shape.panel_radius,
-        wf.background,
-        0.0,
-        wf.background,
-    );
+    panel(ui, ZOOM, v.wave.map(|w| w.settings.zoom_align));
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
     // Frames per design pixel.
     let span = match v.grid {
@@ -698,20 +710,6 @@ fn zoom(ui: &mut Ui, v: &View) {
     let to_x = |pos: f64| x0 + ((pos - left) / fpp) as f32;
     let visible = |x: f32| x >= x0 && x <= x0 + w;
 
-    if let Some(g) = v.grid {
-        let first = g.beat_at(left).ceil() as i64;
-        let last = g.beat_at(left + span).floor() as i64;
-        for b in first..=last.min(first + 256) {
-            let pos = g.position_of(b as f64);
-            let x = to_x(pos);
-            if g.bar_position(pos + 0.5) == 1 {
-                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.bar_line);
-            } else {
-                ui.scene
-                    .fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, wf.beat_line);
-            }
-        }
-    }
     if let Some(wave) = &v.wave {
         let draw = crate::waves::zoom(
             wave.entries,
@@ -722,7 +720,10 @@ fn zoom(ui: &mut Ui, v: &View) {
             &wave.settings,
             &wave.style,
         );
-        ui.scene.waveform(draw);
+        ui.scene.waveform(WaveDraw {
+            opacity: wf.opacity,
+            ..draw
+        });
     }
     if v.looping || v.loop_end > v.loop_start {
         let (a, b) = (to_x(v.loop_start).max(x0), to_x(v.loop_end).min(x0 + w));
@@ -741,6 +742,24 @@ fn zoom(ui: &mut Ui, v: &View) {
                     ui.scene.fill(e - 1.0, y0, 2.0, h, edge);
                 }
             }
+        }
+    }
+    // Beat grid: ticks along the top and bottom edges, over the waveform.
+    if let Some(g) = v.grid {
+        let first = g.beat_at(left).ceil() as i64;
+        let last = g.beat_at(left + span).floor() as i64;
+        for b in first..=last.min(first + 256) {
+            let pos = g.position_of(b as f64);
+            let x = to_x(pos);
+            let (color, width) = if g.bar_position(pos + 0.5) == 1 {
+                (wf.downbeat_line, wf.downbeat_tick_width)
+            } else {
+                (wf.beat_line, wf.tick_width)
+            };
+            let len = wf.tick_length;
+            ui.scene.fill(x - width * 0.5, y0, width, len, color);
+            ui.scene
+                .fill(x - width * 0.5, y0 + h - len, width, len, color);
         }
     }
     let cue = to_x(v.cue);
@@ -923,16 +942,7 @@ fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let t = ui.t;
     let wf = &t.waveform;
     let (x0, y0, w, h) = OVERVIEW;
-    ui.scene.rounded(
-        x0,
-        y0,
-        w,
-        h,
-        t.shape.panel_radius,
-        wf.background,
-        0.0,
-        wf.background,
-    );
+    panel(ui, OVERVIEW, v.wave.map(|w| w.settings.overview_align));
     if v.length > 0.0 {
         let to_x = |pos: f64| x0 + (pos / v.length).clamp(0.0, 1.0) as f32 * w;
         if let Some(wave) = &v.wave {
@@ -945,7 +955,10 @@ fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
                 &wave.settings,
                 &wave.style,
             );
-            ui.scene.waveform(draw);
+            ui.scene.waveform(WaveDraw {
+                opacity: wf.opacity,
+                ..draw
+            });
         }
         if v.loaded_fraction < 1.0 {
             let lx = to_x(v.loaded_fraction * v.length);

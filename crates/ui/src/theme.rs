@@ -124,9 +124,23 @@ pub struct WaveformTokens {
     /// Palettes, gains and dimming of the waveform (the waveform crate's theme). The track
     /// gain inside it is set per track at run time.
     pub style: waveform::display::Style,
+    /// The panel behind the waveform: a vertical gradient from `background` at the edges
+    /// (top, for a bottom-aligned view) to `background_glow` at the baseline.
     pub background: Rgba,
+    pub background_glow: Rgba,
+    /// Opacity of the drawn waveform over its panel and grid (0..=1).
+    pub opacity: f32,
     pub center_line: Rgba,
+    /// Beat ticks along the zoom's top and bottom edges.
     pub beat_line: Rgba,
+    /// Downbeat (first beat of a bar) ticks.
+    pub downbeat_line: Rgba,
+    /// Length of a beat tick from the edge, design pixels.
+    pub tick_length: f32,
+    /// Width of a beat tick and of a downbeat tick.
+    pub tick_width: f32,
+    pub downbeat_tick_width: f32,
+    /// The overview's 16-bar ticks.
     pub bar_line: Rgba,
     pub playhead: Rgba,
     pub cue: Rgba,
@@ -215,8 +229,14 @@ impl Theme {
             waveform: WaveformTokens {
                 style: waveform::display::Style::default(),
                 background: Rgba::hex(0x07080a),
+                background_glow: Rgba::hex(0x1f2430),
+                opacity: 0.7,
                 center_line: Rgba::hex(0x15171b),
-                beat_line: Rgba::hex(0x262a30),
+                beat_line: Rgba::hex(0xffffff),
+                downbeat_line: Rgba::hex(0xd93a3a),
+                tick_length: 12.0,
+                tick_width: 1.5,
+                downbeat_tick_width: 2.5,
                 bar_line: Rgba::hex(0x48505a),
                 playhead: Rgba::hex(0xe6e6e6),
                 cue: amber,
