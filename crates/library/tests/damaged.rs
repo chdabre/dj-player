@@ -267,3 +267,105 @@ fn an_operation_with_a_header_like_field_stays_an_operation() {
     let d = codec::decode(codec::frame(&op.to_json()).as_bytes());
     assert_eq!(d.lines, vec![Line::Op(op)]);
 }
+
+#[test]
+fn a_trusted_clock_does_not_follow_a_fast_one() {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    const NOW: u64 = 1_800_000_000_000; // 2027
+    let s = Arc::new(MemStore::new());
+    let mut lib = mount(&s, 1);
+    let t = lib.find_or_create(file("x.mp3", b"x")).track;
+    lib.flush();
+    drop(lib);
+    // A device whose clock ran two days fast left an edit.
+    let fast = Stamp {
+        hlc: Hlc::new(NOW + 2 * DAY, 0),
+        device: dev(9),
+    };
+    let op = Op::set(fast, format!("track/{t}/rating"), 5.into());
+    s.put(&segment_path(9, 1), segment(9, 1, &[op]));
+    let opts = |trusted| MountOptions {
+        now: || NOW,
+        trusted_clock: trusted,
+        ..MountOptions::new(dev(2))
+    };
+    let mut trusted = Library::mount(Arc::clone(&s), opts(true)).unwrap();
+    assert!(
+        trusted.hlc() < fast.hlc,
+        "the trusted clock stays near its own time"
+    );
+    assert!(trusted.take_warnings().iter().any(|w| w.contains("ahead")));
+    // The merge is the same for everyone: the fast edit is still there.
+    assert_eq!(trusted.track(t).unwrap().rating, Some(5));
+    let untrusted = Library::mount(Arc::clone(&s), opts(false)).unwrap();
+    assert!(
+        untrusted.hlc() >= fast.hlc,
+        "without a trusted clock it follows the library"
+    );
+}
+
+#[test]
+fn a_ram_only_library_says_its_edits_are_unsaved() {
+    let s = Arc::new(MemStore::new());
+    let mut lib = mount(&s, 1);
+    lib.keep_in_ram("no library: --no-library");
+    let t = lib.find_or_create(file("x.mp3", b"x")).track;
+    lib.apply(Edit::SetRating(t, Some(3))).unwrap();
+    assert!(matches!(
+        lib.persistence(),
+        library::Persistence::Unsaved { edits: 2, .. }
+    ));
+    assert!(s.list(&format!("journal/{}", dev(1))).unwrap().is_empty());
+}
+
+#[test]
+fn another_program_writing_as_this_device_keeps_edits_in_ram() {
+    let dir = std::env::temp_dir().join(format!("library-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut lib = Library::mount(FolderStore::new(&dir), MountOptions::new(dev(1))).unwrap();
+    let t = lib.find_or_create(file("x.mp3", b"x")).track;
+    lib.flush();
+    // Two libraries in one process share the lock (and their stamps).
+    let mut same = Library::mount(FolderStore::new(&dir), MountOptions::new(dev(1))).unwrap();
+    same.apply(Edit::SetRating(t, Some(1))).unwrap();
+    assert!(same.is_writable());
+    drop((lib, same));
+    // Another program holds it: its own open file, not this process's shared one.
+    let held = std::fs::File::open(dir.join(format!("journal/{}/writer.lock", dev(1)))).unwrap();
+    held.try_lock().unwrap();
+    let mut lib = Library::mount(FolderStore::new(&dir), MountOptions::new(dev(1))).unwrap();
+    lib.apply(Edit::SetRating(t, Some(2))).unwrap();
+    match lib.persistence() {
+        library::Persistence::Unsaved { reason, .. } => assert!(reason.contains("another program")),
+        p => panic!("{p:?}"),
+    }
+    assert_eq!(lib.track(t).unwrap().rating, Some(2), "kept in RAM");
+    drop(held);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn leftovers_of_interrupted_writes_are_swept() {
+    let dir = std::env::temp_dir().join(format!("library-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tmp")).unwrap();
+    let old = dir.join("tmp/1234-0.tmp");
+    std::fs::write(&old, b"half a snapshot").unwrap();
+    let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(two_hours_ago)
+        .unwrap();
+    let fresh = dir.join("tmp/5678-0.tmp");
+    std::fs::write(&fresh, b"being written now").unwrap();
+    let mut lib = Library::mount(FolderStore::new(&dir), MountOptions::new(dev(1))).unwrap();
+    assert!(!old.exists(), "an old leftover is removed");
+    assert!(
+        fresh.exists(),
+        "a file a live writer may still be using stays"
+    );
+    assert!(lib.take_warnings().iter().any(|w| w.contains("leftover")));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

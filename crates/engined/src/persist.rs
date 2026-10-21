@@ -24,8 +24,10 @@ pub const LIBRARY_DIR: &str = "DJPLAYER";
 /// Which library the player mounts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LibraryChoice {
-    /// `DJPLAYER/` at the root of the track's volume, if it can be written (or exists, then
-    /// read-only); otherwise RAM only.
+    /// `DJPLAYER/` at the root of the track's volume if that is removable (a USB stick or SD
+    /// card) and can be written (or the folder exists, then read-only); otherwise RAM only.
+    /// Never internal storage: an internal-storage library is given as a
+    /// [`LibraryChoice::Folder`].
     #[default]
     Auto,
     /// This library folder (the `DJPLAYER/` folder itself), made if missing.
@@ -70,6 +72,8 @@ pub enum Reply {
     Loaded(Box<Loaded>),
     /// The library could not be mounted; nothing will be stored or restored.
     Failed(String),
+    /// Whether edits reach the store, whenever it changes.
+    Status(Persistence),
 }
 
 /// The library worker of one loaded track.
@@ -215,6 +219,11 @@ fn run(
         identity,
     ))));
 
+    let mut status = Status {
+        replies: replies.clone(),
+        last: None,
+    };
+    report(&mut loc.lib, &say, &mut status);
     let mut deadline: Option<Instant> = None;
     loop {
         let req = match deadline {
@@ -231,7 +240,7 @@ fn run(
         let Some(req) = req else {
             loc.lib.flush();
             deadline = None;
-            report(&mut loc.lib, &say);
+            report(&mut loc.lib, &say, &mut status);
             continue;
         };
         match req {
@@ -262,6 +271,7 @@ fn run(
                 let r = WaveformRef {
                     blob: loc.lib.put_blob(&detail),
                     overview_blob: loc.lib.put_blob(&overview),
+                    extra: Default::default(),
                 };
                 if let Err(e) = loc.lib.apply(Edit::SetWaveform(track, r)) {
                     say(format!("library: {e}"));
@@ -275,6 +285,7 @@ fn run(
                         params: f.params,
                         blob: loc.lib.put_blob(&f.blob),
                         created: library::rfc3339(library::system_ms()),
+                        extra: Default::default(),
                     };
                     if let Err(e) = loc.lib.apply(Edit::SetAnalysis(track, f.name, a)) {
                         say(format!("library: {e}"));
@@ -283,16 +294,27 @@ fn run(
                 loc.lib.flush();
             }
         }
-        report(&mut loc.lib, &say);
+        report(&mut loc.lib, &say, &mut status);
     }
     loc.lib.flush();
-    report(&mut loc.lib, &say);
+    report(&mut loc.lib, &say, &mut status);
 }
 
-fn report(lib: &mut Library, say: &dyn Fn(String)) {
+fn report(lib: &mut Library, say: &dyn Fn(String), status: &mut Status) {
     for w in lib.take_warnings() {
         say(format!("library: {w}"));
     }
+    let now = lib.persistence();
+    if status.last.as_ref() != Some(&now) {
+        let _ = status.replies.send(Reply::Status(now.clone()));
+        status.last = Some(now);
+    }
+}
+
+/// The last persistence sent to the player.
+struct Status {
+    replies: Sender<Reply>,
+    last: Option<Persistence>,
 }
 
 /// The record of `track`, with its stored waveform and analysis blobs read.
@@ -300,6 +322,7 @@ fn loaded(lib: &mut Library, track: library::TrackId, file_hash: FileHash) -> Lo
     let record = lib.track(track).unwrap_or_else(|| empty_track(track));
     let waveform = record
         .waveform
+        .as_ref()
         .and_then(|w| lib.read_blob(w.blob).ok())
         .and_then(|b| Waveform::from_blob(&b).ok());
     let analysis = record
@@ -389,9 +412,62 @@ fn volume_root(file: &Path) -> PathBuf {
     }
 }
 
+/// True if `root` (a mount point) is a removable volume: a USB or SD-card device that is not
+/// the disk the system runs from. On macOS, a volume under `/Volumes`.
+fn is_removable(root: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // The disk (not the partition) a path's file system lives on, from sysfs.
+        let disk = |p: &Path| -> Option<PathBuf> {
+            let dev = std::fs::metadata(p).ok()?.dev();
+            let (major, minor) = ((dev >> 8) & 0xfff, (dev & 0xff) | ((dev >> 12) & 0xfff00));
+            let sys = std::fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+            Some(if sys.join("partition").exists() {
+                sys.parent()?.to_path_buf()
+            } else {
+                sys
+            })
+        };
+        let Some(d) = disk(root) else {
+            return false;
+        };
+        if disk(Path::new("/")).is_some_and(|r| r == d) {
+            return false;
+        }
+        let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let flagged = std::fs::read_to_string(d.join("removable")).is_ok_and(|s| s.trim() == "1");
+        flagged || d.to_string_lossy().contains("/usb") || name.starts_with("mmcblk")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        abs.starts_with("/Volumes") && abs != Path::new("/")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = root;
+        false
+    }
+}
+
+/// True if the system clock is known to be right: on Linux, systemd says it is
+/// NTP-synchronised; macOS keeps its clock synchronised. Anything else (a Pi without network
+/// and without an RTC battery) is not trusted.
+fn clock_is_trusted() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    std::process::Command::new("timedatectl")
+        .args(["show", "-p", "NTPSynchronized", "--value"])
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"yes")
+}
+
 fn mount_options(device: DeviceId, read_only: bool) -> MountOptions {
     MountOptions {
         read_only,
+        trusted_clock: clock_is_trusted(),
         device_info: serde_json::json!({ "name": "engined", "model": "dev" }),
         ..MountOptions::new(device)
     }
@@ -403,8 +479,10 @@ fn mount_folder(dir: &Path, device: DeviceId, read_only: bool) -> Result<Library
 }
 
 fn ram(device: DeviceId, why: String) -> Located {
-    let lib = Library::mount(MemStore::new(), mount_options(device, false))
+    let mut lib = Library::mount(MemStore::new(), mount_options(device, false))
         .expect("an empty RAM library always mounts");
+    // Nothing reaches a stick: say so, edit by edit.
+    lib.keep_in_ram(format!("no library: {why}"));
     Located {
         lib,
         root: None,
@@ -433,8 +511,19 @@ fn locate(choice: &LibraryChoice, file: &Path, device: DeviceId) -> Result<Locat
         LibraryChoice::Folder(dir) => folder(dir),
         LibraryChoice::Auto => {
             let root = volume_root(file);
+            if !is_removable(&root) {
+                return Ok(ram(
+                    device,
+                    format!(
+                        "{} is not a removable volume; use --library <dir>",
+                        root.display()
+                    ),
+                ));
+            }
             let dir = root.join(LIBRARY_DIR);
-            if dir.is_dir() || (writable(&root) && std::fs::create_dir(&dir).is_ok()) {
+            // Making the folder is the write test at the stick's root; nothing else is written
+            // outside it.
+            if dir.is_dir() || std::fs::create_dir(&dir).is_ok() {
                 folder(&dir)
             } else {
                 Ok(ram(
@@ -504,6 +593,16 @@ mod tests {
         let outside = stored_path(&f, Some(&dir.join("elsewhere")));
         assert!(outside.ends_with("/Music/a.mp3") && outside.starts_with('/'));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_system_disk_is_not_removable() {
+        assert!(!is_removable(Path::new("/")));
+        let here = std::env::current_dir().unwrap();
+        // A checkout on the system disk; CI and dev machines alike.
+        if volume_root(&here.join("Cargo.toml")) == Path::new("/") {
+            assert!(!is_removable(&volume_root(&here.join("Cargo.toml"))));
+        }
     }
 
     #[test]

@@ -75,12 +75,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     params: "default".into(),
                     blob: fake_blob(i, name),
                     created: library::rfc3339(library::system_ms()),
+                    extra: Default::default(),
                 };
                 lib.apply(Edit::SetAnalysis(id, name.into(), a))?;
             }
             let w = WaveformRef {
                 blob: fake_blob(i, "detail"),
                 overview_blob: fake_blob(i, "overview"),
+                extra: Default::default(),
             };
             lib.apply(Edit::SetWaveform(id, w))?;
         }

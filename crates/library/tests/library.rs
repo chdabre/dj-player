@@ -200,6 +200,7 @@ fn cues_hot_cues_rating_analysis_and_waveform_persist() {
         params: "p".into(),
         blob,
         created: library::rfc3339(0),
+        extra: Default::default(),
     };
     lib.apply(Edit::SetAnalysis(t, "gridfit".into(), a.clone()))
         .unwrap();
@@ -210,8 +211,9 @@ fn cues_hot_cues_rating_analysis_and_waveform_persist() {
     let w = WaveformRef {
         blob: lib.put_blob(b"detail"),
         overview_blob: lib.put_blob(b"overview"),
+        extra: Default::default(),
     };
-    lib.apply(Edit::SetWaveform(t, w)).unwrap();
+    lib.apply(Edit::SetWaveform(t, w.clone())).unwrap();
     assert_eq!(lib.persistence(), Persistence::Pending);
     lib.flush();
     assert_eq!(lib.persistence(), Persistence::Saved);

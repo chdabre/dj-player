@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+/// Held while a library journals as one device; dropping it releases the lock.
+pub type WriterLock = Box<dyn std::any::Any + Send>;
+
 pub trait Store: Send {
     /// Names of the entries directly in `dir` (files and folders), sorted. A missing folder
     /// is empty.
@@ -37,6 +40,18 @@ pub trait Store: Send {
     fn remove(&self, path: &str) -> io::Result<()>;
     /// Make what was appended to `path` durable.
     fn flush(&self, path: &str) -> io::Result<()>;
+    /// Remove what crashed writes left in `tmp/` (only files no live writer can still be
+    /// using). Returns how many were removed.
+    fn sweep_tmp(&self) -> io::Result<usize> {
+        Ok(0)
+    }
+    /// Take the writer lock at `path` (a file in the device's journal folder), so two
+    /// programs can't journal as one device into one library at once. `Ok(None)` if another
+    /// program holds it. Libraries in one process share it (they share their stamps). The
+    /// system releases it if the program dies, so it never goes stale.
+    fn lock_writer(&self, _path: &str) -> io::Result<Option<WriterLock>> {
+        Ok(Some(Box::new(())))
+    }
 }
 
 impl<S: Store + Sync + ?Sized> Store for std::sync::Arc<S> {
@@ -63,6 +78,12 @@ impl<S: Store + Sync + ?Sized> Store for std::sync::Arc<S> {
     }
     fn flush(&self, path: &str) -> io::Result<()> {
         (**self).flush(path)
+    }
+    fn sweep_tmp(&self) -> io::Result<usize> {
+        (**self).sweep_tmp()
+    }
+    fn lock_writer(&self, path: &str) -> io::Result<Option<WriterLock>> {
+        (**self).lock_writer(path)
     }
 }
 
@@ -207,13 +228,40 @@ impl FolderStore {
         Ok(self.root.join(path))
     }
 
-    fn make_parent(p: &Path) -> io::Result<()> {
-        match p.parent() {
-            Some(dir) => std::fs::create_dir_all(dir),
-            None => Ok(()),
+    /// Make `p`'s folder (and any missing above it, inside the root), syncing the folder
+    /// entries of the ones it made.
+    fn make_parent(&self, p: &Path) -> io::Result<()> {
+        let Some(dir) = p.parent() else {
+            return Ok(());
+        };
+        if dir.is_dir() {
+            return Ok(());
         }
+        std::fs::create_dir_all(dir)?;
+        for d in dir.ancestors().skip(1) {
+            sync_dir(d);
+            if d == self.root || !d.starts_with(&self.root) {
+                break;
+            }
+        }
+        Ok(())
     }
 }
+
+/// Make a folder's entries (a rename or a new file in it) durable. Best effort: some
+/// systems can't open a folder for syncing, and the data itself is already synced.
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// Writer locks this process holds, by file: a second library in the same process shares
+/// the first one's instead of being refused by its own process's lock.
+static HELD: Mutex<BTreeMap<PathBuf, std::sync::Weak<std::fs::File>>> = Mutex::new(BTreeMap::new());
+
+/// A file in `tmp/` this old can't belong to a write still in progress.
+const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl Store for FolderStore {
     fn list(&self, dir: &str) -> io::Result<Vec<String>> {
@@ -261,17 +309,22 @@ impl Store for FolderStore {
 
     fn append_new(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         let p = self.full(path)?;
-        Self::make_parent(&p)?;
+        self.make_parent(&p)?;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(p)?;
-        f.write_all(bytes)
+            .open(&p)?;
+        f.write_all(bytes)?;
+        // The new file's folder entry, so a flushed segment is found after a power cut.
+        if let Some(dir) = p.parent() {
+            sync_dir(dir);
+        }
+        Ok(())
     }
 
     fn append(&self, path: &str, bytes: &[u8]) -> io::Result<()> {
         let p = self.full(path)?;
-        Self::make_parent(&p)?;
+        self.make_parent(&p)?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -287,7 +340,7 @@ impl Store for FolderStore {
                 path.to_owned(),
             ));
         }
-        Self::make_parent(&p)?;
+        self.make_parent(&p)?;
         let tmp_dir = self.root.join("tmp");
         std::fs::create_dir_all(&tmp_dir)?;
         let n = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
@@ -297,7 +350,12 @@ impl Store for FolderStore {
             f.write_all(bytes)?;
             f.sync_all()?;
             drop(f);
-            std::fs::rename(&tmp, &p)
+            std::fs::rename(&tmp, &p)?;
+            // The rename itself must survive a power cut too.
+            if let Some(dir) = p.parent() {
+                sync_dir(dir);
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -314,6 +372,52 @@ impl Store for FolderStore {
             .append(true)
             .open(self.full(path)?)?
             .sync_all()
+    }
+
+    fn lock_writer(&self, path: &str) -> io::Result<Option<WriterLock>> {
+        let p = self.full(path)?;
+        self.make_parent(&p)?;
+        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(f) = held.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(Some(Box::new(f)));
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&p)?;
+        match f.try_lock() {
+            Ok(()) => {
+                let f = std::sync::Arc::new(f);
+                held.insert(key, std::sync::Arc::downgrade(&f));
+                Ok(Some(Box::new(f)))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    fn sweep_tmp(&self) -> io::Result<usize> {
+        let dir = self.root.join("tmp");
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut removed = 0;
+        for entry in rd {
+            let entry = entry?;
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age >= STALE_TMP));
+            if stale && entry.file_type().is_ok_and(|t| t.is_file()) {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 }
 

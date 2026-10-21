@@ -40,6 +40,7 @@ fn wait_loaded(w: &LibraryWorker) -> Loaded {
             Some(Reply::Loaded(l)) => return *l,
             Some(Reply::Failed(e)) => panic!("{e}"),
             Some(Reply::Message(m)) => eprintln!("{m}"),
+            Some(Reply::Status(_)) => {}
             None => std::thread::sleep(Duration::from_millis(5)),
         }
     }

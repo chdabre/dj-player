@@ -29,6 +29,7 @@ use engine_io::{AudioBackend, AudioStream, CpalBackend, CpalStream, StreamFormat
 use library::{AnalysisRef, AudioHash, Cue, CueKind, Edit, HotCue, Track, TrackRef};
 use waveform::compute::{Builder, Entry, Origin, Params, Timeline, Waveform};
 
+pub use library::Persistence;
 pub use persist::LibraryChoice;
 use persist::{FreshAnalysis, LibraryWorker, Loaded, Reply};
 
@@ -40,6 +41,42 @@ pub const DECK: usize = 0;
 pub struct Options {
     pub settings: engine_analysis::Settings,
     pub library: LibraryChoice,
+    pub auto_cue: AutoCue,
+}
+
+/// Where the cue point goes when a track loads: the first stored memory cue if there is
+/// one; else, with auto cue on, the first sound at or above the level; else no cue point,
+/// the playhead at the track start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AutoCue {
+    Off,
+    /// Peak level in dBFS (the reference player offers −36 to −78 dB).
+    Level(f32),
+}
+
+impl Default for AutoCue {
+    fn default() -> Self {
+        AutoCue::Level(-36.0)
+    }
+}
+
+impl AutoCue {
+    /// `off`, or a level in dB (`-36`, `-48`, …).
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "off" {
+            return Some(AutoCue::Off);
+        }
+        let db: f32 = s.trim_end_matches("dB").parse().ok()?;
+        (db.is_finite() && db <= 0.0).then_some(AutoCue::Level(db))
+    }
+
+    /// The linear peak that counts as sound, if auto cue is on.
+    fn threshold(self) -> Option<f32> {
+        match self {
+            AutoCue::Off => None,
+            AutoCue::Level(db) => Some(10f32.powf(db / 20.0)),
+        }
+    }
 }
 
 pub struct Player {
@@ -60,6 +97,8 @@ pub struct Player {
     waveform: Arc<LiveWaveform>,
     library: Option<LibraryWorker>,
     lib: LibState,
+    auto_cue: AutoCue,
+    persistence: Option<Persistence>,
 }
 
 /// What the player knows about the track's library record.
@@ -71,8 +110,15 @@ struct LibState {
     /// Hot cues (frames) as the library gave them, and as last seen on the deck.
     restored: [Option<f64>; HOT_CUES],
     known: [Option<f64>; HOT_CUES],
+    /// The library's hot cues per slot, so a deck edit (a new position) keeps the rest:
+    /// end, colour, comment and fields this version doesn't know.
+    records: [Option<HotCue>; HOT_CUES],
     /// The waveform is stored, or was sent to be stored.
     waveform_stored: bool,
+    /// Memory cues in the record, once the library answered.
+    memory_cues: Option<usize>,
+    /// The load-time cue point is decided (a memory cue, the first sound, or none).
+    cue_decided: bool,
 }
 
 impl Player {
@@ -100,7 +146,8 @@ impl Player {
         // The device decides the engine rate; tracks are resampled to it at load.
         let format = backend.format(request)?;
         let waveform = Arc::new(LiveWaveform::default());
-        let tap = WaveTap::new(format.sample_rate, Arc::clone(&waveform));
+        let tap = WaveTap::new(format.sample_rate, Arc::clone(&waveform))
+            .with_first_sound(options.auto_cue.threshold());
         let loading = engine_media::load_file_tapped(file, format.sample_rate, Some(tap.boxed()))?;
         waveform.set_timeline(Timeline {
             // Our decoder trims gapless padding: entry 0 is the deck's frame 0.
@@ -140,11 +187,18 @@ impl Player {
             waveform,
             library,
             lib: LibState::default(),
+            auto_cue: options.auto_cue,
+            persistence: None,
         };
         if player.library.is_none() {
             player.start_analysis(BTreeMap::new(), false);
         }
         Ok(player)
+    }
+
+    /// Whether the library is saving this deck's edits; `None` until it has said.
+    pub fn persistence(&self) -> Option<&Persistence> {
+        self.persistence.as_ref()
     }
 
     pub fn device_name(&self) -> &str {
@@ -244,6 +298,7 @@ impl Player {
             self.lib.serial = serial;
             self.lib.restored = hot;
             self.lib.known = hot;
+            self.lib.records = std::array::from_fn(|i| record.hot_cues.get(i).cloned().flatten());
         }
         sent
     }
@@ -251,6 +306,9 @@ impl Player {
     fn on_loaded(&mut self, l: Loaded, lines: &mut Vec<String>) {
         let first = self.lib.track.is_none();
         self.lib.track = Some(l.track);
+        if first {
+            self.lib.memory_cues = Some(l.record.cues.len());
+        }
         let hot = l.record.hot_cues.iter().flatten().count();
         let cues = l.record.cues.len();
         // The first restore only fills what the DJ hasn't set while the library was being
@@ -287,6 +345,51 @@ impl Player {
         }
     }
 
+    /// The load-time cue point when the track has no memory cue: the first sound, with auto
+    /// cue on. Waits for the library's answer (a stored memory cue wins) unless there is no
+    /// library. Only fills: a cue point the DJ set meanwhile stays.
+    fn apply_auto_cue(&mut self, lines: &mut Vec<String>) {
+        if self.lib.cue_decided {
+            return;
+        }
+        let memory = match (self.library.is_some(), self.lib.memory_cues) {
+            (true, None) => return, // still waiting for the record
+            (_, Some(n)) => n,
+            (false, None) => 0,
+        };
+        if memory > 0 || self.auto_cue == AutoCue::Off {
+            self.lib.cue_decided = true;
+            return;
+        }
+        let Some(first) = self.waveform.first_sound() else {
+            return;
+        };
+        self.lib.cue_decided = true;
+        let Some(at) = first else {
+            return; // silent all through: no cue point
+        };
+        let serial = self.lib.serial + 1;
+        let sent = self.send(DeckCommand::SetCues {
+            source_id: self.source.id(),
+            serial,
+            cues: TrackCues {
+                cue: Some(at),
+                hot: [None; HOT_CUES],
+                stored_loop: None,
+                fill_only: true,
+            },
+        });
+        if sent {
+            self.lib.serial = serial;
+            lines.push(format!(
+                "auto cue: first sound at {:.3} s",
+                at / f64::from(self.format.sample_rate)
+            ));
+        } else {
+            lines.push("command ring full, auto cue dropped".into());
+        }
+    }
+
     /// Write hot cue changes made on the deck to the library.
     fn write_back_cues(&mut self) {
         let (Some(t), Some(lib)) = (self.lib.track, &self.library) else {
@@ -303,11 +406,21 @@ impl Player {
             let now = (!p.is_nan()).then_some(p);
             if now != self.lib.known[slot] {
                 self.lib.known[slot] = now;
-                lib.edit(Edit::SetHotCue(
-                    t.track,
-                    slot,
-                    now.map(|f| HotCue::at(f / sr)),
-                ));
+                let cue = now.map(|f| {
+                    let at = f / sr;
+                    match self.lib.records[slot].take() {
+                        // Moved: the same cue at its new place. A loop end that would now
+                        // come before the start no longer applies.
+                        Some(old) => HotCue {
+                            at,
+                            end: old.end.filter(|&e| e > at),
+                            ..old
+                        },
+                        None => HotCue::at(at),
+                    }
+                });
+                self.lib.records[slot] = cue.clone();
+                lib.edit(Edit::SetHotCue(t.track, slot, cue));
             }
         }
     }
@@ -322,8 +435,13 @@ impl Player {
                 Reply::Failed(e) => {
                     lines.push(format!("library: {e}; nothing is stored"));
                     self.library = None;
+                    self.persistence = Some(Persistence::Unsaved {
+                        edits: 0,
+                        reason: e,
+                    });
                     self.start_analysis(BTreeMap::new(), false);
                 }
+                Reply::Status(p) => self.persistence = Some(p),
             }
         }
         if let Some(Ok(result)) = self.analysis.as_ref().map(Receiver::try_recv) {
@@ -358,6 +476,7 @@ impl Player {
             lib.waveform(w);
             self.lib.waveform_stored = true;
         }
+        self.apply_auto_cue(&mut lines);
         self.write_back_cues();
         self.handle.collect_retired();
         if self.loader.as_ref().is_some_and(|t| t.is_finished())
@@ -400,6 +519,9 @@ struct LiveState {
     entries: Vec<Entry>,
     done: Option<Waveform>,
     timeline: Timeline,
+    /// The first frame at or above the auto cue level: `Some(None)` once the whole track was
+    /// decoded without one.
+    first_sound: Option<Option<f64>>,
 }
 
 impl LiveWaveform {
@@ -437,6 +559,12 @@ impl LiveWaveform {
         s.done.is_some()
     }
 
+    /// The first frame (engine rate) at or above the auto cue level, once known; `Some(None)`
+    /// if the track has none. `None` while still looking.
+    pub fn first_sound(&self) -> Option<Option<f64>> {
+        self.lock().first_sound
+    }
+
     /// The finished waveform, with its timeline, once the decode is done.
     pub fn finished(&self) -> Option<Waveform> {
         let s = self.lock();
@@ -455,6 +583,10 @@ struct WaveTap {
     /// Frames since the last publish.
     pending: usize,
     publish_every: usize,
+    /// The auto cue level (linear peak) while still looking for the first sound.
+    first_sound: Option<f32>,
+    /// Frames seen so far.
+    frames: u64,
 }
 
 impl WaveTap {
@@ -465,7 +597,29 @@ impl WaveTap {
             pending: 0,
             // A quarter second of audio: the display grows smoothly, the lock stays rare.
             publish_every: sample_rate as usize / 4,
+            first_sound: None,
+            frames: 0,
         }
+    }
+
+    /// Also look for the first frame whose peak (either channel) reaches `threshold`.
+    fn with_first_sound(mut self, threshold: Option<f32>) -> Self {
+        self.first_sound = threshold;
+        self
+    }
+
+    fn find_first_sound(&mut self, stereo: &[f32]) {
+        let Some(level) = self.first_sound else {
+            return;
+        };
+        let hit = stereo
+            .chunks_exact(2)
+            .position(|f| f[0].abs().max(f[1].abs()) >= level);
+        if let Some(i) = hit {
+            self.live.lock().first_sound = Some(Some((self.frames + i as u64) as f64));
+            self.first_sound = None;
+        }
+        self.frames += (stereo.len() / 2) as u64;
     }
 
     fn boxed(mut self) -> engine_media::Tap {
@@ -473,6 +627,7 @@ impl WaveTap {
     }
 
     fn push(&mut self, stereo: &[f32]) {
+        self.find_first_sound(stereo);
         if self.live.stored.load(Ordering::Relaxed) {
             self.builder = None;
         }
@@ -492,6 +647,10 @@ impl WaveTap {
 
 impl Drop for WaveTap {
     fn drop(&mut self) {
+        if self.first_sound.is_some() {
+            // Decoded to the end without reaching the level.
+            self.live.lock().first_sound = Some(None);
+        }
         if let Some(b) = self.builder.take() {
             let wf = b.finish();
             let mut s = self.live.lock();
@@ -711,6 +870,47 @@ mod tests {
         assert!(!live.set_stored(stored), "only before one is complete");
     }
 
+    #[test]
+    fn the_tap_finds_the_first_sound_at_the_auto_cue_level() {
+        let at = AutoCue::Level(-36.0).threshold();
+        let live = Arc::new(LiveWaveform::default());
+        let mut tap = WaveTap::new(48_000, Arc::clone(&live))
+            .with_first_sound(at)
+            .boxed();
+        // Silence, then a noise floor under the level, then sound in the right channel
+        // only, in the second block.
+        tap(&vec![0.0; 2 * 1000]);
+        assert_eq!(live.first_sound(), None, "still looking");
+        let mut block = vec![0.001f32; 2 * 1000];
+        block[2 * 250 + 1] = 0.1;
+        tap(&block);
+        assert_eq!(live.first_sound(), Some(Some(1250.0)));
+        drop(tap);
+        assert_eq!(live.first_sound(), Some(Some(1250.0)));
+
+        // A track that never reaches the level has no first sound.
+        let live = Arc::new(LiveWaveform::default());
+        let mut tap = WaveTap::new(48_000, Arc::clone(&live))
+            .with_first_sound(at)
+            .boxed();
+        tap(&vec![0.01; 2 * 1000]);
+        drop(tap);
+        assert_eq!(live.first_sound(), Some(None));
+    }
+
+    #[test]
+    fn auto_cue_levels_parse() {
+        assert_eq!(AutoCue::parse("off"), Some(AutoCue::Off));
+        assert_eq!(AutoCue::parse("-48"), Some(AutoCue::Level(-48.0)));
+        assert_eq!(AutoCue::parse("-60dB"), Some(AutoCue::Level(-60.0)));
+        assert_eq!(AutoCue::parse("6"), None);
+        assert_eq!(AutoCue::parse("loud"), None);
+        assert_eq!(AutoCue::default(), AutoCue::Level(-36.0));
+        let t = AutoCue::Level(-20.0).threshold().unwrap();
+        assert!((t - 0.1).abs() < 1e-6);
+        assert_eq!(AutoCue::Off.threshold(), None);
+    }
+
     /// 20 s of clicks at 120 BPM, stereo, 16-bit.
     fn clicks(path: &Path) {
         let spec = hound::WavSpec {
@@ -757,6 +957,7 @@ mod tests {
                     params: f.params.clone(),
                     blob: library::BlobId::of(&f.blob),
                     created: String::new(),
+                    extra: Default::default(),
                 };
                 (f.name.clone(), (r, f.blob.clone()))
             })

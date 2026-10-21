@@ -32,7 +32,7 @@ pub use hlc::{Clock, Hlc, Stamp};
 pub use ids::{BadId, BlobId, DeviceId, LibraryId, TrackId, TrackRef};
 pub use library::{
     Edit, Found, Libraries, Library, MountError, MountOptions, MountStats, Persistence,
-    SEGMENT_ROTATE_BYTES, WriteError, rfc3339, system_ms,
+    SEGMENT_ROTATE_BYTES, TRUSTED_CLOCK_AHEAD_MS, WriteError, rfc3339, system_ms,
 };
 pub use model::{AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Track, WaveformRef};
 pub use state::State;

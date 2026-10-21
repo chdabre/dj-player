@@ -286,44 +286,75 @@ pub struct AnalysisRef {
     pub blob: BlobId,
     /// RFC 3339 UTC.
     pub created: String,
+    /// Fields this version doesn't know, written back as they were.
+    pub extra: Map<String, Value>,
 }
 
 impl AnalysisRef {
     pub fn to_json(&self) -> Value {
-        json!({
-            "version": self.version,
-            "params": self.params,
-            "blob": self.blob.to_string(),
-            "created": self.created,
-        })
+        let mut m = self.extra.clone();
+        m.insert("version".into(), self.version.clone().into());
+        m.insert("params".into(), self.params.clone().into());
+        m.insert("blob".into(), self.blob.to_string().into());
+        m.insert("created".into(), self.created.clone().into());
+        Value::Object(m)
     }
 
     pub fn from_json(v: &Value) -> Option<Self> {
+        let mut extra = v.as_object()?.clone();
+        let mut take = |k: &str| extra.remove(k);
+        let version = take("version")?.as_str()?.to_owned();
+        let params = take("params")?.as_str()?.to_owned();
+        let blob = take("blob")?.as_str()?.parse().ok()?;
+        let created = take("created")
+            .and_then(|c| c.as_str().map(str::to_owned))
+            .unwrap_or_default();
         Some(Self {
-            version: v.get("version")?.as_str()?.to_owned(),
-            params: v.get("params")?.as_str()?.to_owned(),
-            blob: v.get("blob")?.as_str()?.parse().ok()?,
-            created: v.get("created")?.as_str().unwrap_or_default().to_owned(),
+            version,
+            params,
+            blob,
+            created,
+            extra,
         })
     }
 }
 
 /// A track's waveform: DJWF blobs, whose headers carry their parameters and timeline.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WaveformRef {
     pub blob: BlobId,
     pub overview_blob: BlobId,
+    /// Fields this version doesn't know, written back as they were.
+    pub extra: Map<String, Value>,
 }
 
 impl WaveformRef {
+    pub fn new(blob: BlobId, overview_blob: BlobId) -> Self {
+        Self {
+            blob,
+            overview_blob,
+            extra: Map::new(),
+        }
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({ "blob": self.blob.to_string(), "overview_blob": self.overview_blob.to_string() })
+        let mut m = self.extra.clone();
+        m.insert("blob".into(), self.blob.to_string().into());
+        m.insert(
+            "overview_blob".into(),
+            self.overview_blob.to_string().into(),
+        );
+        Value::Object(m)
     }
 
     pub fn from_json(v: &Value) -> Option<Self> {
+        let mut extra = v.as_object()?.clone();
+        let blob = extra.remove("blob")?.as_str()?.parse().ok()?;
+        let overview_blob = extra.remove("overview_blob")?.as_str()?.parse().ok()?;
         Some(Self {
-            blob: v.get("blob")?.as_str()?.parse().ok()?,
-            overview_blob: v.get("overview_blob")?.as_str()?.parse().ok()?,
+            blob,
+            overview_blob,
+            extra,
         })
     }
 }
@@ -388,6 +419,7 @@ mod tests {
         let w = WaveformRef {
             blob: BlobId([1; 32]),
             overview_blob: BlobId([2; 32]),
+            extra: Default::default(),
         };
         assert_eq!(WaveformRef::from_json(&w.to_json()), Some(w));
     }
@@ -399,5 +431,18 @@ mod tests {
         assert_eq!(track_of_path(&alias_path(id)), Some(id));
         assert_eq!(track_of_path("history"), None);
         assert!(is_component("tempocnn") && !is_component("a/b") && !is_component(".."));
+    }
+
+    #[test]
+    fn analysis_and_waveform_refs_keep_unknown_fields() {
+        let blob = BlobId::of(b"x");
+        let a = json!({"version": "1", "params": "p", "blob": blob.to_string(),
+                       "created": "2026-10-21T00:00:00Z", "signer": "abc"});
+        let r = AnalysisRef::from_json(&a).unwrap();
+        assert_eq!(r.extra.get("signer"), Some(&json!("abc")));
+        assert_eq!(r.to_json(), a);
+        let w = json!({"blob": blob.to_string(), "overview_blob": blob.to_string(), "stems": [1]});
+        let r = WaveformRef::from_json(&w).unwrap();
+        assert_eq!(r.to_json(), w);
     }
 }

@@ -15,7 +15,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 use engine_core::{DeckCommand, DeckState, LoadMeter, Source};
 use engine_io::{CpalBackend, StreamRequest};
-use engined::{LibraryChoice, Options, Player};
+use engined::{AutoCue, LibraryChoice, Options, Player};
 
 /// Debug builds abort on any allocation inside `assert_no_alloc` scopes (the audio callback).
 #[cfg(debug_assertions)]
@@ -27,10 +27,13 @@ const RATE_STEP: f64 = 0.01;
 
 const USAGE: &str = "\
 usage: engined <file> [--device <name>] [--buffer <frames>] [--bpm-range MIN-MAX]
-               [--library <dir> | --no-library] [--list-devices]
+               [--library <dir> | --no-library] [--auto-cue off|<dB>] [--list-devices]
 
 --library <dir>: the library folder (made if missing). Default: DJPLAYER/ at the root of the
-track's volume if it can be written, else RAM only. --no-library: RAM only.
+track's removable volume (a USB stick or SD card) if it can be written, else RAM only.
+--no-library: RAM only.
+--auto-cue: with no stored memory cue, the load cue point is the first sound at or above this
+level (default -36 dB); off: no cue point, the playhead at the start.
 
 Set TEMPOCNN_MODEL to the TempoCNN .onnx model for model-based tempo (see docs/plan/analysis.md).
 
@@ -78,6 +81,10 @@ fn parse_args() -> Result<Args, String> {
                 out.options.library = LibraryChoice::Folder(PathBuf::from(dir));
             }
             "--no-library" => out.options.library = LibraryChoice::Ram,
+            "--auto-cue" => {
+                let v = args.next().ok_or("--auto-cue needs off or a level in dB")?;
+                out.options.auto_cue = AutoCue::parse(&v).ok_or(format!("bad auto cue {v:?}"))?;
+            }
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             _ if out.file.is_none() => out.file = Some(PathBuf::from(arg)),
             _ => return Err("only one file, please".into()),

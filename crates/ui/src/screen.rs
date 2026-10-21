@@ -131,6 +131,29 @@ pub struct View<'a> {
     pub hot_cue_positions: [f64; engine_core::HOT_CUES],
     pub screen: ScreenKind,
     pub perf: PerfState,
+    /// Whether the library is saving edits; `None` until it says.
+    pub save: Option<SaveState>,
+}
+
+/// What the status band says about the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveState {
+    /// Every edit is on the stick.
+    Saved,
+    /// Written, flushed within a second or two.
+    Saving,
+    /// Edits are in RAM only and lost at power-off (no library, a locked or failing stick).
+    Unsaved,
+}
+
+impl SaveState {
+    fn label(self) -> &'static str {
+        match self {
+            SaveState::Saved => "SAVED",
+            SaveState::Saving => "SAVING",
+            SaveState::Unsaved => "UNSAVED",
+        }
+    }
 }
 
 /// A deck's waveform as the screen draws it.
@@ -950,6 +973,14 @@ fn clock(seconds: f64) -> (String, String) {
 pub(crate) fn status(ui: &mut Ui, v: &View) {
     let t = ui.t;
     ui.label("TRACK", 113.0, 398.0, t.color.label);
+    if let Some(save) = v.save {
+        let color = match save {
+            SaveState::Saved => t.color.dim,
+            SaveState::Saving => t.color.label,
+            SaveState::Unsaved => t.color.danger_text,
+        };
+        ui.label(save.label(), 160.0, 398.0, color);
+    }
     ui.digits(
         "01",
         113.0,
@@ -1247,6 +1278,7 @@ mod tests {
             hot_cue_positions: [f64::NAN; engine_core::HOT_CUES],
             screen: ScreenKind::Main,
             perf: PerfState::default(),
+            save: Some(SaveState::Unsaved),
         }
     }
 

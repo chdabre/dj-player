@@ -46,7 +46,15 @@ pub struct MountOptions {
     pub device_info: Value,
     /// Wall-clock milliseconds since the Unix epoch; 0 if the device has no clock.
     pub now: fn() -> u64,
+    /// The wall clock is known to be right (NTP-synchronised, or a kept RTC). The clock then
+    /// doesn't adopt stamps more than [`TRUSTED_CLOCK_AHEAD_MS`] ahead of it: a device whose
+    /// clock ran fast can't drag this one into its future. The merge is unaffected (it must
+    /// be the same on every device); only what this clock observes is.
+    pub trusted_clock: bool,
 }
+
+/// How far ahead of a trusted wall clock a stamp may be and still be observed: one day.
+pub const TRUSTED_CLOCK_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 
 impl MountOptions {
     pub fn new(device: DeviceId) -> Self {
@@ -55,6 +63,7 @@ impl MountOptions {
             read_only: false,
             device_info: json!({}),
             now: system_ms,
+            trusted_clock: false,
         }
     }
 }
@@ -205,6 +214,8 @@ pub struct Library {
     index: Option<Index>,
     stats: MountStats,
     warnings: Vec<String>,
+    /// This device's writer lock, taken before its first segment is opened.
+    writer_lock: Option<crate::store::WriterLock>,
 }
 
 impl std::fmt::Debug for Library {
@@ -256,6 +267,9 @@ impl Library {
         let mut state = State::new();
         let mut vector: BTreeMap<DeviceId, u32> = BTreeMap::new();
         let mut stats = MountStats::default();
+        let cutoff = observe_cutoff(&opts);
+        // The highest HLC the clock may adopt, and how many were too far ahead to.
+        let mut seen = Seen::new(cutoff);
         // One unreadable file or folder is skipped with a warning, never the whole mount.
         let skip = |warnings: &mut Vec<String>, stats: &mut MountStats, what: String, e| {
             stats.skipped_files += 1;
@@ -289,10 +303,11 @@ impl Library {
             stats.skipped_lines += decoded.skipped;
             for line in &decoded.lines[1..] {
                 if let Line::Op(op) = line {
-                    apply_counted(&mut state, op, &mut stats);
+                    apply_counted(&mut state, op, &mut stats, &mut seen);
                 }
             }
             state.observe(header.hlc);
+            seen.see(header.hlc);
             // Its operations are safe to use either way; its vector only if the file is
             // whole, or segments it never held would be skipped as covered.
             if snapshot_is_whole(&bytes, &decoded) {
@@ -353,7 +368,7 @@ impl Library {
                 stats.skipped_lines += decoded.skipped;
                 for line in &decoded.lines {
                     if let Line::Op(op) = line {
-                        apply_counted(&mut state, op, &mut stats);
+                        apply_counted(&mut state, op, &mut stats, &mut seen);
                     }
                 }
                 if seg <= held + 1 {
@@ -374,8 +389,22 @@ impl Library {
         // may have been compacted away).
         let next_segment = own_last.max(vector.get(&opts.device).copied().unwrap_or(0)) + 1;
 
+        if seen.ahead > 0 {
+            warnings.push(format!(
+                "{} operations are stamped more than a day ahead of this player's clock (a \
+                 device with a fast clock?): this player's clock doesn't follow them",
+                seen.ahead
+            ));
+        }
+        if !read_only {
+            match store.sweep_tmp() {
+                Ok(0) => {}
+                Ok(n) => warnings.push(format!("{n} leftover files of interrupted writes removed")),
+                Err(e) => warnings.push(format!("tmp/: {e}")),
+            }
+        }
         let mut clock = Clock::default();
-        clock.observe(state.max_hlc());
+        clock.observe(seen.max);
         let mode = if read_only {
             Mode::Ram {
                 reason: "the library is read-only".into(),
@@ -401,6 +430,7 @@ impl Library {
             index: None,
             stats,
             warnings,
+            writer_lock: None,
         })
     }
 
@@ -442,6 +472,14 @@ impl Library {
         }
     }
 
+    /// Keep every edit in RAM from now on, reported as unsaved for `reason` (a RAM-only
+    /// session: no library was found, or none was wanted).
+    pub fn keep_in_ram(&mut self, reason: impl Into<String>) {
+        self.mode = Mode::Ram {
+            reason: reason.into(),
+        };
+    }
+
     pub fn is_writable(&self) -> bool {
         matches!(self.mode, Mode::Journal { .. })
     }
@@ -479,14 +517,40 @@ impl Library {
             self.state.apply(op);
             self.update_index(op);
         }
+        let open_now = match &self.mode {
+            Mode::Journal { open, .. } => *open,
+            Mode::Ram { .. } => {
+                self.unsaved += ops.len();
+                return;
+            }
+        };
+        if !open_now && self.writer_lock.is_none() {
+            let path = format!("journal/{}/writer.lock", self.opts.device);
+            match self.store.lock_writer(&path) {
+                Ok(Some(lock)) => self.writer_lock = Some(lock),
+                Ok(None) => {
+                    self.unsaved += ops.len();
+                    self.stop_saving(
+                        "another program is writing this library as this device".into(),
+                    );
+                    return;
+                }
+                // A file system without locks: journal anyway, each mount in its own
+                // segment.
+                Err(e) => {
+                    self.warnings
+                        .push(format!("{path}: {e}; writing without a lock"));
+                    self.writer_lock = Some(Box::new(()));
+                }
+            }
+        }
         let Mode::Journal {
             segment,
             bytes,
             open,
         } = &mut self.mode
         else {
-            self.unsaved += ops.len();
-            return;
+            unreachable!("checked above");
         };
         let mut body = String::new();
         for op in ops {
@@ -582,8 +646,11 @@ impl Library {
             .filter(|op| op.stamp.hlc.is_plausible())
             .cloned()
             .collect();
+        let cutoff = observe_cutoff(&self.opts);
         for op in &ops {
-            self.clock.observe(op.stamp.hlc);
+            if op.stamp.hlc <= cutoff {
+                self.clock.observe(op.stamp.hlc);
+            }
         }
         if !ops.is_empty() {
             self.commit(&ops);
@@ -1078,11 +1145,52 @@ impl Library {
     }
 }
 
+/// The highest HLC the clock may observe: a day ahead of a trusted wall clock, else
+/// anything plausible.
+fn observe_cutoff(opts: &MountOptions) -> Hlc {
+    let wall = (opts.now)();
+    if opts.trusted_clock && wall > 0 {
+        let ms = wall
+            .saturating_add(TRUSTED_CLOCK_AHEAD_MS)
+            .min(crate::hlc::MAX_PLAUSIBLE_MS);
+        Hlc::new(ms, u16::MAX)
+    } else {
+        Hlc::new(crate::hlc::MAX_PLAUSIBLE_MS, u16::MAX)
+    }
+}
+
+/// What mounting lets the clock observe.
+struct Seen {
+    cutoff: Hlc,
+    max: Hlc,
+    /// Plausible HLCs above the cutoff.
+    ahead: usize,
+}
+
+impl Seen {
+    fn new(cutoff: Hlc) -> Self {
+        Self {
+            cutoff,
+            max: Hlc::ZERO,
+            ahead: 0,
+        }
+    }
+
+    fn see(&mut self, hlc: Hlc) {
+        if hlc <= self.cutoff {
+            self.max = self.max.max(hlc);
+        } else if hlc.is_plausible() {
+            self.ahead += 1;
+        }
+    }
+}
+
 /// Apply `op`, counting one with an implausible HLC (which the state drops) as skipped.
-fn apply_counted(state: &mut State, op: &Op, stats: &mut MountStats) {
+fn apply_counted(state: &mut State, op: &Op, stats: &mut MountStats, seen: &mut Seen) {
     if op.stamp.hlc.is_plausible() {
         state.apply(op);
         stats.ops += 1;
+        seen.see(op.stamp.hlc);
     } else {
         stats.skipped_lines += 1;
     }
