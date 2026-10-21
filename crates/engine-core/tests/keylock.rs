@@ -115,7 +115,9 @@ fn bursts(frames: usize, onsets: &[usize]) -> Vec<f32> {
 
 /// First output frame at or after `from` whose level exceeds a quarter of the burst.
 fn onset(out: &[f32], from: usize) -> usize {
-    out.chunks_exact(CHANNELS)
+    out.as_chunks::<CHANNELS>()
+        .0
+        .iter()
         .enumerate()
         .skip(from)
         .find(|(_, f)| f[0].abs() > 0.125)
@@ -271,8 +273,10 @@ fn keylock_loop_wraps_without_a_click() {
     assert!(h.deck_state(0).looping.load(Ordering::Relaxed));
     // Natural steps of this sine are up to ~0.0065; a raw wrap could jump by up to 1.0.
     let max_step = out
-        .chunks_exact(CHANNELS)
-        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
         .skip(BLOCK)
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);
@@ -296,8 +300,10 @@ fn toggling_keylock_while_playing_does_not_click() {
         _ => {}
     });
     let max_step = out
-        .chunks_exact(CHANNELS)
-        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
         .skip(1)
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);

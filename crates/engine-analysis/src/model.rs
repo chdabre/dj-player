@@ -378,7 +378,9 @@ impl TrackAudio {
     /// Mono mixdown (L+R)/2.
     pub fn mono(&self) -> Vec<f32> {
         self.stereo
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|f| 0.5 * (f[0] + f[1]))
             .collect()
     }

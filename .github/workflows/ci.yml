@@ -89,4 +89,4 @@ jobs:
       - name: Build (release, all targets)
         run: cargo build --workspace --exclude keylock-shootout --all-targets --release --target aarch64-unknown-linux-gnu
       - name: Test engine-core and engine-media under qemu
-        run: cargo test -p engine-core -p engine-media -p engine-stretch --target aarch64-unknown-linux-gnu
+        run: cargo test -p engine-core -p engine-media -p engine-stretch -p library --target aarch64-unknown-linux-gnu

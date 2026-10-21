@@ -29,7 +29,7 @@ Known gap (2026-10-21): `docs/research/findings.md` predates these decisions, an
 - One real-time audio callback owns all decks. It never allocates, frees, locks, logs or does I/O. Debug builds wrap it in `assert_no_alloc`.
 - Tracks are decoded into RAM in chunks with ready flags before and during playback; the callback never waits on disk or network.
 - `Transport` carries a slip shadow playhead from the start.
-- Rekordbox libraries are **read-only**. All writes go to our own library format (snapshot + per-device append-only journals + content-addressed blobs), on the USB stick or a cloud folder.
+- Rekordbox libraries are **read-only**. All writes go to our own library: one SQLite file (`DJPLAYER/library.db`) plus content-addressed blobs, on the USB stick or a cloud folder (decided 2026-10-21, replacing the journals).
 - No internal storage by default: RAM is the working cache, the stick (or cloud) is the persistent store.
 - Never hard-code 48 kHz; resample at load to the device rate.
 - License: GPL-3.0-or-later. AGPL-3.0 components are accepted (decided 2026-10-21): the TempoCNN model and the `hpcpkey` port in `engine-analysis` (see `docs/plan/analysis.md`).
@@ -38,7 +38,7 @@ Known gap (2026-10-21): `docs/research/findings.md` predates these decisions, an
 
 ## Current step
 
-Designing our own library format (the overlay library on the stick or a cloud folder: snapshot + per-device journals + content-addressed blobs), so that cues, analysis and waveforms persist. Design settled: [`docs/plan/library.md`](docs/plan/library.md) (first build handed to a separate session). Earlier steps:
+Our own library (the overlay library on the stick or a cloud folder: one SQLite file plus content-addressed blobs), so that cues, analysis and waveforms persist. Built on SQLite after a spike: [`docs/plan/library.md`](docs/plan/library.md). Earlier steps:
 
 - **Step 1:** code-complete ([`docs/plan/step-1.md`](docs/plan/step-1.md)).
 - **Step 2:** the engine part is done; known gaps are in its Status section ([`docs/plan/step-2.md`](docs/plan/step-2.md)). Analysis work is in [`docs/plan/analysis.md`](docs/plan/analysis.md).

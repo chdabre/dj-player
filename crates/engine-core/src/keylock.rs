@@ -167,7 +167,7 @@ impl Fifo {
     /// FIFO does not hold are silence.
     fn peek(&self, out: &mut [f32]) {
         let frames = (out.len() / CHANNELS).min(self.len);
-        for (k, dst) in out.chunks_exact_mut(CHANNELS).enumerate() {
+        for (k, dst) in out.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
             if k < frames {
                 let at = (self.head + k) % self.capacity();
                 dst.copy_from_slice(&self.audio[at * CHANNELS..(at + 1) * CHANNELS]);
@@ -362,8 +362,10 @@ impl GrainPath {
             let inv = 1.0 / self.fade_len as f32;
             let old = &self.fade[self.fade_done * CHANNELS..self.fade_len * CHANNELS];
             for (k, (o, s)) in out
-                .chunks_exact_mut(CHANNELS)
-                .zip(old.chunks_exact(CHANNELS))
+                .as_chunks_mut::<CHANNELS>()
+                .0
+                .iter_mut()
+                .zip(old.as_chunks::<CHANNELS>().0.iter())
                 .enumerate()
             {
                 let g = (self.fade_done + k + 1) as f32 * inv;
@@ -422,8 +424,10 @@ mod tests {
     }
 
     fn max_step(out: &[f32]) -> f32 {
-        out.chunks_exact(CHANNELS)
-            .zip(out.chunks_exact(CHANNELS).skip(1))
+        out.as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
             .map(|(a, b)| (b[0] - a[0]).abs())
             .fold(0.0, f32::max)
     }

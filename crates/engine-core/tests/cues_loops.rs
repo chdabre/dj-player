@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use engine_core::render::index_ramp;
-use engine_core::{CHANNELS, DeckCommand, DeckGrid, Engine, EngineConfig, EngineHandle, Source};
+use engine_core::{
+    CHANNELS, DeckCommand, DeckGrid, Engine, EngineConfig, EngineHandle, HOT_CUES, Source,
+    TrackCues,
+};
 
 #[cfg(debug_assertions)]
 #[global_allocator]
@@ -75,7 +78,9 @@ impl Rig {
             self.handle.collect_retired();
             done += n;
         }
-        out.chunks_exact(CHANNELS)
+        out.as_chunks::<CHANNELS>()
+            .0
+            .iter()
             .map(|f| f64::from(f[0]) * f64::from(SCALE))
             .collect()
     }
@@ -217,12 +222,119 @@ fn loop_wraps_without_a_click() {
     }
     // Natural steps of this sine are up to ~0.0065; a raw wrap could jump by up to 1.0.
     let max_step = out
-        .chunks_exact(CHANNELS)
-        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
         .skip(BLOCK)
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);
     assert!(max_step < 0.03, "max step {max_step}");
+}
+
+#[test]
+fn stored_cues_restore_into_the_deck() {
+    let mut r = rig(false);
+    let id = r.engine.deck(0).source().unwrap().id();
+    let mut hot = [None; HOT_CUES];
+    hot[0] = Some(48_000.0);
+    hot[5] = Some(96_000.5);
+    let cues = TrackCues {
+        cue: Some(24_000.0),
+        hot,
+        stored_loop: Some((200_000.0, 248_000.0)),
+        fill_only: false,
+    };
+    // Cues of another track are ignored.
+    r.send(DeckCommand::SetCues {
+        source_id: id + 1,
+        serial: 1,
+        cues,
+    });
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    assert_eq!(st.cues_serial.load(Ordering::Relaxed), 0);
+    assert_eq!(st.hot_cues.load(Ordering::Relaxed), 0);
+
+    r.send(DeckCommand::SetCues {
+        source_id: id,
+        serial: 2,
+        cues,
+    });
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    assert_eq!(st.cues_serial.load(Ordering::Relaxed), 2);
+    assert_eq!(st.cue.load(), 24_000.0);
+    assert_eq!(
+        r.position(),
+        24_000.0,
+        "a paused deck at the start moves to the cue"
+    );
+    assert_eq!(st.hot_cues.load(Ordering::Relaxed), 0b10_0001);
+    assert_eq!(st.hot_cue_positions[5].load(), 96_000.5);
+    assert!(st.hot_cue_positions[1].load().is_nan());
+    assert!(
+        !st.looping.load(Ordering::Relaxed),
+        "the loop is stored, not entered"
+    );
+    assert_eq!(st.loop_start.load(), 200_000.0);
+
+    // The restored hot cue plays like one set on the deck; RELOOP enters the stored loop.
+    r.send(DeckCommand::HotCue(5));
+    r.render(BLOCK);
+    assert_eq!(r.position(), 96_000.5);
+    r.send(DeckCommand::ReloopExit);
+    r.render(BLOCK);
+    assert!(r.handle.deck_state(0).looping.load(Ordering::Relaxed));
+    assert_eq!(r.position(), 200_000.0);
+}
+
+#[test]
+fn a_first_restore_keeps_what_the_dj_set_meanwhile() {
+    let mut r = rig(false);
+    let id = r.engine.deck(0).source().unwrap().id();
+    // The DJ sets hot cue B before the library has answered.
+    r.send(DeckCommand::Seek(30_000.0));
+    r.render(BLOCK);
+    r.send(DeckCommand::HotCue(1));
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    let dj = st.hot_cue_positions[1].load();
+    assert!(!dj.is_nan());
+    let mut hot = [None; HOT_CUES];
+    hot[0] = Some(48_000.0);
+    hot[1] = Some(96_000.0);
+    let stored = TrackCues {
+        cue: Some(24_000.0),
+        hot,
+        stored_loop: None,
+        fill_only: true,
+    };
+    r.send(DeckCommand::SetCues {
+        source_id: id,
+        serial: 1,
+        cues: stored,
+    });
+    r.render(BLOCK);
+    let st = r.handle.deck_state(0);
+    assert_eq!(st.cues_serial.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        st.hot_cue_positions[0].load(),
+        48_000.0,
+        "an empty slot is filled"
+    );
+    assert_eq!(st.hot_cue_positions[1].load(), dj, "the DJ's hot cue stays");
+    // A full restore (the record after a merge) replaces the slots.
+    r.send(DeckCommand::SetCues {
+        source_id: id,
+        serial: 2,
+        cues: TrackCues {
+            fill_only: false,
+            ..stored
+        },
+    });
+    r.render(BLOCK);
+    assert_eq!(r.handle.deck_state(0).hot_cue_positions[1].load(), 96_000.0);
 }
 
 #[test]
@@ -308,8 +420,10 @@ fn taking_and_releasing_the_track_does_not_click() {
         handle.collect_retired();
     }
     let max_step = out
-        .chunks_exact(CHANNELS)
-        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<CHANNELS>().0.iter().skip(1))
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);
     // The sine's own steps at up to 4x are ~0.026; a hard start or stop could step by 0.5.

@@ -5,9 +5,9 @@
 //! overview to seek. Keys as in `engined`, plus a real CUE hold (the window sees key
 //! releases): space play/pause, c cue, 1–8 hot cues (shift: delete), i/o/l loop,
 //! b 4-beat loop, [ ] loop ½X / 2X, , . beat jump, ←/→ seek ±5 s, +/- rate, 0 reset,
-//! k keylock, r reverse, s slip, z quantize, w waveform mode (3-band / RGB / single colour),
-//! p performance screen (hot cue / beat jump pads, beat loops), d timing overlay,
-//! f fullscreen, q quit.
+//! k keylock, r reverse, s slip, m memory cue, z quantize, w waveform mode (3-band / RGB /
+//! single colour), p performance screen (hot cue / beat jump pads, beat loops), d timing
+//! overlay, f fullscreen, q quit.
 //!
 //! With the `standin` feature (on by default) the window also shows the hardware stand-in:
 //! the player's physical controls drawn around the device screen (`standin.rs`), as a
@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use engine_core::DeckCommand;
 use engine_io::{CpalBackend, StreamRequest};
-use engined::Player;
+use engined::{AutoCue, LibraryChoice, Options, Persistence, Player};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, Touch, TouchPhase, WindowEvent};
@@ -45,7 +45,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::clock::PlayheadClock;
 use crate::gfx::Gfx;
 use crate::scene::Scene;
-use crate::screen::{HitBox, OVERVIEW, PerfState, ScreenKind, Target, View};
+use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveSettings};
@@ -59,7 +59,7 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] [--no-standin] \
                      [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--perform] [--pad-mode hotcue|beatjump|delete] \
                      [--hot-cues <s,s,…>] [--at <seconds>] [--play] [--run-for <seconds>] \
-                     [--screenshot <out.png>]";
+                     [--screenshot <out.png>] [--library <dir> | --no-library] [--auto-cue off|<dB>]";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
 const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
@@ -77,6 +77,8 @@ struct Args {
     run_for: Option<f64>,
     theme: Theme,
     wave_mode: Mode,
+    library: LibraryChoice,
+    auto_cue: AutoCue,
     perform: Option<PerfState>,
     /// Hot cues to set at start (seconds), for screenshots and demos.
     hot_cues: Vec<f64>,
@@ -91,6 +93,8 @@ fn parse_args() -> Result<Args, String> {
     let mut theme = Theme::default();
     let mut wave_theme: Option<String> = None;
     let mut wave_mode = Mode::ThreeBand;
+    let mut library = LibraryChoice::Auto;
+    let mut auto_cue = AutoCue::default();
     let mut perform: Option<PerfState> = None;
     let mut hot_cues: Vec<f64> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -163,6 +167,16 @@ fn parse_args() -> Result<Args, String> {
                     format!("unknown theme {name:?} (themes: {})", names.join(", "))
                 })?;
             }
+            "--library" => {
+                library = LibraryChoice::Folder(PathBuf::from(
+                    args.next().ok_or("--library needs a folder")?,
+                ))
+            }
+            "--no-library" => library = LibraryChoice::Ram,
+            "--auto-cue" => {
+                let v = args.next().ok_or("--auto-cue needs off or a level in dB")?;
+                auto_cue = AutoCue::parse(&v).ok_or(format!("bad auto cue {v:?}"))?;
+            }
             "--run-for" => {
                 let s = args.next().ok_or("--run-for needs seconds")?;
                 run_for = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
@@ -195,6 +209,8 @@ fn parse_args() -> Result<Args, String> {
         run_for,
         theme,
         wave_mode,
+        library,
+        auto_cue,
         perform,
         hot_cues,
     })
@@ -212,7 +228,12 @@ fn main() -> ExitCode {
         }
     };
     let backend = CpalBackend::new();
-    let mut player = match Player::open(&backend, &args.request, &args.file, Default::default()) {
+    let options = Options {
+        library: args.library.clone(),
+        auto_cue: args.auto_cue,
+        ..Options::default()
+    };
+    let mut player = match Player::open_with(&backend, &args.request, &args.file, options) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("dj-ui: {e}");
@@ -592,6 +613,10 @@ impl App {
                         self.debug = !self.debug;
                         return;
                     }
+                    "m" => {
+                        eprintln!("{}", self.player.memory());
+                        return;
+                    }
                     "p" => {
                         self.screen = match self.screen {
                             ScreenKind::Main => ScreenKind::Performance,
@@ -729,6 +754,11 @@ impl App {
             hot_cue_positions: std::array::from_fn(|i| st.hot_cue_positions[i].load()),
             screen: self.screen,
             perf: self.perf,
+            save: self.player.persistence().map(|p| match p {
+                Persistence::Saved => SaveState::Saved,
+                Persistence::Pending => SaveState::Saving,
+                Persistence::Unsaved { .. } => SaveState::Unsaved,
+            }),
             wave: (!self.wave.is_empty()).then_some(screen::Wave {
                 entries: &self.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),

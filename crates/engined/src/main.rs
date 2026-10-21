@@ -1,7 +1,8 @@
 //! `engined <file>`: play one track on one deck through the real engine.
 //!
 //! Keys: space play/pause, ←/→ seek ±5 s, +/- rate ±1 %, 0 reset rate, k keylock,
-//! r reverse, s slip, q quit. Prints the deck state and the callback load meter once per second.
+//! r reverse, s slip, m memory, q quit. Prints the deck state and the callback load meter once
+//! per second. Cues, hot cues, the waveform and analysis persist in the library (`--library`).
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 use engine_core::{DeckCommand, DeckState, LoadMeter, Source};
 use engine_io::{CpalBackend, StreamRequest};
-use engined::Player;
+use engined::{AutoCue, LibraryChoice, Options, Player};
 
 /// Debug builds abort on any allocation inside `assert_no_alloc` scopes (the audio callback).
 #[cfg(debug_assertions)]
@@ -25,14 +26,21 @@ const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
 
 const USAGE: &str = "\
-usage: engined <file> [--device <name>] [--buffer <frames>] [--bpm-range MIN-MAX] [--list-devices]
+usage: engined <file> [--device <name>] [--buffer <frames>] [--bpm-range MIN-MAX]
+               [--library <dir> | --no-library] [--auto-cue off|<dB>] [--list-devices]
+
+--library <dir>: the library folder (made if missing). Default: DJPLAYER/ at the root of the
+track's removable volume (a USB stick or SD card) if it can be written, else RAM only.
+--no-library: RAM only.
+--auto-cue: with no stored memory cue, the load cue point is the first sound at or above this
+level (default -36 dB); off: no cue point, the playhead at the start.
 
 Set TEMPOCNN_MODEL to the TempoCNN .onnx model for model-based tempo (see docs/plan/analysis.md).
 
 keys:  space play/pause   <-/-> seek -/+5 s   +/- rate +/-1 %   0 reset rate
        k keylock   r reverse   s slip   z quantize   c cue   1-4 hot cue A-D (!@#$ delete)
        i/o loop in/out   l reloop/exit   b 4-beat loop   [/] loop 1/2X / 2X   ,/. jump -/+4 beats
-       q quit
+       m memory (store the cue point, or the active loop, in the library)   q quit
 
 A terminal reports no key releases, so c is a tap: back cue and set cue work, holding to
 preview does not.";
@@ -41,7 +49,7 @@ struct Args {
     file: Option<PathBuf>,
     request: StreamRequest,
     list_devices: bool,
-    settings: engine_analysis::Settings,
+    options: Options,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -50,7 +58,7 @@ fn parse_args() -> Result<Args, String> {
         file: None,
         request: StreamRequest::default(),
         list_devices: false,
-        settings: engine_analysis::Settings::default(),
+        options: Options::default(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -64,9 +72,18 @@ fn parse_args() -> Result<Args, String> {
             "--list-devices" => out.list_devices = true,
             "--bpm-range" => {
                 let r = args.next().ok_or("--bpm-range needs MIN-MAX")?;
-                out.settings.bpm_range = Some(
+                out.options.settings.bpm_range = Some(
                     engine_analysis::BpmRange::parse(&r).ok_or(format!("bad BPM range {r:?}"))?,
                 );
+            }
+            "--library" => {
+                let dir = args.next().ok_or("--library needs a folder")?;
+                out.options.library = LibraryChoice::Folder(PathBuf::from(dir));
+            }
+            "--no-library" => out.options.library = LibraryChoice::Ram,
+            "--auto-cue" => {
+                let v = args.next().ok_or("--auto-cue needs off or a level in dB")?;
+                out.options.auto_cue = AutoCue::parse(&v).ok_or(format!("bad auto cue {v:?}"))?;
             }
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             _ if out.file.is_none() => out.file = Some(PathBuf::from(arg)),
@@ -109,7 +126,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("no file given".into());
     };
 
-    let mut player = Player::open(&backend, &args.request, &file, args.settings)?;
+    let mut player = Player::open_with(&backend, &args.request, &file, args.options)?;
     let (format, info) = (player.format, &player.info);
     println!(
         "{} output: {} Hz, {} channels, buffer {}",
@@ -137,8 +154,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let _raw = interactive.then_some(RawModeGuard);
     if interactive {
         out(
-            "space play  c cue  1-4 hot cues  i/o/l loop  b beat loop  [/] 1/2X 2X  ,/. jump  \
-             z quantize  k keylock  r reverse  s slip  q quit (engined --help for all keys)",
+            "space play  c cue  1-4 hot cues  m memory  i/o/l loop  b beat loop  [/] 1/2X 2X  \
+             ,/. jump  z quantize  k keylock  r reverse  s slip  q quit (engined --help for all keys)",
         );
     } else {
         out("stdin is not a terminal: playing to the end without key control");
@@ -157,6 +174,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             {
                 match controls.command(key) {
                     Action::Quit => break,
+                    Action::Memory => out(&player.memory()),
                     Action::Send(cmd) => {
                         if !player.send(cmd) {
                             out("command ring full, key dropped");
@@ -307,6 +325,8 @@ fn clock(seconds: f64) -> String {
 enum Action {
     None,
     Quit,
+    /// MEMORY: store a memory cue in the library.
+    Memory,
     Send(DeckCommand),
     /// A button press and its release (the terminal reports no releases).
     Tap(DeckCommand, DeckCommand),
@@ -372,6 +392,7 @@ impl Controls {
             KeyCode::Char(c @ ('!' | '@' | '#' | '$')) => {
                 DeckCommand::DeleteHotCue("!@#$".find(c).unwrap_or(0))
             }
+            KeyCode::Char('m') => return Action::Memory,
             KeyCode::Char('i') => DeckCommand::LoopIn,
             KeyCode::Char('o') => DeckCommand::LoopOut,
             KeyCode::Char('l') => DeckCommand::ReloopExit,

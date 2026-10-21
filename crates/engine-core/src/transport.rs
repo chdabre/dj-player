@@ -259,6 +259,20 @@ impl Transport {
         true
     }
 
+    /// Store a loop for RELOOP without entering it (a memory loop restored at load). Ignored
+    /// while a loop is active; refused like [`Transport::set_loop`].
+    pub fn store_loop(&mut self, l: Loop) -> bool {
+        if self.looping
+            || l.len() < MIN_LOOP_FRAMES
+            || l.start < 0.0
+            || l.end > self.length.max(l.start)
+        {
+            return false;
+        }
+        self.loop_ = Some(l);
+        true
+    }
+
     /// Leave the active loop; with slip, snap to the shadow.
     pub fn exit_loop(&mut self) {
         if self.looping {

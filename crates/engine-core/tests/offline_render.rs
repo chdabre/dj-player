@@ -159,10 +159,10 @@ fn ten_seconds_scripted_render_is_sample_accurate() {
     ];
 
     let mut worst: f64 = 0.0;
-    for (k, frame) in out.chunks_exact(2).enumerate() {
+    for (k, frame) in out.as_chunks::<2>().0.iter().enumerate() {
         let piece = pieces.iter().rev().find(|p| p.from <= k).unwrap();
         match piece.pos {
-            None => assert_eq!(frame, [0.0, 0.0], "frame {k} should be silent"),
+            None => assert_eq!(*frame, [0.0, 0.0], "frame {k} should be silent"),
             Some((start, step)) => {
                 let expected = start + (k - piece.from) as f64 * step;
                 let got = read_position(frame);
@@ -251,9 +251,11 @@ fn unloaded_chunk_gives_silence_and_a_flag_and_skips_nothing() {
     let held = state.position.load();
     assert!(held <= (4 * chunk - 2) as f64 && held > (4 * chunk - 2 - BLOCK) as f64);
     let audible: Vec<f64> = out
-        .chunks_exact(2)
-        .filter(|f| f != &[0.0, 0.0])
-        .map(read_position)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|f| **f != [0.0, 0.0])
+        .map(|f| read_position(f))
         .collect();
     assert_eq!(audible.len(), held as usize - 1, "frame 0 reads as silence");
     for (i, p) in audible.iter().enumerate() {
@@ -266,7 +268,7 @@ fn unloaded_chunk_gives_silence_and_a_flag_and_skips_nothing() {
     let mut out = vec![f32::NAN; 4 * BLOCK * 2];
     render(&mut eng, &mut h, &mut out, |_, _| {});
     assert!(!state.starved.load(std::sync::atomic::Ordering::Relaxed));
-    for (k, f) in out.chunks_exact(2).enumerate() {
+    for (k, f) in out.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(read_position(f), held + k as f64);
     }
 }
@@ -295,8 +297,10 @@ fn declick_bounds_the_jump_at_a_seek() {
         }
     });
     let max_step = out
-        .chunks_exact(2)
-        .zip(out.chunks_exact(2).skip(1))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(out.as_chunks::<2>().0.iter().skip(1))
         .skip(1)
         .map(|(a, b)| (b[0] - a[0]).abs())
         .fold(0.0, f32::max);

@@ -42,7 +42,7 @@ impl Scaler {
         segment: Segment,
         out: &mut [f32],
     ) {
-        for (k, frame) in out.chunks_exact_mut(CHANNELS).enumerate() {
+        for (k, frame) in out.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
             let pos = segment.start + k as f64 * segment.step;
             frame.copy_from_slice(&Self::sample_at(source, pos));
         }

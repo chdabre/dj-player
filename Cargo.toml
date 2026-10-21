@@ -6,7 +6,7 @@ members = ["crates/*", "spikes/*"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.87"
+rust-version = "1.89"
 
 [workspace.dependencies]
 engine-core = { path = "crates/engine-core" }
@@ -14,7 +14,8 @@ engine-media = { path = "crates/engine-media" }
 engine-io = { path = "crates/engine-io" }
 engine-stretch = { path = "crates/engine-stretch" }
 engine-analysis = { path = "crates/engine-analysis" }
-waveform = { path = "crates/waveform" }
+waveform = { path = "crates/waveform", default-features = false }
+library = { path = "crates/library" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"
@@ -29,6 +30,11 @@ hound = "3.5"
 criterion = "0.8"
 crossterm = "0.29"
 png = "0.18"
+blake3 = { version = "1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+getrandom = "0.3"
+unicode-normalization = "0.1"
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

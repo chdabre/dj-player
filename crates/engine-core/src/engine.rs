@@ -212,6 +212,14 @@ impl Engine {
                 DeckCommand::Load(src) => d.swap_source(Some(src)),
                 DeckCommand::Unload => d.swap_source(None),
                 DeckCommand::SetGrid { source_id, grid } => (None, d.set_grid(source_id, grid)),
+                DeckCommand::SetCues {
+                    source_id,
+                    serial,
+                    ref cues,
+                } => {
+                    d.set_cues(source_id, serial, cues);
+                    (None, None)
+                }
                 ref other => {
                     d.apply(other);
                     (None, None)
@@ -232,7 +240,7 @@ impl Engine {
 fn write_master(mix: &[f32], out: &mut [f32], channels: usize) {
     for (frame, lr) in out
         .chunks_exact_mut(channels)
-        .zip(mix.chunks_exact(CHANNELS))
+        .zip(mix.as_chunks::<CHANNELS>().0.iter())
     {
         if channels == 1 {
             frame[0] = 0.5 * (lr[0] + lr[1]);
@@ -250,12 +258,15 @@ impl EngineHandle {
     }
 
     /// Queue a command for the next callback.
+    // A full ring hands the command back by value; boxing it would allocate for nothing.
+    #[allow(clippy::result_large_err)]
     pub fn send(&mut self, cmd: Command) -> Result<(), CommandRingFull> {
         self.commands
             .push(cmd)
             .map_err(|rtrb::PushError::Full(c)| CommandRingFull(c))
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn send_deck(&mut self, deck: usize, cmd: DeckCommand) -> Result<(), CommandRingFull> {
         self.send(Command::deck(deck, cmd))
     }
@@ -314,8 +325,8 @@ mod tests {
         h.send_deck(0, DeckCommand::Play).unwrap();
         let mut out = vec![9.0; 4 * 64];
         e.process(&mut out, 64);
-        for f in out.chunks_exact(4) {
-            assert_eq!(f, [0.25, 0.25, 0.0, 0.0]);
+        for f in out.as_chunks::<4>().0.iter() {
+            assert_eq!(*f, [0.25, 0.25, 0.0, 0.0]);
         }
         let (mut e, mut h) = engine(1);
         e.deck_mut(0).set_declick(false);
