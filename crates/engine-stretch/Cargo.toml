@@ -1,6 +1,6 @@
 [package]
 name = "engine-stretch"
-description = "Time-stretchers for keylock behind one Stretcher trait."
+description = "Time-stretcher for keylock: Bungee Basic, ported to Rust."
 version.workspace = true
 edition.workspace = true
 # src/bungee/ is MPL-2.0 (ported from Bungee, Parabola Research); everything else is
@@ -9,13 +9,8 @@ license = "GPL-3.0-or-later AND MPL-2.0"
 rust-version.workspace = true
 publish = false
 
-[features]
-default = ["signalsmith"]
-signalsmith = ["dep:signalsmith-stretch"]
-
 [dependencies]
 rustfft.workspace = true
-signalsmith-stretch = { workspace = true, optional = true }
 
 [lints]
 workspace = true

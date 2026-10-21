@@ -25,7 +25,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use candidate::{Candidate, Signalsmith};
+use candidate::Candidate;
 use rubberband::{Engine, RubberBand};
 use track::{CHANNELS, Track};
 
@@ -36,8 +36,6 @@ const BUDGET_US: f64 = 1333.0;
 
 fn candidates() -> Vec<Box<dyn Candidate>> {
     vec![
-        Box::new(Signalsmith::default_preset(SR)),
-        Box::new(Signalsmith::cheaper_preset(SR)),
         Box::new(bungee::Bungee::cpp(SR)),
         Box::new(bungee::Bungee::rust(SR)),
         Box::new(RubberBand::new(Engine::R2, SR)),

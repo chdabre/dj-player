@@ -2,8 +2,8 @@
 //!
 //! Each block plays through one of two paths: the [`Scaler`] (resampler: pitch follows rate,
 //! any direction) or, with keylock on and a velocity it can play, the [`Keylock`]
-//! time-stretcher (Bungee by default: either direction up to 4x). A change of path
-//! crossfades like a jump does.
+//! time-stretcher (Bungee: either direction up to 4x). A change of path crossfades like a
+//! jump does.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -110,11 +110,10 @@ pub struct Deck {
 }
 
 impl Deck {
-    /// Create an empty deck for an engine running at `sample_rate`, with the default
-    /// keylock path (Bungee). Allocates its scratch space and stretcher; call off the audio
-    /// thread.
+    /// Create an empty deck for an engine running at `sample_rate`, with a keylock path.
+    /// Allocates its scratch space and stretcher; call off the audio thread.
     pub fn new(state: Arc<DeckState>, sample_rate: u32) -> Self {
-        Self::with_keylock(state, sample_rate, Some(Keylock::bungee(sample_rate)))
+        Self::with_keylock(state, sample_rate, Some(Keylock::new(sample_rate)))
     }
 
     /// Create an empty deck with an explicit keylock path (or none).
@@ -135,13 +134,6 @@ impl Deck {
             scratch: vec![0.0; MAX_BLOCK_FRAMES * CHANNELS].into_boxed_slice(),
             wrap_scratch: vec![0.0; WRAP_FADE_FRAMES * CHANNELS].into_boxed_slice(),
         }
-    }
-
-    /// Swap the keylock path (e.g. for [`Keylock::new`] around Signalsmith) and return the
-    /// old one. Call before the engine goes into the audio callback: the old path is dropped
-    /// by the caller and the next keylock block primes.
-    pub fn replace_keylock(&mut self, keylock: Option<Keylock>) -> Option<Keylock> {
-        std::mem::replace(&mut self.keylock, keylock)
     }
 
     /// Enable or disable the jump crossfade (on by default). Offline tests turn it off to
@@ -258,11 +250,9 @@ impl Deck {
 
     /// True if a block of `transport` goes through the stretcher.
     fn uses_keylock(&self, transport: &Transport) -> bool {
-        transport.is_keylock_enabled()
-            && self
-                .keylock
-                .as_ref()
-                .is_some_and(|k| k.handles(transport.velocity()))
+        self.keylock.is_some()
+            && transport.is_keylock_enabled()
+            && Keylock::handles(transport.velocity())
     }
 
     /// Render `out.len() / 2` interleaved stereo frames (at most [`MAX_BLOCK_FRAMES`]),

@@ -1,18 +1,13 @@
 //! `Keylock`: the keylock path. Plays a transport [`Segment`] through a time-stretcher so
 //! the rate changes speed but not pitch.
 //!
-//! Two backends:
-//!
-//! - **Bungee** (default, [`Keylock::bungee`]): the pure-Rust port in
-//!   [`engine_stretch::bungee`], driven through its grain API. Plays any non-zero velocity up
-//!   to [`MAX_STRETCH_RATE`] in either direction, so reverse keeps the pitch too.
-//! - **Push** ([`Keylock::new`]): any [`Stretcher`] (Signalsmith), fed input frames ahead of
-//!   the playhead. Forward rates only.
-//!
-//! Either way the audio that comes out at a given moment is the audio at
+//! The stretcher is the pure-Rust Bungee port in [`engine_stretch::bungee`], driven through
+//! its grain API. It plays any non-zero velocity up to [`MAX_STRETCH_RATE`] in either
+//! direction, so reverse keeps the pitch too; rate 0 and anything faster go to the resampler
+//! ([`crate::Scaler`]). The audio that comes out at a given moment is the audio at
 //! [`crate::Transport::position`], so waveforms, cues and later sync need no keylock offset.
 //!
-//! # Bungee: grains placed where the playhead will be
+//! # Grains placed where the playhead will be
 //!
 //! Bungee is pull-based: each grain asks for an input position and returns one synthesis
 //! hop of output, two grains later, tagged with the positions it covers. The path keeps an
@@ -28,24 +23,7 @@
 //!   (about 30 ms of output). The next grain is placed on the new trajectory, and Bungee works
 //!   the hop out from the position difference, so the audio rejoins the playhead within one
 //!   grain.
-//!
-//! # Push: latency compensation
-//!
-//! A push stretcher's output lags its input by `input_latency + output_latency * rate` input
-//! frames (the *lookahead*). Because the whole track is resident, the path simply reads that
-//! far ahead of the transport.
-//!
-//! - **Jumps**: [`Keylock::render`] primes the stretcher at the new position. It seeks with the
-//!   audio before it, then runs and discards one output latency of audio, so the very next
-//!   output frame is the new position.
-//! - **Rate changes**: the lookahead depends on the rate. It is slewed towards the new value
-//!   by at most [`LOOKAHEAD_SLEW`] of each block, so the audio catches up with the playhead
-//!   over a fraction of a second instead of jumping.
-//!
-//! The push path only runs forward at rates in `(0, MAX_STRETCH_RATE]`. Reverse, rate 0 and
-//! anything faster fall back to the resampler ([`crate::Scaler`]).
 
-use engine_stretch::Stretcher;
 use engine_stretch::bungee::{self, Request, SampleRates};
 
 use crate::deck::MAX_BLOCK_FRAMES;
@@ -55,11 +33,7 @@ use crate::transport::Segment;
 /// Fastest rate the stretcher plays; above it the deck uses the resampler.
 pub const MAX_STRETCH_RATE: f64 = 4.0;
 
-/// Largest lookahead correction per block of the push path, as a fraction of the block
-/// length (1 % speed).
-pub const LOOKAHEAD_SLEW: f64 = 0.01;
-
-/// Crossfade from the old audio when the Bungee path re-primes at a jump. The deck's own
+/// Crossfade from the old audio when the path re-primes at a jump. The deck's own
 /// declick covers jumps from commands; this covers loop wraps.
 pub const JUMP_FADE_FRAMES: usize = 64;
 
@@ -70,75 +44,46 @@ const ALIGN_EPSILON: f64 = 1e-6;
 /// went wrong (it should never be more than a few thousand after a rate change): re-prime.
 const MAX_DRIFT: f64 = 65_536.0;
 
+/// The keylock path of one deck. See the [module docs](self).
 pub struct Keylock {
-    path: Path,
-}
-
-enum Path {
-    Bungee(Box<GrainPath>),
-    Push(PushPath),
+    path: Box<GrainPath>,
 }
 
 impl std::fmt::Debug for Keylock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.path {
-            Path::Bungee(g) => f
-                .debug_struct("Keylock::Bungee")
-                .field("cursor", &g.cursor)
-                .field("clock", &g.clock)
-                .field("emit", &g.emit)
-                .field("fifo", &g.fifo.len)
-                .finish_non_exhaustive(),
-            Path::Push(p) => f
-                .debug_struct("Keylock::Push")
-                .field("cursor", &p.cursor)
-                .field("fed_end", &p.fed_end)
-                .field("lookahead", &p.lookahead)
-                .finish_non_exhaustive(),
-        }
+        let g = &self.path;
+        f.debug_struct("Keylock")
+            .field("cursor", &g.cursor)
+            .field("clock", &g.clock)
+            .field("emit", &g.emit)
+            .field("fifo", &g.fifo.len)
+            .finish_non_exhaustive()
     }
 }
 
 impl Keylock {
-    /// The default path: Bungee, stereo at `sample_rate`. Allocates; call off the audio
-    /// thread.
-    pub fn bungee(sample_rate: u32) -> Self {
+    /// A stereo keylock path at `sample_rate`. Allocates; call off the audio thread.
+    pub fn new(sample_rate: u32) -> Self {
         Self {
-            path: Path::Bungee(Box::new(GrainPath::new(sample_rate))),
+            path: Box::new(GrainPath::new(sample_rate)),
         }
     }
 
-    /// The push path around a stereo stretcher (e.g. Signalsmith). Allocates the scratch
-    /// space; call off the audio thread.
-    pub fn new(stretcher: Box<dyn Stretcher>) -> Self {
-        Self {
-            path: Path::Push(PushPath::new(stretcher)),
-        }
-    }
-
-    /// True if this path plays a segment with this step (frames per output frame).
-    pub fn handles(&self, step: f64) -> bool {
-        match self.path {
-            Path::Bungee(_) => step != 0.0 && step.abs() <= MAX_STRETCH_RATE,
-            Path::Push(_) => step > 0.0 && step <= MAX_STRETCH_RATE,
-        }
+    /// True if the path plays a segment with this step (frames per output frame).
+    pub fn handles(step: f64) -> bool {
+        step != 0.0 && step.abs() <= MAX_STRETCH_RATE
     }
 
     /// True if the next output continues seamlessly from `position`, with no priming.
     pub fn is_aligned(&self, position: f64) -> bool {
-        let cursor = match &self.path {
-            Path::Bungee(g) => g.cursor,
-            Path::Push(p) => p.cursor,
-        };
-        cursor.is_some_and(|c| (c - position).abs() < ALIGN_EPSILON)
+        self.path
+            .cursor
+            .is_some_and(|c| (c - position).abs() < ALIGN_EPSILON)
     }
 
     /// Forget the stretcher's position (new track); the next render primes.
     pub fn invalidate(&mut self) {
-        match &mut self.path {
-            Path::Bungee(g) => g.cursor = None,
-            Path::Push(p) => p.cursor = None,
-        }
+        self.path.cursor = None;
     }
 
     /// Render `out.len() / 2` frames of `segment` (whose step must satisfy
@@ -149,19 +94,13 @@ impl Keylock {
     /// frame it needs is not loaded yet.
     pub fn render(&mut self, source: &Source, segment: Segment, out: &mut [f32]) -> bool {
         debug_assert!(
-            self.handles(segment.step),
+            Self::handles(segment.step),
             "keylock cannot play step {}",
             segment.step
         );
-        match &mut self.path {
-            Path::Bungee(g) => g.render(source, segment, out),
-            Path::Push(p) => p.render(source, segment, out),
-        }
+        self.path.render(source, segment, out)
     }
 }
-
-// ---------------------------------------------------------------------------------------------
-// Bungee
 
 /// Fixed-capacity FIFO of interleaved stereo frames, each with the source position it plays.
 struct Fifo {
@@ -376,169 +315,28 @@ impl GrainPath {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Push (Signalsmith)
-
-struct PushPath {
-    stretcher: Box<dyn Stretcher>,
-    /// Transport position the stretcher's next output frame corresponds to, if primed.
-    cursor: Option<f64>,
-    /// One past the last source frame fed to the stretcher.
-    fed_end: i64,
-    /// `fed_end - cursor`: how far ahead of the playhead the input runs.
-    lookahead: f64,
-    input: Box<[f32]>,
-    discard: Box<[f32]>,
-}
-
-impl PushPath {
-    fn new(stretcher: Box<dyn Stretcher>) -> Self {
-        assert_eq!(
-            stretcher.channels(),
-            CHANNELS,
-            "keylock needs a stereo stretcher"
-        );
-        let per_block = (MAX_BLOCK_FRAMES as f64 * MAX_STRETCH_RATE * (1.0 + LOOKAHEAD_SLEW)).ceil()
-            as usize
-            + 2;
-        let frames = stretcher.preroll_frames().max(per_block);
-        Self {
-            stretcher,
-            cursor: None,
-            fed_end: 0,
-            lookahead: 0.0,
-            input: vec![0.0; frames * CHANNELS].into_boxed_slice(),
-            discard: vec![0.0; MAX_BLOCK_FRAMES * CHANNELS].into_boxed_slice(),
-        }
-    }
-
-    /// Lookahead the stretcher needs at `rate` for its output to match the playhead.
-    fn latency_at(&self, rate: f64) -> f64 {
-        self.stretcher.input_latency() as f64 + self.stretcher.output_latency() as f64 * rate
-    }
-
-    fn is_aligned(&self, position: f64) -> bool {
-        self.cursor
-            .is_some_and(|c| (c - position).abs() < ALIGN_EPSILON)
-    }
-
-    fn render(&mut self, source: &Source, segment: Segment, out: &mut [f32]) -> bool {
-        let frames = out.len() / CHANNELS;
-        let rate = segment.step;
-        if !self.is_aligned(segment.start) && !self.prime(source, segment.start, rate) {
-            return false;
-        }
-        let slew = frames as f64 * LOOKAHEAD_SLEW;
-        let lookahead =
-            self.lookahead + (self.latency_at(rate) - self.lookahead).clamp(-slew, slew);
-        let end = segment.start + rate * frames as f64;
-        let capacity = (self.input.len() / CHANNELS) as i64;
-        let n = ((end + lookahead).round() as i64 - self.fed_end).clamp(0, capacity);
-        if n > 0 && !source.range_ready(self.fed_end, self.fed_end + n - 1) {
-            return false;
-        }
-        let input = fill(&mut self.input, source, self.fed_end, n as usize);
-        self.stretcher.process(input, out);
-        self.fed_end += n;
-        self.lookahead = self.fed_end as f64 - end;
-        self.cursor = Some(end);
-        true
-    }
-
-    /// Put the stretcher at `position` so its next output frame is that position.
-    fn prime(&mut self, source: &Source, position: f64, rate: f64) -> bool {
-        let preroll = self.stretcher.preroll_frames();
-        let out_latency = self.stretcher.output_latency();
-        let start = position.round() as i64 + self.stretcher.input_latency() as i64;
-        let discard_in = (out_latency as f64 * rate).round() as i64;
-        if !source.range_ready(start - preroll as i64, start + discard_in) {
-            return false;
-        }
-        self.stretcher.reset();
-        let input = fill(&mut self.input, source, start - preroll as i64, preroll);
-        self.stretcher.seek(input, rate);
-
-        // Run off the output latency, so what comes next is `position`.
-        let mut fed = start;
-        let mut done = 0;
-        while done < out_latency {
-            let n_out = (out_latency - done).min(MAX_BLOCK_FRAMES);
-            let target = start + ((done + n_out) as f64 * rate).round() as i64;
-            let input = fill(&mut self.input, source, fed, (target - fed) as usize);
-            self.stretcher
-                .process(input, &mut self.discard[..n_out * CHANNELS]);
-            fed = target;
-            done += n_out;
-        }
-        self.fed_end = fed;
-        self.lookahead = fed as f64 - position;
-        self.cursor = Some(position);
-        true
-    }
-}
-
-/// Copy `frames` source frames starting at `first` into `buf`; return the filled part.
-fn fill<'a>(buf: &'a mut [f32], source: &Source, first: i64, frames: usize) -> &'a [f32] {
-    let dst = &mut buf[..frames * CHANNELS];
-    for (k, frame) in dst.chunks_exact_mut(CHANNELS).enumerate() {
-        frame.copy_from_slice(&source.frame(first + k as i64));
-    }
-    dst
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_stretch::SignalsmithStretcher;
 
     const SR: u32 = 48_000;
 
-    fn push_keylock() -> Keylock {
-        Keylock::new(Box::new(SignalsmithStretcher::new(CHANNELS, SR)))
-    }
-
-    fn push(k: &Keylock) -> &PushPath {
-        match &k.path {
-            Path::Push(p) => p,
-            Path::Bungee(_) => panic!("not the push path"),
-        }
-    }
-
-    fn grains(k: &Keylock) -> &GrainPath {
-        match &k.path {
-            Path::Bungee(g) => g,
-            Path::Push(_) => panic!("not the Bungee path"),
-        }
+    #[test]
+    fn handles_both_directions_up_to_the_limit() {
+        assert!(Keylock::handles(1.0));
+        assert!(Keylock::handles(0.01));
+        assert!(Keylock::handles(-1.0));
+        assert!(Keylock::handles(-MAX_STRETCH_RATE));
+        assert!(Keylock::handles(MAX_STRETCH_RATE));
+        assert!(!Keylock::handles(0.0));
+        assert!(!Keylock::handles(MAX_STRETCH_RATE + 0.1));
+        assert!(!Keylock::handles(-MAX_STRETCH_RATE - 0.1));
     }
 
     #[test]
-    fn bungee_handles_both_directions() {
-        let k = Keylock::bungee(SR);
-        assert!(k.handles(1.0));
-        assert!(k.handles(0.01));
-        assert!(k.handles(-1.0));
-        assert!(k.handles(-MAX_STRETCH_RATE));
-        assert!(k.handles(MAX_STRETCH_RATE));
-        assert!(!k.handles(0.0));
-        assert!(!k.handles(MAX_STRETCH_RATE + 0.1));
-        assert!(!k.handles(-MAX_STRETCH_RATE - 0.1));
-    }
-
-    #[test]
-    fn push_handles_forward_rates_only() {
-        let k = push_keylock();
-        assert!(k.handles(1.0));
-        assert!(k.handles(0.01));
-        assert!(k.handles(MAX_STRETCH_RATE));
-        assert!(!k.handles(0.0));
-        assert!(!k.handles(-1.0));
-        assert!(!k.handles(MAX_STRETCH_RATE + 0.1));
-    }
-
-    #[test]
-    fn bungee_primes_once_and_its_output_is_the_playhead() {
+    fn primes_once_and_its_output_is_the_playhead() {
         let src = Source::from_interleaved(SR, &vec![0.1; 10 * SR as usize * CHANNELS]);
-        let mut k = Keylock::bungee(SR);
+        let mut k = Keylock::new(SR);
         let mut out = vec![0.0; 128 * CHANNELS];
         let mut pos = 20_000.0;
         for rate in [1.08, 1.08, -0.5, 2.0] {
@@ -553,66 +351,22 @@ mod tests {
             }
             // After the grains requested at the old rate are out, the next frame plays the
             // playhead exactly.
-            let head = grains(&k).fifo.head_position().unwrap();
+            let head = k.path.fifo.head_position().unwrap();
             assert!((head - pos).abs() < 1e-6, "rate {rate}: {head} vs {pos}");
         }
     }
 
     #[test]
-    fn push_primes_once_then_stays_aligned() {
-        let src = Source::from_interleaved(SR, &vec![0.1; 10 * SR as usize * CHANNELS]);
-        let mut k = push_keylock();
-        let mut out = vec![0.0; 128 * CHANNELS];
-        let seg = Segment {
-            start: 1000.0,
-            step: 1.08,
-        };
-        assert!(k.render(&src, seg, &mut out));
-        assert!(k.is_aligned(1000.0 + 1.08 * 128.0));
-        let p = push(&k);
-        assert!((p.lookahead - p.latency_at(1.08)).abs() <= 1.0);
-    }
-
-    #[test]
-    fn push_lookahead_follows_rate_changes_gradually() {
-        let src = Source::from_interleaved(SR, &vec![0.1; 30 * SR as usize * CHANNELS]);
-        let mut k = push_keylock();
-        let mut out = vec![0.0; 128 * CHANNELS];
-        let mut pos = 0.0;
-        let mut play = |k: &mut Keylock, rate: f64| {
-            assert!(k.render(
-                &src,
-                Segment {
-                    start: pos,
-                    step: rate
-                },
-                &mut out
-            ));
-            pos += rate * 128.0;
-        };
-        play(&mut k, 1.0);
-        play(&mut k, 1.08);
-        let jump = push(&k).lookahead - push(&k).latency_at(1.0);
-        assert!(jump <= 128.0 * LOOKAHEAD_SLEW + 1.0, "{jump}");
-        for _ in 0..400 {
-            play(&mut k, 1.08);
-        }
-        let p = push(&k);
-        assert!((p.lookahead - p.latency_at(1.08)).abs() <= 1.0);
-    }
-
-    #[test]
     fn unloaded_frames_starve_without_touching_state() {
-        for mut k in [Keylock::bungee(SR), push_keylock()] {
-            let (src, _writer) = Source::new(SR, SR as usize);
-            let mut out = vec![7.0; 128 * CHANNELS];
-            let seg = Segment {
-                start: 0.0,
-                step: 1.0,
-            };
-            assert!(!k.render(&src, seg, &mut out));
-            assert!(out.iter().all(|&s| s == 7.0));
-            assert!(!k.is_aligned(0.0));
-        }
+        let (src, _writer) = Source::new(SR, SR as usize);
+        let mut k = Keylock::new(SR);
+        let mut out = vec![7.0; 128 * CHANNELS];
+        let seg = Segment {
+            start: 0.0,
+            step: 1.0,
+        };
+        assert!(!k.render(&src, seg, &mut out));
+        assert!(out.iter().all(|&s| s == 7.0));
+        assert!(!k.is_aligned(0.0));
     }
 }

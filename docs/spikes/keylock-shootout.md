@@ -33,7 +33,9 @@ cargo run -p keylock-shootout --release -- render --out target/keylock-shootout/
 cargo run -p keylock-shootout --release -- compare
 ```
 
-`render` writes `NN-ref.wav` (the untouched excerpt) and `NN-<rate>-<A..F>.wav` (20 s from 60 s in, at 0.92x and 1.08x, candidates shuffled per track and rate), plus `listening-sheet.csv` to score and `key.csv`. Score the sheet before opening the key. `compare` runs the Rust port of Bungee against the C++ library (see below). Needs CMake ≥ 3.30 for the C++ Bungee; `bench` and `render` include the port as `bungee-rust`.
+`render` writes `NN-ref.wav` (the untouched excerpt) and `NN-<rate>-<A..E>.wav` (20 s from 60 s in, at 0.92x and 1.08x, candidates shuffled per track and rate), plus `listening-sheet.csv` to score and `key.csv`. Score the sheet before opening the key. `compare` runs the Rust port of Bungee against the C++ library (see below). Needs CMake ≥ 3.30 for the C++ Bungee; `bench` and `render` include the port as `bungee-rust`.
+
+Signalsmith was removed from the code base on 2026-10-21, once Bungee became the keylock (owner decision); its rows below are from runs before that. To rerun them, check out a commit before the removal.
 
 ## Listening result (2026-10-21)
 

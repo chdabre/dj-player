@@ -1,16 +1,14 @@
 //! Keylock through the real engine, offline: pitch is kept, the audio lines up with the
-//! reported playhead (latency compensation), reverse keeps the pitch (Bungee, the default),
-//! and switching paths or wrapping a loop does not click. The alignment test also runs on the
-//! Signalsmith push path.
+//! reported playhead (latency compensation), reverse keeps the pitch, and switching paths or
+//! wrapping a loop does not click.
 //!
-//! In debug builds every `process` call runs inside `assert_no_alloc`. Bungee is pure Rust,
-//! so that covers it completely; Signalsmith's C++ `malloc` calls are not visible to it.
+//! In debug builds every `process` call runs inside `assert_no_alloc`. The stretcher is pure
+//! Rust, so that covers the whole keylock path.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use engine_core::{CHANNELS, DeckCommand, Engine, EngineConfig, EngineHandle, Keylock, Source};
-use engine_stretch::SignalsmithStretcher;
+use engine_core::{CHANNELS, DeckCommand, Engine, EngineConfig, EngineHandle, Source};
 
 #[cfg(debug_assertions)]
 #[global_allocator]
@@ -26,14 +24,6 @@ fn engine() -> (Engine, EngineHandle) {
         channels: 2,
         decks: 1,
     })
-}
-
-/// An engine whose deck uses the Signalsmith push path instead of Bungee.
-fn signalsmith_engine() -> (Engine, EngineHandle) {
-    let (mut eng, h) = engine();
-    let push = Keylock::new(Box::new(SignalsmithStretcher::new(CHANNELS, SR)));
-    drop(eng.deck_mut(0).replace_keylock(Some(push)));
-    (eng, h)
 }
 
 fn render(
@@ -135,15 +125,7 @@ fn onset(out: &[f32], from: usize) -> usize {
 
 #[test]
 fn audio_lines_up_with_the_reported_playhead() {
-    lines_up(engine());
-}
-
-#[test]
-fn signalsmith_audio_lines_up_with_the_reported_playhead() {
-    lines_up(signalsmith_engine());
-}
-
-fn lines_up((mut eng, mut h): (Engine, EngineHandle)) {
+    let (mut eng, mut h) = engine();
     // Bursts at 2, 4, 8 and 12 s of the track.
     let marks = [2 * S, 4 * S, 8 * S, 12 * S];
     let source = Source::from_interleaved(SR, &bursts(20 * S, &marks));

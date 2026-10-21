@@ -1,6 +1,6 @@
 [package]
 name = "keylock-shootout"
-description = "Keylock spike: CPU, latency, alignment and listening renders for Signalsmith, Bungee and Rubber Band."
+description = "Keylock spike: CPU, latency, alignment and listening renders for Bungee (C++ and the Rust port) and Rubber Band; Signalsmith was removed after the decision."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
