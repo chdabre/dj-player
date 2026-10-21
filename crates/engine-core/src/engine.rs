@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::deck::{BlockOutcome, Deck, DeckCommand, MAX_BLOCK_FRAMES};
+use crate::grid::DeckGrid;
 use crate::source::{CHANNELS, Source};
 use crate::state::{DeckState, LoadMeter};
 
@@ -18,6 +19,13 @@ pub const COMMAND_CAPACITY: usize = 256;
 pub const MAX_COMMANDS_PER_CALLBACK: usize = 64;
 /// Capacity of the ring carrying replaced sources out of the callback.
 pub const RETIRE_CAPACITY: usize = 16;
+
+/// Something the callback replaced and hands back to be freed elsewhere.
+#[derive(Debug)]
+pub enum Retired {
+    Source(Arc<Source>),
+    Grid(Arc<DeckGrid>),
+}
 
 /// A command into the engine.
 #[derive(Debug, Clone)]
@@ -46,7 +54,7 @@ pub struct Engine {
     config: EngineConfig,
     decks: Box<[Deck]>,
     commands: Consumer<Command>,
-    retire: Producer<Arc<Source>>,
+    retire: Producer<Retired>,
     mix: Box<[f32]>,
     deck_buf: Box<[f32]>,
 }
@@ -64,7 +72,7 @@ impl std::fmt::Debug for Engine {
 pub struct EngineHandle {
     config: EngineConfig,
     commands: Producer<Command>,
-    retired: Consumer<Arc<Source>>,
+    retired: Consumer<Retired>,
     decks: Box<[Arc<DeckState>]>,
     load: Arc<LoadMeter>,
 }
@@ -170,38 +178,50 @@ impl Engine {
 
     fn drain_commands(&mut self) {
         for _ in 0..MAX_COMMANDS_PER_CALLBACK {
-            // A load hands the old source to the retire ring; wait for room rather than
-            // freeing it here.
-            let swaps_source = match self.commands.peek() {
-                Ok(Command::Deck { cmd, .. }) => {
-                    matches!(cmd, DeckCommand::Load(_) | DeckCommand::Unload)
-                }
+            // A load hands the old source and grid to the retire ring, a new grid the old
+            // grid; wait for room rather than freeing anything here.
+            let needs = match self.commands.peek() {
+                Ok(Command::Deck { cmd, .. }) => match cmd {
+                    DeckCommand::Load(_) | DeckCommand::Unload => 2,
+                    DeckCommand::SetGrid { .. } => 1,
+                    _ => 0,
+                },
                 Err(_) => return,
             };
-            if swaps_source && self.retire.slots() == 0 {
+            if self.retire.slots() < needs {
                 return;
             }
             let Ok(Command::Deck { deck, cmd }) = self.commands.pop() else {
                 return;
             };
             let Some(d) = self.decks.get_mut(deck) else {
-                // Unknown deck: the command may own a source; retire it, never drop it here.
-                if let DeckCommand::Load(src) = cmd {
-                    let _ = self.retire.push(src);
+                // Unknown deck: the command may own a source or grid; retire, never drop.
+                match cmd {
+                    DeckCommand::Load(src) => {
+                        let _ = self.retire.push(Retired::Source(src));
+                    }
+                    DeckCommand::SetGrid { grid, .. } => {
+                        let _ = self.retire.push(Retired::Grid(grid));
+                    }
+                    _ => {}
                 }
                 continue;
             };
-            let old = match cmd {
+            // Room was checked above; the pushes cannot fail.
+            let (old_source, old_grid) = match cmd {
                 DeckCommand::Load(src) => d.swap_source(Some(src)),
                 DeckCommand::Unload => d.swap_source(None),
+                DeckCommand::SetGrid { source_id, grid } => (None, d.set_grid(source_id, grid)),
                 ref other => {
                     d.apply(other);
-                    None
+                    (None, None)
                 }
             };
-            if let Some(old) = old {
-                // Room was checked above; the push cannot fail.
-                let _ = self.retire.push(old);
+            if let Some(s) = old_source {
+                let _ = self.retire.push(Retired::Source(s));
+            }
+            if let Some(g) = old_grid {
+                let _ = self.retire.push(Retired::Grid(g));
             }
         }
     }
@@ -249,7 +269,7 @@ impl EngineHandle {
         &self.load
     }
 
-    /// Drop sources the callback has retired. Call regularly from a non-real-time thread.
+    /// Drop sources and grids the callback has retired. Call regularly from a non-real-time thread.
     /// Returns how many were freed.
     pub fn collect_retired(&mut self) -> usize {
         let mut n = 0;
@@ -335,6 +355,44 @@ mod tests {
     }
 
     #[test]
+    fn grids_attach_to_their_own_track_only() {
+        let (mut e, mut h) = engine(2);
+        let first = constant(48_000, 0.0);
+        let second = constant(48_000, 0.0);
+        let grid = |bpm| Arc::new(DeckGrid::constant(0.0, bpm, 48_000.0, 48_000).unwrap());
+        let mut out = vec![0.0; 256];
+        h.send_deck(0, DeckCommand::Load(Arc::clone(&first)))
+            .unwrap();
+        h.send_deck(
+            0,
+            DeckCommand::SetGrid {
+                source_id: first.id(),
+                grid: grid(120.0),
+            },
+        )
+        .unwrap();
+        e.process(&mut out, 128);
+        assert_eq!(e.deck(0).grid().unwrap().bpm(), 120.0);
+        assert_eq!(h.deck_state(0).track_bpm.load(), 120.0);
+        // A new track drops the grid; a late grid for the old track is retired, not applied.
+        h.send_deck(0, DeckCommand::Load(Arc::clone(&second)))
+            .unwrap();
+        h.send_deck(
+            0,
+            DeckCommand::SetGrid {
+                source_id: first.id(),
+                grid: grid(125.0),
+            },
+        )
+        .unwrap();
+        e.process(&mut out, 128);
+        assert!(e.deck(0).grid().is_none());
+        assert_eq!(h.deck_state(0).track_bpm.load(), 0.0);
+        assert!(h.deck_state(0).beat.load().is_nan());
+        assert_eq!(h.collect_retired(), 3, "old source, old grid, stale grid");
+    }
+
+    #[test]
     fn full_retire_ring_defers_loads() {
         let (mut e, mut h) = engine(2);
         for _ in 0..RETIRE_CAPACITY + 3 {
@@ -343,9 +401,10 @@ mod tests {
         }
         let mut out = vec![0.0; 256];
         e.process(&mut out, 128);
-        // First load retires nothing; then RETIRE_CAPACITY retire; the rest wait.
-        assert_eq!(h.collect_retired(), RETIRE_CAPACITY);
+        // A load reserves two slots (source and grid). The first load retires nothing, the
+        // next RETIRE_CAPACITY - 1 one source each; then a load waits for room.
+        assert_eq!(h.collect_retired(), RETIRE_CAPACITY - 1);
         e.process(&mut out, 128);
-        assert_eq!(h.collect_retired(), 2);
+        assert_eq!(h.collect_retired(), 3);
     }
 }

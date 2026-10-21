@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::grid::DeckGrid;
 use crate::keylock::Keylock;
 use crate::scaler::Scaler;
 use crate::source::{CHANNELS, Source};
@@ -29,6 +30,12 @@ pub enum DeckCommand {
     /// through the engine's retire ring so it is never freed on the audio thread.
     Load(Arc<Source>),
     Unload,
+    /// The beatgrid of the source with this id (see [`Source::id`]). Ignored, and retired,
+    /// if another track is loaded by the time it arrives.
+    SetGrid {
+        source_id: u64,
+        grid: Arc<DeckGrid>,
+    },
     Play,
     Pause,
     TogglePlay,
@@ -62,6 +69,7 @@ pub enum BlockOutcome {
 #[derive(Debug)]
 pub struct Deck {
     source: Option<Arc<Source>>,
+    grid: Option<Arc<DeckGrid>>,
     transport: Transport,
     scaler: Scaler,
     /// `None` if no stretcher backend is compiled in; keylock then has no effect.
@@ -87,6 +95,7 @@ impl Deck {
     pub fn with_keylock(state: Arc<DeckState>, keylock: Option<Keylock>) -> Self {
         Self {
             source: None,
+            grid: None,
             transport: Transport::default(),
             scaler: Scaler::new(),
             keylock,
@@ -116,9 +125,26 @@ impl Deck {
         &self.state
     }
 
-    /// Replace the loaded source and return the previous one, which the caller must not drop
-    /// on the audio thread. The new track starts paused at frame 0.
-    pub fn swap_source(&mut self, source: Option<Arc<Source>>) -> Option<Arc<Source>> {
+    pub fn grid(&self) -> Option<&Arc<DeckGrid>> {
+        self.grid.as_ref()
+    }
+
+    /// Attach the grid of source `source_id`. Returns the grid to retire: the previous one,
+    /// or `grid` itself if it belongs to a track that is no longer loaded.
+    pub fn set_grid(&mut self, source_id: u64, grid: Arc<DeckGrid>) -> Option<Arc<DeckGrid>> {
+        if self.source.as_ref().map(|s| s.id()) == Some(source_id) {
+            self.grid.replace(grid)
+        } else {
+            Some(grid)
+        }
+    }
+
+    /// Replace the loaded source and return the previous one and its grid, which the caller
+    /// must not drop on the audio thread. The new track starts paused at frame 0, gridless.
+    pub fn swap_source(
+        &mut self,
+        source: Option<Arc<Source>>,
+    ) -> (Option<Arc<Source>>, Option<Arc<DeckGrid>>) {
         let length = source.as_ref().map_or(0.0, |s| s.len_frames() as f64);
         let keylock = self.transport.is_keylock_enabled();
         self.transport = Transport::new(length);
@@ -127,7 +153,10 @@ impl Deck {
         if let Some(k) = &mut self.keylock {
             k.invalidate();
         }
-        std::mem::replace(&mut self.source, source)
+        (
+            std::mem::replace(&mut self.source, source),
+            self.grid.take(),
+        )
     }
 
     /// Apply a command that does not change the source. `Load` and `Unload` are handled by
@@ -138,7 +167,7 @@ impl Deck {
         }
         let t = &mut self.transport;
         match *cmd {
-            DeckCommand::Load(_) | DeckCommand::Unload => {}
+            DeckCommand::Load(_) | DeckCommand::Unload | DeckCommand::SetGrid { .. } => {}
             DeckCommand::Play => t.play(),
             DeckCommand::Pause => t.pause(),
             DeckCommand::TogglePlay => t.toggle_play(),
@@ -273,6 +302,16 @@ impl Deck {
         s.position.store(t.position());
         s.shadow_position.store(t.shadow_position());
         s.rate.store(t.rate());
+        match &self.grid {
+            Some(g) => {
+                s.track_bpm.store(g.bpm());
+                s.beat.store(g.beat_at(t.position()));
+            }
+            None => {
+                s.track_bpm.store(0.0);
+                s.beat.store(f64::NAN);
+            }
+        }
         s.length.store(t.length());
         let starved = outcome == BlockOutcome::Starved;
         s.starved.store(starved, Ordering::Relaxed);

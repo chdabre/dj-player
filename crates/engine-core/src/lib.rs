@@ -13,6 +13,7 @@
 
 pub mod deck;
 pub mod engine;
+pub mod grid;
 pub mod keylock;
 pub mod render;
 pub mod scaler;
@@ -21,7 +22,8 @@ pub mod state;
 pub mod transport;
 
 pub use deck::{BlockOutcome, DECLICK_FRAMES, Deck, DeckCommand, MAX_BLOCK_FRAMES};
-pub use engine::{Command, CommandRingFull, Engine, EngineConfig, EngineHandle};
+pub use engine::{Command, CommandRingFull, Engine, EngineConfig, EngineHandle, Retired};
+pub use grid::{DeckGrid, FALLBACK_BPM};
 pub use keylock::{Keylock, MAX_STRETCH_RATE};
 pub use scaler::Scaler;
 pub use source::{CHANNELS, Frame, FrameSource, SliceSource, Source, SourceWriter};

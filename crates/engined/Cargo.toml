@@ -11,6 +11,7 @@ publish = false
 engine-core.workspace = true
 engine-media.workspace = true
 engine-io.workspace = true
+engine-analysis.workspace = true
 assert_no_alloc.workspace = true
 crossterm.workspace = true
 

@@ -11,7 +11,10 @@
 //! on read) is what orders the data.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// Source ids are unique for the life of the process.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Number of interleaved channels in a `Source`. The loader maps every file to stereo.
 pub const CHANNELS: usize = 2;
@@ -31,6 +34,7 @@ pub trait FrameSource {
 
 /// The resident, chunked sample store of one track.
 pub struct Source {
+    id: u64,
     sample_rate: u32,
     chunk_frames: usize,
     capacity_frames: usize,
@@ -74,6 +78,7 @@ impl Source {
             .collect();
         let ready = (0..chunks).map(|_| AtomicBool::new(false)).collect();
         let source = Arc::new(Source {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             sample_rate,
             chunk_frames,
             capacity_frames,
@@ -97,6 +102,12 @@ impl Source {
         writer.push(interleaved);
         writer.finish();
         source
+    }
+
+    /// Unique id of this source, so results computed for one track (e.g. its grid) are never
+    /// applied to another.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn sample_rate(&self) -> u32 {

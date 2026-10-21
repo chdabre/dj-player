@@ -30,7 +30,7 @@ The claude.ai links need the project owner's account. The exported copies in `do
 
 ## Current step
 
-Step 1 — "one deck plays" vertical slice on macOS. Scope and done-criteria are in [`docs/plan/step-1.md`](docs/plan/step-1.md).
+Step 2 — analysis in the deck, cues, loops, quantize. Scope and done-criteria are in [`docs/plan/step-2.md`](docs/plan/step-2.md). Step 1 ([`docs/plan/step-1.md`](docs/plan/step-1.md)) is code-complete; analysis work is in [`docs/plan/analysis.md`](docs/plan/analysis.md).
 
 ## Working conventions
 

@@ -44,6 +44,10 @@ pub struct DeckState {
     /// Slip shadow playhead, frames at the engine rate.
     pub shadow_position: AtomicF64,
     pub rate: AtomicF64,
+    /// Track tempo from the grid; 0 without a grid. The playing tempo is this times `rate`.
+    pub track_bpm: AtomicF64,
+    /// Fractional beat number at the playhead (0.0 = first grid beat); NaN without a grid.
+    pub beat: AtomicF64,
     /// Track length in frames (estimate while loading).
     pub length: AtomicF64,
     /// True if the last block hit a chunk that was not loaded yet.
