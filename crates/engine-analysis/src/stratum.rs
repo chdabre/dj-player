@@ -71,6 +71,7 @@ impl Analyzer for Stratum {
         &mut self,
         audio: &TrackAudio,
         want: FeatureSet,
+        _context: &[Analysis],
         cancel: &CancelFlag,
     ) -> Result<Analysis, AnalysisError> {
         cancel.check()?;

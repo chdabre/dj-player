@@ -70,6 +70,7 @@ fn fits_tempo_phase_and_bars_across_tempos_and_rates() {
             .analyze(
                 &track(sr, bpm, intro, seconds),
                 FeatureSet::ALL,
+                &[],
                 &CancelFlag::new(),
             )
             .expect("analysis");
@@ -97,5 +98,57 @@ fn fits_tempo_phase_and_bars_across_tempos_and_rates() {
             "{sr} {bpm}: downbeat F {}",
             downs.f_measure
         );
+    }
+}
+
+#[test]
+fn a_tempo_hint_decides_the_octave() {
+    use engine_analysis::{Analysed, Analysis, AnalyzerId, Provenance, Tempo};
+    // 165 with a kick on every beat: alone, gridfit picks 82.5 (see above).
+    let audio = track(44_100, 165.0, 1.0, 60.0);
+    let hint = |name: &str, provenance: Provenance| Analysis {
+        tempo: Some(Analysed {
+            value: Tempo { bpm: 165.0 },
+            confidence: None,
+            provenance: if name.is_empty() {
+                provenance
+            } else {
+                Provenance::Analyzer(AnalyzerId {
+                    name: name.into(),
+                    version: "test".into(),
+                    params: String::new(),
+                })
+            },
+        }),
+        ..Analysis::default()
+    };
+    let mut g = GridFit::hinted("tempocnn");
+    let a = g
+        .analyze(
+            &audio,
+            FeatureSet::ALL,
+            &[hint("tempocnn", Provenance::Manual)],
+            &CancelFlag::new(),
+        )
+        .unwrap();
+    let tempo = a.tempo.unwrap();
+    assert!(
+        (tempo.value.bpm - 165.0).abs() < 0.02,
+        "{}",
+        tempo.value.bpm
+    );
+    let Provenance::Analyzer(id) = tempo.provenance else {
+        panic!()
+    };
+    assert!(id.params.contains("hint=tempocnn test"), "{}", id.params);
+    // Another analyzer's tempo, or reference data, is not a hint.
+    for other in [
+        hint("someone-else", Provenance::Manual),
+        hint("", Provenance::Rekordbox),
+    ] {
+        let a = g
+            .analyze(&audio, FeatureSet::ALL, &[other], &CancelFlag::new())
+            .unwrap();
+        assert!((a.tempo.unwrap().value.bpm - 82.5).abs() < 0.02);
     }
 }

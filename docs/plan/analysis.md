@@ -47,15 +47,44 @@ What the tuning showed:
 - **Octave:** gridfit alone confuses 4:3 and 3:2 (90→120, 160→107) and, with a kick on every beat, double and half. TempoCNN made none of these errors but reports whole BPM only.
 - **Key:** Essentia's `KeyExtractor` (EDM profile) is the best so far and still only 60 %.
 
+## Validation (162 hand-corrected tracks, 2026-10-21)
+
+The `Validation` playlist (80–185 BPM, 160 MP3 + 2 WAV), corrected by hand in Rekordbox and disjoint from the tuning set:
+
+| | gridfit+tempocnn | tempocnn | gridfit | essentia (DSP) | hpcpkey |
+| --- | --- | --- | --- | --- | --- |
+| Tempo within ±0.5 BPM | **94.4 %** | 92.0 % | 85.2 % | 72.8 % | — |
+| Half/double, 3:2 or wrong | 5.6 % (all half/double) | 5.6 % | 14.3 % | 16.7 % | — |
+| Beat F (±70 ms) | **0.939** | — | 0.885 | 0.702 | — |
+| Downbeat F | **0.607** | — | 0.539 | — | — |
+| Key correct / MIREX | — | — | — | 50 % / 0.610 | 50 % / 0.610 |
+| s per 5-min track | 0.54 (+0.27 tempocnn) | 0.27 | 0.55 | 3.16 | 0.35 |
+
+- The combined tempo + grid is better on unseen tracks than on the tuning set (beat F 0.939 vs 0.83), so the tuning did not overfit.
+- All nine tempo misses are 80–92 vs 160–185 BPM, and the reference goes both ways (87 for some tracks, 174 for others): a display convention to settle with a BPM range setting, as Rekordbox does, not a detection error.
+- **MP3 start offset:** on MP3s Rekordbox's grid is 23.4 ms (median) later than ours; on the two WAVs 0.7 ms. That is the size of an MP3 encoder's start delay (576 + 529 samples ≈ 25 ms at 44.1 kHz): Rekordbox and Symphonia (gapless on) disagree on where an MP3 starts. Grids and cues imported from Rekordbox need that correction for MP3s; more WAV/AIFF tracks would pin it down.
+- Key is the weak feature: 50 %.
+
+## Ported backends
+
+Both ports are checked against the implementation they replace before they are scored:
+
+- **`tempocnn`** (Rust, tract): same BPM as Essentia's TempoCNN on all 100 tuning tracks, 7.5x faster. The model is not in the repo; convert it once with tf2onnx (TensorFlow 2.15, Python 3.11): `python -m tf2onnx.convert --graphdef deeptemp-k16-3.pb --inputs input:0 --outputs output:0 --opset 13 --output deeptemp-k16-3.onnx` (max abs difference to TensorFlow 5e-7), and point `TEMPOCNN_MODEL` at it.
+- **`hpcpkey`** (Rust): Essentia's `KeyExtractor` with its defaults and the EDM profile; same key as Essentia on all 162 validation tracks, 9x faster. **License:** a close translation of Essentia's code, so the file is AGPL-3.0-or-later; it sits behind the `hpcpkey` feature so the crate can be built without AGPL code.
+- **`gridfit+tempocnn`**: gridfit refines the tempo of the analyzer named in its hint (TempoCNN) within ±1 %, so TempoCNN decides octave and 3:2 questions and gridfit the exact BPM, phase and bars.
+
 ## Plan: our own analysis package
 
 Pick the best part for each feature, port it to Rust, and run everything in-process on the Pi:
 
-1. **Tempo:** TempoCNN (`deeptemp-k16-3`, AGPL-3.0, 1.3 MB) converted to ONNX and run in Rust (`tract` or `ort`), with Essentia's mel front-end ported. It decides the tempo; gridfit refines it to ~0.001 BPM.
-2. **Grid:** gridfit, searching only around the TempoCNN tempo. Needs the `Analyzer` interface to pass earlier results (a tempo hint) to later analyzers.
-3. **Key:** port Essentia's `KeyExtractor` (HPCP chroma plus key profiles) to Rust; then compare profiles and libKeyFinder.
+1. ~~Tempo: TempoCNN in Rust~~ (done: `tempocnn`).
+2. ~~Grid: gridfit around the TempoCNN tempo~~ (done: `gridfit+tempocnn`).
+3. ~~Key: port Essentia's `KeyExtractor`~~ (done: `hpcpkey`). Next: raise it from 50 %: other profiles (bgate, Krumhansl, Temperley are in the port), libKeyFinder, or a key CNN.
 4. Essentia (Python worker) and stratum-dsp stay as reference backends for the scorer only.
-5. A second, independent ground-truth set before trusting the tuned numbers.
+5. ~~A second, independent ground-truth set~~ (done: the Validation playlist).
+6. **BPM range setting** (decided 2026-10-21): settles 87 vs 174 the way Rekordbox's range does.
+7. **MP3 start offset:** detect it automatically rather than hard-coding a correction.
+8. **Licensing** (decided 2026-10-21): AGPL-3.0 is fine; the player may ship the TempoCNN model and `hpcpkey`.
 
 Each port is checked against the reference implementation it replaces (same outputs on the same audio) before it is scored.
 

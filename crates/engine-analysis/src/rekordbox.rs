@@ -31,6 +31,8 @@ pub struct TempoMarker {
 /// One track of the collection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct XmlTrack {
+    /// Rekordbox's `TrackID`, which playlists refer to.
+    pub id: String,
     pub name: String,
     pub artist: String,
     /// "MP3 File", "WAV File", ...
@@ -223,6 +225,47 @@ pub fn read_collection(xml: &str) -> Result<Vec<XmlTrack>, String> {
     Ok(tracks)
 }
 
+/// The `TrackID`s of the playlist called `name` (anywhere in the playlist tree), in order;
+/// `None` if there is no such playlist.
+pub fn read_playlist(xml: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut in_playlists = false;
+    let mut depth_in_list: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut ids = Vec::new();
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| format!("XML error at byte {}: {e}", reader.buffer_position()))?;
+        match event {
+            Event::Start(e) if e.name().as_ref() == "PLAYLISTS" => in_playlists = true,
+            Event::End(e) if e.name().as_ref() == "PLAYLISTS" => in_playlists = false,
+            Event::Start(e) if in_playlists && e.name().as_ref() == "NODE" => {
+                depth += 1;
+                let a = attrs(&e)?;
+                if depth_in_list.is_none() && get(&a, "Type") == "1" && get(&a, "Name") == name {
+                    depth_in_list = Some(depth);
+                }
+            }
+            Event::End(e) if in_playlists && e.name().as_ref() == "NODE" => {
+                if depth_in_list == Some(depth) {
+                    return Ok(Some(ids));
+                }
+                depth -= 1;
+            }
+            Event::Empty(e) | Event::Start(e)
+                if depth_in_list.is_some() && e.name().as_ref() == "TRACK" =>
+            {
+                ids.push(get(&attrs(&e)?, "Key").to_string());
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(depth_in_list.map(|_| ids))
+}
+
 fn attrs(e: &BytesStart) -> Result<Vec<(String, String)>, String> {
     e.attributes()
         .map(|a| {
@@ -253,6 +296,7 @@ fn track(e: &BytesStart) -> Result<XmlTrack, String> {
     let tonality = get(&a, "Tonality").trim();
     let key = Key::parse(tonality);
     Ok(XmlTrack {
+        id: get(&a, "TrackID").into(),
         name: get(&a, "Name").into(),
         artist: get(&a, "Artist").into(),
         kind: get(&a, "Kind").into(),
@@ -333,7 +377,7 @@ mod tests {
       <TEMPO Inizio="1.0" Bpm="90.00" Metro="3/4" Battito="2"/>
     </TRACK>
   </COLLECTION>
-  <PLAYLISTS><NODE Type="0" Name="ROOT"><TRACK Key="2"/></NODE></PLAYLISTS>
+  <PLAYLISTS><NODE Type="0" Name="ROOT"><NODE Type="1" Name="Validation" Entries="2"><TRACK Key="3"/><TRACK Key="2"/></NODE><NODE Type="1" Name="Empty" Entries="0"></NODE></NODE></PLAYLISTS>
 </DJ_PLAYLISTS>"#;
 
     #[test]
@@ -367,6 +411,16 @@ mod tests {
         let waltz = t[2].beatgrid(5.0).unwrap();
         let pos: Vec<u8> = waltz.beats.iter().map(|b| b.bar_pos).collect();
         assert_eq!(pos, [2, 3, 1, 2, 3, 1]);
+    }
+
+    #[test]
+    fn reads_playlists() {
+        assert_eq!(
+            read_playlist(XML, "Validation").unwrap(),
+            Some(vec!["3".into(), "2".into()])
+        );
+        assert_eq!(read_playlist(XML, "Empty").unwrap(), Some(vec![]));
+        assert_eq!(read_playlist(XML, "Nope").unwrap(), None);
     }
 
     #[test]

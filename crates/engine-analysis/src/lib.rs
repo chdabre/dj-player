@@ -20,12 +20,16 @@ pub mod analyzer;
 #[cfg(feature = "essentia")]
 pub mod essentia;
 pub mod gridfit;
+#[cfg(feature = "hpcpkey")]
+pub mod hpcpkey;
 pub mod model;
 pub mod rekordbox;
 pub mod score;
 pub mod select;
 #[cfg(feature = "stratum")]
 pub mod stratum;
+#[cfg(feature = "tempocnn")]
+pub mod tempocnn;
 
 pub use analyzer::{AnalysisError, Analyzer, CancelFlag, RunResults, run_all};
 pub use gridfit::{GridFit, GridFitConfig, PhaseSource};
@@ -51,6 +55,8 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<TrackAudio, engine_medi
 #[allow(unused_mut, clippy::vec_init_then_push)]
 pub fn analyzers() -> Vec<Box<dyn Analyzer>> {
     let mut v: Vec<Box<dyn Analyzer>> = vec![Box::new(GridFit::default())];
+    #[cfg(feature = "hpcpkey")]
+    v.push(Box::new(hpcpkey::HpcpKey::default()));
     #[cfg(feature = "stratum")]
     v.push(Box::new(Stratum::new()));
     #[cfg(feature = "essentia")]
@@ -61,5 +67,16 @@ pub fn analyzers() -> Vec<Box<dyn Analyzer>> {
             None => {}
         }
     }
+    #[cfg(feature = "tempocnn")]
+    match tempocnn::TempoCnn::from_env() {
+        Some(Ok(t)) => v.push(Box::new(t)),
+        Some(Err(e)) => eprintln!("tempocnn unavailable: {e}"),
+        None => {}
+    }
+    #[cfg(feature = "tempocnn")]
+    v.push(Box::new(GridFit::hinted("tempocnn")));
+    // Last, so TempoCNN has run: gridfit refines its tempo.
+    #[cfg(feature = "essentia")]
+    v.push(Box::new(GridFit::hinted("essentia-tempocnn")));
     v
 }

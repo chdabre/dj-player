@@ -20,12 +20,17 @@ pub trait Analyzer: Send {
     /// Compute the features in `want` that this analyzer provides. The result holds only
     /// those; each carries [`crate::Provenance::Analyzer`] with [`Analyzer::id`].
     ///
+    /// `context` holds what the analyzers that ran earlier on the same track produced; a
+    /// backend may use it as a hint (gridfit refines the tempo of a named analyzer). It
+    /// never contains reference data being scored against.
+    ///
     /// Backends check `cancel` where they can; one that runs a library call to completion
     /// checks it before and after.
     fn analyze(
         &mut self,
         audio: &TrackAudio,
         want: FeatureSet,
+        context: &[Analysis],
         cancel: &CancelFlag,
     ) -> Result<Analysis, AnalysisError>;
 }
@@ -82,7 +87,8 @@ impl std::error::Error for AnalysisError {}
 pub type RunResults = Vec<(AnalyzerId, Result<Analysis, AnalysisError>)>;
 
 /// Run every analyzer that provides something in `want`, in order, and collect what each one
-/// produced. A failing analyzer is reported and skipped; cancellation stops the run.
+/// produced. Each analyzer sees, as its context, the results of those that ran before it. A
+/// failing analyzer is reported and skipped; cancellation stops the run.
 pub fn run_all(
     analyzers: &mut [Box<dyn Analyzer>],
     audio: &TrackAudio,
@@ -90,15 +96,18 @@ pub fn run_all(
     cancel: &CancelFlag,
 ) -> Result<RunResults, AnalysisError> {
     let mut out = Vec::new();
+    let mut context: Vec<Analysis> = Vec::new();
     for a in analyzers.iter_mut() {
         let wanted = want.intersect(a.features());
         if wanted.is_empty() {
             continue;
         }
         cancel.check()?;
-        let result = a.analyze(audio, wanted, cancel);
-        if matches!(result, Err(AnalysisError::Cancelled)) {
-            return Err(AnalysisError::Cancelled);
+        let result = a.analyze(audio, wanted, &context, cancel);
+        match &result {
+            Err(AnalysisError::Cancelled) => return Err(AnalysisError::Cancelled),
+            Ok(r) => context.push(r.clone()),
+            Err(_) => {}
         }
         out.push((a.id(), result));
     }

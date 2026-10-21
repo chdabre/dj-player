@@ -3,7 +3,7 @@
 //! them. The CSV has a header and the columns `file,bpm,key` (paths relative to the CSV;
 //! empty cells are not scored).
 //! `engine-analyze rekordbox EXPORT.xml [--min-seconds N] [--limit N] [--only A,B]
-//! [--overrides FILE]`: score
+//! [--overrides FILE] [--playlist NAME]`: score
 //! against the
 //! tempo, grid and key of every track Rekordbox analysed whose file is present.
 
@@ -21,7 +21,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: engine-analyze FILE...\n       engine-analyze score TRUTH.csv\n       \
                  engine-analyze rekordbox EXPORT.xml [--min-seconds N] [--limit N] [--only A,B] \
-                 [--overrides FILE]"
+                 [--overrides FILE] [--playlist NAME]"
             );
             return ExitCode::from(2);
         }
@@ -54,9 +54,19 @@ fn run(path: &Path) -> Result<Vec<(String, Analysis)>> {
 /// Like [`run`], with each analyzer's wall time in seconds.
 fn run_audio(audio: &TrackAudio, only: &[String]) -> Result<Vec<(String, Analysis, f64)>> {
     let mut out = Vec::new();
+    // What earlier analyzers found, as a hint for later ones (never the reference data).
+    let mut context: Vec<Analysis> = Vec::new();
     for mut a in selected(only) {
         let started = Instant::now();
-        let analysis = a.analyze(audio, FeatureSet::ALL, &CancelFlag::new())?;
+        // One analyzer failing on one track is reported, not fatal for a long run.
+        let analysis = match a.analyze(audio, FeatureSet::ALL, &context, &CancelFlag::new()) {
+            Ok(analysis) => analysis,
+            Err(e) => {
+                eprintln!("  {}: {e}", a.id().name);
+                continue;
+            }
+        };
+        context.push(analysis.clone());
         let secs = started.elapsed().as_secs_f64();
         eprintln!(
             "  {}: {:.1} s for {:.0} s of audio ({:.0}x real time)",
@@ -158,11 +168,13 @@ fn rekordbox(args: &[String]) -> Result<()> {
     let mut limit = usize::MAX;
     let mut only: Vec<String> = Vec::new();
     let mut overrides = None;
+    let mut playlist: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--min-seconds" => min_seconds = it.next().ok_or("--min-seconds N")?.parse()?,
             "--limit" => limit = it.next().ok_or("--limit N")?.parse()?,
+            "--playlist" => playlist = Some(it.next().ok_or("--playlist NAME")?.clone()),
             "--overrides" => overrides = Some(PathBuf::from(it.next().ok_or("--overrides FILE")?)),
             "--only" => {
                 only = it
@@ -176,7 +188,13 @@ fn rekordbox(args: &[String]) -> Result<()> {
         }
     }
     let xml = xml.ok_or("rekordbox needs the XML export")?;
-    let mut tracks = engine_analysis::rekordbox::read_collection(&std::fs::read_to_string(&xml)?)?;
+    let text = std::fs::read_to_string(&xml)?;
+    let mut tracks = engine_analysis::rekordbox::read_collection(&text)?;
+    if let Some(name) = &playlist {
+        let ids = engine_analysis::rekordbox::read_playlist(&text, name)?
+            .ok_or_else(|| format!("no playlist {name:?}"))?;
+        tracks.retain(|t| ids.contains(&t.id));
+    }
     if let Some(path) = &overrides {
         let o = engine_analysis::rekordbox::Overrides::parse(&std::fs::read_to_string(path)?)?;
         for (rule, hits) in o.apply(&mut tracks) {

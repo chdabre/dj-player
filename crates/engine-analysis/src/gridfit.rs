@@ -74,7 +74,15 @@ pub struct GridFitConfig {
     /// Use the band envelope (see [`PhaseSource::Bands`]) instead of the linear-bin flux
     /// for the tempo as well.
     pub band_tempo: bool,
+    /// Refine the tempo of this analyzer (by [`AnalyzerId::name`]), if it ran earlier on
+    /// the same track, instead of choosing the tempo itself: the search then stays within
+    /// [`HINT_SPAN`] of it, so the hint decides octave and 3:2 questions.
+    pub tempo_hint: Option<&'static str>,
 }
+
+/// How far (relative) gridfit searches around a hinted tempo. TempoCNN reports whole BPM,
+/// so ±1 % covers its rounding at any club tempo.
+pub const HINT_SPAN: f64 = 0.01;
 
 impl Default for GridFitConfig {
     fn default() -> Self {
@@ -87,6 +95,7 @@ impl Default for GridFitConfig {
             prior_octaves: 1.0,
             phase: PhaseSource::Bands,
             band_tempo: true,
+            tempo_hint: None,
         }
     }
 }
@@ -103,6 +112,14 @@ impl Default for GridFit {
 }
 
 impl GridFit {
+    /// gridfit that refines the tempo of `analyzer`, run before it (`gridfit+<analyzer>`).
+    pub fn hinted(analyzer: &'static str) -> Self {
+        Self::new(GridFitConfig {
+            tempo_hint: Some(analyzer),
+            ..GridFitConfig::default()
+        })
+    }
+
     pub fn new(config: GridFitConfig) -> Self {
         Self {
             config,
@@ -115,7 +132,10 @@ impl Analyzer for GridFit {
     fn id(&self) -> AnalyzerId {
         let c = &self.config;
         AnalyzerId {
-            name: "gridfit".into(),
+            name: match c.tempo_hint {
+                Some(from) => format!("gridfit+{from}"),
+                None => "gridfit".into(),
+            },
             version: env!("CARGO_PKG_VERSION").into(),
             params: format!(
                 "{RATE}Hz,frame={FRAME},hop={HOP},range={}-{},prior={}/{},phase={:?},band_tempo={}",
@@ -132,9 +152,20 @@ impl Analyzer for GridFit {
         &mut self,
         audio: &TrackAudio,
         want: FeatureSet,
+        context: &[Analysis],
         cancel: &CancelFlag,
     ) -> Result<Analysis, AnalysisError> {
         cancel.check()?;
+        // The named analyzer's tempo; never reference data (Rekordbox, manual edits).
+        let hint = self.config.tempo_hint.and_then(|from| {
+            context.iter().find_map(|a| {
+                let t = a.tempo.as_ref()?;
+                match &t.provenance {
+                    Provenance::Analyzer(id) if id.name == from => Some((t.value.bpm, id.clone())),
+                    _ => None,
+                }
+            })
+        });
         let audio = audio.at_rate(RATE).map_err(AnalysisError::Backend)?;
         let mono = audio.mono();
         if mono.len() < FRAME * 64 {
@@ -151,11 +182,21 @@ impl Analyzer for GridFit {
         };
         let low = onset_envelope(&frames.flux_low, &frames.flux_low, fps);
         let linear = onset_envelope(&frames.flux_full, &frames.flux_low, fps);
-        let Some(coarse) = coarse_period(&[&env, &low, &linear], fps, &self.config) else {
+        let search = match &hint {
+            Some((bpm, _)) => GridFitConfig {
+                min_bpm: bpm * (1.0 - HINT_SPAN),
+                max_bpm: bpm * (1.0 + HINT_SPAN),
+                ..self.config
+            },
+            None => self.config,
+        };
+        let Some(coarse) = coarse_period(&[&env, &low, &linear], fps, &search) else {
             return Ok(Analysis::default());
         };
         cancel.check()?;
-        let mut fit = fine_fit(&env, fps, coarse);
+        // With a hint, the fine search must not wander off it either.
+        let span = if hint.is_some() { HINT_SPAN } else { 0.02 };
+        let mut fit = fine_fit(&env, fps, coarse, span);
         // The kick defines where the beat is; hats and claps on the off-beats can outweigh it
         // in the full band. Take the phase from the chosen source when it has a clear pulse.
         let source = match self.config.phase {
@@ -177,7 +218,12 @@ impl Analyzer for GridFit {
             b.bar_pos = ((k + 4 - bar) % 4) as u8 + 1;
         }
 
-        let provenance = Provenance::Analyzer(self.id());
+        let mut id = self.id();
+        if let Some((_, from)) = &hint {
+            // The result depends on the hint's source: part of the cache key.
+            id.params += &format!(",hint={} {}", from.name, from.version);
+        }
+        let provenance = Provenance::Analyzer(id);
         let mut out = Analysis::default();
         if want.contains(Feature::Tempo) {
             out.tempo = Some(Analysed {
@@ -455,10 +501,10 @@ fn sharpness(env: &[f32], fps: f64, period: f64) -> (f64, f64) {
     (score, phase)
 }
 
-/// Refine the period around `coarse` (±2 %) coarse to fine and find the phase.
-fn fine_fit(env: &[f32], fps: f64, coarse: f64) -> Fit {
+/// Refine the period around `coarse` (± `relative_span`) coarse to fine and find the phase.
+fn fine_fit(env: &[f32], fps: f64, coarse: f64, relative_span: f64) -> Fit {
     let mut center = coarse;
-    let mut span = 0.02 * coarse;
+    let mut span = relative_span * coarse;
     let mut best = (0.0, coarse, 0.0);
     for _ in 0..4 {
         let steps = 40;

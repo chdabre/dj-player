@@ -42,7 +42,7 @@ fn finds_tempo_and_grid_of_a_track_with_a_silent_intro() {
     let (bpm, intro, seconds) = (124.0, 3.0, 40.0);
     let audio = track(bpm, intro, seconds);
     let a = Stratum::new()
-        .analyze(&audio, FeatureSet::ALL, &CancelFlag::new())
+        .analyze(&audio, FeatureSet::ALL, &[], &CancelFlag::new())
         .expect("analysis");
 
     let tempo = a.tempo.expect("tempo").value.bpm;
@@ -74,7 +74,7 @@ fn cancelled_jobs_stop() {
     flag.cancel();
     let audio = track(120.0, 0.0, 5.0);
     assert!(matches!(
-        Stratum::new().analyze(&audio, FeatureSet::ALL, &flag),
+        Stratum::new().analyze(&audio, FeatureSet::ALL, &[], &flag),
         Err(engine_analysis::AnalysisError::Cancelled)
     ));
 }

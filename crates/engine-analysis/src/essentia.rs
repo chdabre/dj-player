@@ -157,6 +157,7 @@ impl Analyzer for Essentia {
         &mut self,
         audio: &TrackAudio,
         want: FeatureSet,
+        _context: &[Analysis],
         cancel: &CancelFlag,
     ) -> Result<Analysis, AnalysisError> {
         cancel.check()?;

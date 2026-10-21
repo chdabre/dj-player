@@ -3,12 +3,19 @@ name = "engine-analysis"
 description = "Track analysis (tempo, beatgrid, key) behind pluggable backends, plus a ground-truth scorer."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# hpcpkey.rs is AGPL-3.0-or-later (ported from Essentia); everything else is GPL-3.0-or-later.
+license = "GPL-3.0-or-later AND AGPL-3.0-or-later"
 rust-version.workspace = true
 publish = false
 
 [features]
-default = ["stratum"]
+default = ["stratum", "tempocnn", "hpcpkey"]
+# Key detection ported from Essentia's KeyExtractor. The port is AGPL-3.0-or-later (derived
+# from Essentia); without this feature the crate contains no AGPL code.
+hpcpkey = []
+# TempoCNN in Rust: the converted model runs on tract (pure Rust, MIT OR Apache-2.0). The
+# model itself (AGPL-3.0) is not bundled; it is loaded from a path.
+tempocnn = ["dep:tract-onnx"]
 # stratum-dsp: pure Rust, MIT OR Apache-2.0.
 stratum = ["dep:stratum-dsp"]
 # Essentia (AGPL-3.0) through a Python worker process: classic DSP, and the TempoCNN model.
@@ -19,6 +26,7 @@ essentia = ["dep:serde_json"]
 engine-media.workspace = true
 quick-xml.workspace = true
 rustfft.workspace = true
+tract-onnx = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 stratum-dsp = { workspace = true, optional = true }
 
