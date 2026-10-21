@@ -103,9 +103,16 @@ impl Clock {
 
     /// A new value for an edit made now (`wall_ms`, milliseconds since the Unix epoch, or 0
     /// without a clock), strictly greater than every earlier one. A wall clock set beyond
-    /// [`MAX_PLAUSIBLE_MS`] counts as that.
+    /// [`MAX_PLAUSIBLE_MS`] counts as no clock: clamping it to the ceiling instead would pin
+    /// every device that mounts the library there, and once the counter carried past the
+    /// ceiling their edits would be dropped as implausible.
     pub fn tick(&mut self, wall_ms: u64) -> Hlc {
-        let wall = Hlc::new(wall_ms.min(MAX_PLAUSIBLE_MS), 0);
+        let wall_ms = if wall_ms > MAX_PLAUSIBLE_MS {
+            0
+        } else {
+            wall_ms
+        };
+        let wall = Hlc::new(wall_ms, 0);
         self.last = if wall > self.last {
             wall
         } else {
@@ -150,8 +157,12 @@ mod tests {
         c.observe(Hlc::new(MAX_PLAUSIBLE_MS + 1, 0));
         assert_eq!(c.tick(500), Hlc::new(1000, 1));
         assert!(Hlc::new(MAX_PLAUSIBLE_MS, 0xffff).is_plausible());
-        // A wall clock set to the year 9000 stamps at the ceiling, not beyond.
-        assert_eq!(c.tick(u64::MAX), Hlc::new(MAX_PLAUSIBLE_MS, 0));
+        // A wall clock set to the year 9000 counts as none: the clock keeps counting from
+        // what it has seen, far from the ceiling.
+        assert_eq!(c.tick(u64::MAX), Hlc::new(1000, 2));
+        assert_eq!(c.tick(MAX_PLAUSIBLE_MS + 1), Hlc::new(1000, 3));
+        // Right at the ceiling is still a (very late) clock.
+        assert_eq!(c.tick(MAX_PLAUSIBLE_MS), Hlc::new(MAX_PLAUSIBLE_MS, 0));
     }
 
     #[test]
