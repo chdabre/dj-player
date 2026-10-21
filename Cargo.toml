@@ -14,7 +14,7 @@ engine-media = { path = "crates/engine-media" }
 engine-io = { path = "crates/engine-io" }
 engine-stretch = { path = "crates/engine-stretch" }
 engine-analysis = { path = "crates/engine-analysis" }
-waveform = { path = "crates/waveform" }
+waveform = { path = "crates/waveform", default-features = false }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"
