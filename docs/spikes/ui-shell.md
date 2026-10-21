@@ -26,6 +26,19 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
 - **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view marks the analysed beat grid with ticks along its top and bottom edges, drawn over the waveform: white for beats, solid red for downbeats. The loop, cue, slip shadow and centred playhead are drawn on top. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
 
+## Scrubbing the waveform
+
+Touching the zoom waveform (on either screen) takes the track; dragging moves it with the waveform under the finger (drag left to play forward); letting go releases it.
+
+- **Engine: a scratch mode in the transport** (`ScratchBegin` / `ScratchBy(frames)` / `ScratchEnd`), meant for the jog wheel too.
+  - The playhead is pulled to the hand's target by a critically damped spring (τ = 10 ms), solved exactly per block. Jittery touch updates play as smooth record movement, the track eases to a stop when the finger stops, and it never swings back past the target.
+  - Catching a playing track starts from its speed and brings it to rest without running backwards.
+  - Scratching plays through the resampler (the pitch follows the hand, like vinyl), even with keylock on, and a paused deck is audible while it is held. Taking and releasing the track is declicked.
+  - Letting go: a playing track plays on at its rate; with slip on it returns to the shadow. A paused track stays exactly where the finger left it.
+  - Tests (offline, under `assert_no_alloc`): following and settling, speed changes bounded by the spring, slip snap-back, play resuming, no click on take and release.
+- **UI:** the drag sends relative moves (frames = −Δx × frames per design pixel of the zoom). While scrubbing, the waveform shows the finger's position directly, so the picture has no lag; the audio trails it by about 2τ.
+- **Still to try on real hardware:** the feel at different zoom levels, and whether the spring time suits a jog wheel too.
+
 ## Performance screen
 
 `p` or the PERFORM button switches between the main screen and the performance screen ("2 · Performance" and its three variants on the canvas, at 1024×600). The pads' logic is `perform::press`, a pure function from a touch to a deck command, tested without a window.

@@ -37,6 +37,8 @@ pub enum Target {
     JumpSize,
     /// The overview: touching it seeks (needle search).
     Overview,
+    /// The zoom waveform: touching it takes the track, dragging scrubs it.
+    Waveform,
     // Performance screen.
     HotCueMode,
     BeatJumpMode,
@@ -380,6 +382,14 @@ pub fn build(
 /// The colour of hot cue `i` (A = 0), until the library gives cues their own.
 pub(crate) fn hot_cue_color(t: &Theme, i: usize) -> Rgba {
     t.color.hot_cue_colors[i % t.color.hot_cue_colors.len()]
+}
+
+/// Frames across the zoom view: `zoom_beats` beats of the grid (120 BPM until there is one).
+pub fn zoom_span(grid: Option<&DeckGrid>, zoom_beats: f64, sample_rate: f64) -> f64 {
+    match grid {
+        Some(g) => zoom_beats * g.period(),
+        None => zoom_beats * 0.5 * sample_rate,
+    }
 }
 
 /// Hot cue `i`'s pad letter: A, B, …
@@ -797,11 +807,9 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: (f32, f32, f32, f32)) {
     let (x0, y0, w, h) = area;
     panel(ui, area, v.wave.map(|w| w.settings.zoom_align));
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
+    ui.hit(Target::Waveform, area);
     // Frames per design pixel.
-    let span = match v.grid {
-        Some(g) => v.zoom_beats * g.period(),
-        None => v.zoom_beats * 0.5 * v.sample_rate, // 120 BPM until the grid arrives
-    };
+    let span = zoom_span(v.grid, v.zoom_beats, v.sample_rate);
     let fpp = span / f64::from(w);
     let left = v.position - span * 0.5;
     let to_x = |pos: f64| x0 + ((pos - left) / fpp) as f32;

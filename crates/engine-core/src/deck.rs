@@ -59,6 +59,14 @@ pub enum DeckCommand {
     /// Keylock: rate changes speed, not pitch. Kept across track loads.
     SetKeylock(bool),
     ToggleKeylock,
+    /// The hand takes the track (touch on the waveform, later the jog): the playhead holds,
+    /// then follows [`DeckCommand::ScratchBy`]. Plays through the resampler, so the pitch
+    /// follows the hand like vinyl. With slip on and the track playing, the shadow runs on.
+    ScratchBegin,
+    /// Move the hand by this many frames (positive = forward in the track).
+    ScratchBy(f64),
+    /// The hand lets go: play state and rate as before; with slip, back to the shadow.
+    ScratchEnd,
     /// The CUE button (see [`crate::cue`]): press and release.
     CuePress,
     CueRelease,
@@ -245,6 +253,9 @@ impl Deck {
             DeckCommand::ToggleSlip => t.set_slip(!t.is_slip_enabled()),
             DeckCommand::SetKeylock(on) => t.set_keylock(on),
             DeckCommand::ToggleKeylock => t.set_keylock(!t.is_keylock_enabled()),
+            DeckCommand::ScratchBegin => t.scratch_begin(sr),
+            DeckCommand::ScratchBy(frames) => t.scratch_by(frames),
+            DeckCommand::ScratchEnd => t.scratch_end(),
         }
     }
 
@@ -252,6 +263,7 @@ impl Deck {
     fn uses_keylock(&self, transport: &Transport) -> bool {
         self.keylock.is_some()
             && transport.is_keylock_enabled()
+            && !transport.is_scratching()
             && Keylock::handles(transport.velocity())
     }
 
@@ -280,12 +292,12 @@ impl Deck {
         let mut next = self.transport;
         let parts = next.advance(frames);
         let first = parts.first();
-        let audible = self.transport.is_playing();
+        let audible = self.transport.is_audible();
         let stretch = self.uses_keylock(&self.transport);
         let fade = fade_from.filter(|old| {
             self.declick
                 && (old.position() != first.start
-                    || old.is_playing() != audible
+                    || old.is_audible() != audible
                     || self.uses_keylock(old) != stretch)
         });
 
@@ -294,7 +306,7 @@ impl Deck {
         let fade_len = frames.min(DECLICK_FRAMES);
         if let Some(mut old) = fade {
             let old_stretch = self.uses_keylock(&old);
-            let old_audible = old.is_playing();
+            let old_audible = old.is_audible();
             let old_parts = old.advance(fade_len);
             let scratch = &mut self.scratch[..fade_len * CHANNELS];
             let mut rendered = old_audible;
@@ -410,6 +422,7 @@ impl Deck {
         s.keylock_enabled
             .store(t.is_keylock_enabled(), Ordering::Relaxed);
         s.stretching.store(self.stretching, Ordering::Relaxed);
+        s.scratching.store(t.is_scratching(), Ordering::Relaxed);
         s.position.store(t.position());
         s.shadow_position.store(t.shadow_position());
         s.rate.store(t.rate());

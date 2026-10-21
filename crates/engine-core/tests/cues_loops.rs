@@ -224,3 +224,94 @@ fn loop_wraps_without_a_click() {
         .fold(0.0, f32::max);
     assert!(max_step < 0.03, "max step {max_step}");
 }
+
+#[test]
+fn scratching_moves_a_paused_track_by_hand_and_letting_go_leaves_it_there() {
+    let mut r = rig(true);
+    r.send(DeckCommand::SetKeylock(true));
+    r.send(DeckCommand::Seek(100_000.0));
+    r.render(BLOCK);
+    r.send(DeckCommand::ScratchBegin);
+    // The hand moves the track 0.5 s forward in 50 updates, one per 4 blocks (~10 ms).
+    let mut reads = Vec::new();
+    for _ in 0..50 {
+        r.send(DeckCommand::ScratchBy(24_000.0 / 50.0));
+        reads.extend(r.render(4 * BLOCK));
+    }
+    let st = Arc::clone(r.handle.deck_state(0));
+    assert!(st.scratching.load(Ordering::Relaxed));
+    assert!(
+        !st.stretching.load(Ordering::Relaxed),
+        "scratch plays through the resampler, not the keylock"
+    );
+    reads.extend(r.render(100 * BLOCK));
+    assert!((r.position() - 124_000.0).abs() < 0.5, "{}", r.position());
+    // The audio is the track moving forward: the frames read never go backwards (after the
+    // declick at the start).
+    let backwards = reads[engine_core::DECLICK_FRAMES..]
+        .windows(2)
+        .filter(|w| w[1] < w[0] - 0.05)
+        .count();
+    assert_eq!(backwards, 0);
+    r.send(DeckCommand::ScratchEnd);
+    r.render(BLOCK);
+    assert!(!st.playing.load(Ordering::Relaxed) && !st.scratching.load(Ordering::Relaxed));
+    assert!((r.position() - 124_000.0).abs() < 0.5);
+}
+
+#[test]
+fn letting_go_of_a_playing_track_plays_on_at_its_rate() {
+    let mut r = rig(true);
+    r.send(DeckCommand::Seek(100_000.0));
+    r.send(DeckCommand::Play);
+    r.render(10 * BLOCK);
+    r.send(DeckCommand::ScratchBegin);
+    r.send(DeckCommand::ScratchBy(-12_000.0));
+    r.render(40 * BLOCK);
+    r.send(DeckCommand::ScratchEnd);
+    let before = r.position();
+    r.render(10 * BLOCK);
+    assert!((r.position() - before - 10.0 * BLOCK as f64).abs() < 1e-6);
+    assert!(r.handle.deck_state(0).playing.load(Ordering::Relaxed));
+}
+
+#[test]
+fn taking_and_releasing_the_track_does_not_click() {
+    // A 100 Hz sine, paused: taking it, moving it and letting go must stay smooth.
+    let (mut engine, mut handle) = Engine::new(EngineConfig {
+        sample_rate: SR,
+        channels: 2,
+        decks: 1,
+    });
+    let w = std::f32::consts::TAU * 100.0 / SR as f32;
+    let signal: Vec<f32> = (0..10 * SR as usize)
+        .flat_map(|i| {
+            let x = 0.5 * (w * i as f32).sin();
+            [x, x]
+        })
+        .collect();
+    send(
+        &mut handle,
+        DeckCommand::Load(Source::from_interleaved(SR, &signal)),
+    );
+    send(&mut handle, DeckCommand::Seek(48_123.0));
+    let mut out = vec![0.0f32; 60 * BLOCK * CHANNELS];
+    for (b, block) in out.chunks_mut(BLOCK * CHANNELS).enumerate() {
+        match b {
+            5 => send(&mut handle, DeckCommand::ScratchBegin),
+            6..=30 => send(&mut handle, DeckCommand::ScratchBy(60.0)),
+            45 => send(&mut handle, DeckCommand::ScratchEnd),
+            _ => {}
+        }
+        let n = block.len() / CHANNELS;
+        assert_no_alloc::assert_no_alloc(|| engine.process(block, n));
+        handle.collect_retired();
+    }
+    let max_step = out
+        .chunks_exact(CHANNELS)
+        .zip(out.chunks_exact(CHANNELS).skip(1))
+        .map(|(a, b)| (b[0] - a[0]).abs())
+        .fold(0.0, f32::max);
+    // The sine's own steps at up to 4x are ~0.026; a hard start or stop could step by 0.5.
+    assert!(max_step < 0.05, "max step {max_step}");
+}

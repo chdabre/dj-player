@@ -242,6 +242,7 @@ fn main() -> ExitCode {
     let mut app = App {
         clock: PlayheadClock::new(player.format.sample_rate),
         last_shown: None,
+        scrub: None,
         player,
         title,
         fullscreen: args.fullscreen,
@@ -290,6 +291,13 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Scrub {
+    last_x: f32,
+    frames_per_px: f64,
+    shown: f64,
+}
+
 struct App {
     player: Player,
     title: String,
@@ -318,6 +326,9 @@ struct App {
     zoom: usize,
     debug: bool,
     clock: PlayheadClock,
+    /// The hand on the zoom waveform: where the finger was (design x), the frames one design
+    /// pixel covers, and the playhead the finger has moved the track to.
+    scrub: Option<Scrub>,
     last_shown: Option<(Instant, f64)>,
     stats: FrameStats,
     overlay: String,
@@ -365,6 +376,23 @@ impl App {
             Target::CallNext => self.send(DeckCommand::BeatJump(4.0)),
             Target::Zoom => self.zoom = (self.zoom + 1) % ZOOM_STEPS.len(),
             Target::Overview => self.seek_overview(dx),
+            Target::Waveform => {
+                let st = self.player.state();
+                let sr = f64::from(self.player.format.sample_rate);
+                let grid = self
+                    .player
+                    .analysed
+                    .as_ref()
+                    .and_then(|a| a.grid.as_deref());
+                let span = screen::zoom_span(grid, ZOOM_STEPS[self.zoom], sr);
+                let shown = self.last_shown.map_or(st.position.load(), |(_, p)| p);
+                self.scrub = Some(Scrub {
+                    last_x: dx,
+                    frames_per_px: span / f64::from(hit.w),
+                    shown,
+                });
+                self.send(DeckCommand::ScratchBegin);
+            }
             _ => {}
         }
     }
@@ -391,11 +419,32 @@ impl App {
     }
 
     fn drag(&mut self, x: f64, y: f64) {
+        if let (Some(mut scrub), Some(gfx)) = (self.scrub, &self.gfx) {
+            let (dx, _) = gfx.to_design(x, y);
+            // The waveform moves with the finger: dragging left plays forward.
+            let frames = -f64::from(dx - scrub.last_x) * scrub.frames_per_px;
+            let length = self.player.state().length.load();
+            scrub.shown = (scrub.shown + frames).clamp(0.0, length);
+            scrub.last_x = dx;
+            self.scrub = Some(scrub);
+            if frames != 0.0 {
+                self.send(DeckCommand::ScratchBy(frames));
+            }
+            return;
+        }
         if self.pressed == Some(Target::Overview)
             && let Some(gfx) = &self.gfx
         {
             let (dx, _) = gfx.to_design(x, y);
             self.seek_overview(dx);
+        }
+    }
+
+    /// The finger or button came up.
+    fn release(&mut self) {
+        self.pressed = None;
+        if self.scrub.take().is_some() {
+            self.send(DeckCommand::ScratchEnd);
         }
     }
 
@@ -515,7 +564,12 @@ impl App {
         } else {
             0.0
         };
-        let position = self.clock.update(now, st.position.load(), speed);
+        let mut position = self.clock.update(now, st.position.load(), speed);
+        if let Some(scrub) = self.scrub {
+            // Under the finger the picture follows the hand at once; the audio trails it by the
+            // scratch spring's few milliseconds.
+            position = scrub.shown;
+        }
         if let Some((t, p)) = self.last_shown
             && speed != 0.0
         {
@@ -696,14 +750,14 @@ impl ApplicationHandler for App {
                 ..
             } => match state {
                 ElementState::Pressed => self.press(self.cursor.0, self.cursor.1),
-                ElementState::Released => self.pressed = None,
+                ElementState::Released => self.release(),
             },
             WindowEvent::Touch(Touch {
                 phase, location, ..
             }) => match phase {
                 TouchPhase::Started => self.press(location.x, location.y),
                 TouchPhase::Moved => self.drag(location.x, location.y),
-                TouchPhase::Ended | TouchPhase::Cancelled => self.pressed = None,
+                TouchPhase::Ended | TouchPhase::Cancelled => self.release(),
             },
             _ => {}
         }

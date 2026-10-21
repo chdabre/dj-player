@@ -39,6 +39,8 @@ pub struct DeckState {
     /// The last block went through the time-stretcher. False with keylock on while the
     /// deck is paused, reversing or at a rate the stretcher does not play.
     pub stretching: AtomicBool,
+    /// The track is moved by hand (waveform scrub, jog).
+    pub scratching: AtomicBool,
     /// Audible playhead, frames at the engine rate.
     pub position: AtomicF64,
     /// Slip shadow playhead, frames at the engine rate.
