@@ -85,6 +85,12 @@ pub struct TrackInfo {
     pub file_frames: Option<u64>,
     /// Engine (device) sample rate the source is stored at.
     pub sample_rate: u32,
+    /// Frames (at the file's rate) the decoder drops from the start for gapless playback:
+    /// for MP3 the LAME header's encoder delay plus the decoder's 529 frames; 0 if the file
+    /// states none. Software that decodes without gapless trimming has its sample 0 this
+    /// many frames earlier, so times taken from it (e.g. Rekordbox grids and cues) are this
+    /// much later than ours.
+    pub start_trim: u32,
 }
 
 /// A track being loaded: the source is usable right away; `thread` finishes the decode.
@@ -109,6 +115,7 @@ pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, Lo
         file_channels: decoding.channels,
         file_frames: decoding.frames,
         sample_rate,
+        start_trim: decoding.start_trim,
     };
     let ratio = sample_rate as f64 / decoding.sample_rate as f64;
 
@@ -149,6 +156,20 @@ pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, Lo
             })
         }
     }
+}
+
+/// Probe `path` without decoding it. `sample_rate` in the result is the file's own rate.
+pub fn probe(path: impl AsRef<Path>) -> Result<TrackInfo, LoadError> {
+    let path = path.as_ref();
+    let d = Decoding::open(path)?;
+    Ok(TrackInfo {
+        path: path.to_path_buf(),
+        file_sample_rate: d.sample_rate,
+        file_channels: d.channels,
+        file_frames: d.frames,
+        sample_rate: d.sample_rate,
+        start_trim: d.start_trim,
+    })
 }
 
 /// Decode `path` completely at the file's own sample rate. Returns interleaved stereo and that
@@ -228,6 +249,7 @@ struct Decoding {
     sample_rate: u32,
     channels: usize,
     frames: Option<u64>,
+    start_trim: u32,
 }
 
 impl Decoding {
@@ -258,6 +280,7 @@ impl Decoding {
             .make_audio_decoder(params, &AudioDecoderOptions::default().gapless(true))?;
         let track_id = track.id;
         let frames = track.num_frames;
+        let start_trim = track.delay.unwrap_or(0);
         Ok(Self {
             format,
             decoder,
@@ -265,6 +288,7 @@ impl Decoding {
             sample_rate,
             channels,
             frames,
+            start_trim,
         })
     }
 
