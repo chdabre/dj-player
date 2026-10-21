@@ -26,6 +26,18 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
 - **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view marks the analysed beat grid with ticks along its top and bottom edges, drawn over the waveform: white for beats, solid red for downbeats. The loop, cue, slip shadow and centred playhead are drawn on top. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
 
+## Performance screen
+
+`p` or the PERFORM button switches between the main screen and the performance screen ("2 · Performance" and its three variants on the canvas, at 1024×600). The pads' logic is `perform::press`, a pure function from a touch to a deck command, tested without a window.
+
+- **HOT CUE:** four pads per bank. An empty pad stores the playhead (quantized); a set pad jumps there. Pads are tinted in their cue's colour, from the theme until the library carries colours. BANK pages through the hot cues four at a time (A–D, E–H).
+- **BEAT JUMP:** the pads jump ∓4 / ∓1 beats; BANK switches them to ∓32 / ∓16.
+- **DELETE:** arms deletion. Set pads show "✕ A, TAP TO DELETE" and delete on tap, until DELETE is tapped again or the mode changes. The canvas's CALL mode (stored hot cues to call up) waits for the library.
+- **BEAT LOOP:** 1/2 to 16 beats from the playhead; the active length is highlighted, and tapping it exits the loop.
+- **Waveform:** the zoom is drawn smaller (703×72), and both waveforms now show hot cues: a line and a lettered tag in the zoom, a small tag in the overview. The engine publishes each hot cue's position for this (`DeckState::hot_cue_positions`, NaN when empty).
+- **Shared with the main screen:** the rail's player number and SLIP, the phase meters (`screen::phase`), the cue column, the status band and the bottom strip are the same code, parametrised by position. The main screen renders byte-identically after that refactor.
+- **Screenshots:** `--perform`, `--pad-mode hotcue|beatjump|delete` and `--hot-cues 57,61,64` (seconds) set up the screen for `--screenshot`.
+
 ## Design tokens
 
 Every colour, font size, corner radius and line width the screen uses lives in one `Theme` (`crates/ui/src/theme.rs`), named by role: `button_edge`, `cue`, `readout`, `section_radius`, and so on. `screen.rs` asks the theme and has no colour literals; a test fails if a colour literal turns up in `screen.rs`, `main.rs` or `gfx.rs`. The frame's clear colour comes from the theme too.

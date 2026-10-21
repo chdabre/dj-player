@@ -164,6 +164,9 @@ fn cue_and_hot_cues_land_on_grid_lines() {
         r.handle.deck_state(0).hot_cues.load(Ordering::Relaxed),
         0b100
     );
+    let hot = &r.handle.deck_state(0).hot_cue_positions;
+    assert!((hot[2].load() - r.grid.position_of(7.0)).abs() < 1e-6);
+    assert!(hot[0].load().is_nan() && hot[1].load().is_nan());
     // Elsewhere, CUE while playing: back to the cue, paused.
     r.send(DeckCommand::Seek(r.grid.position_of(30.0)));
     r.send(DeckCommand::Play);

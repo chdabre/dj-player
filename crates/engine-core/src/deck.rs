@@ -415,6 +415,9 @@ impl Deck {
         s.rate.store(t.rate());
         s.cue.store(self.cues.cue);
         s.hot_cues.store(self.cues.hot_mask(), Ordering::Relaxed);
+        for (slot, hot) in s.hot_cue_positions.iter().zip(self.cues.hot) {
+            slot.store(hot.unwrap_or(f64::NAN));
+        }
         s.quantize.store(self.cues.quantize.unwrap_or(0.0));
         let (looping, l) = match (t.active_loop(), t.stored_loop()) {
             (Some(l), _) => (true, Some(l)),

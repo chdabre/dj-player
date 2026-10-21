@@ -52,6 +52,8 @@ pub struct DeckState {
     pub cue: AtomicF64,
     /// Hot cues in use (bit 0 = A).
     pub hot_cues: AtomicU8,
+    /// Each hot cue's position (frames); NaN if empty.
+    pub hot_cue_positions: [AtomicF64; crate::cue::HOT_CUES],
     /// Quantize resolution in beats; 0 = off.
     pub quantize: AtomicF64,
     /// A loop is active.

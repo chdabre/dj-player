@@ -67,6 +67,14 @@ pub struct Colors {
     pub track_color: Rgba,
     /// A pad's colour until the library gives hot cues their own.
     pub hot_cue: Rgba,
+    /// Hot cue colours by pad (A, B, …) until the library gives each cue its own.
+    pub hot_cue_colors: [Rgba; 8],
+    /// How strongly a set pad is tinted with its colour (0..=1).
+    pub pad_tint: f32,
+    /// Destructive actions armed (delete): edge, fill, text.
+    pub danger: Rgba,
+    pub danger_fill: Rgba,
+    pub danger_text: Rgba,
     /// Behind the timing overlay.
     pub overlay: Rgba,
 }
@@ -82,6 +90,9 @@ pub struct TypeScale {
     pub small: f32,
     /// The smallest text (the MASTER PLAYER badge label).
     pub caption: f32,
+    /// Performance pads, and the rail's mode buttons.
+    pub pad: f32,
+    pub rail_mode: f32,
     pub button: f32,
     pub chip: f32,
     pub chip_large: f32,
@@ -198,6 +209,20 @@ impl Theme {
                 title_bar: Rgba::hex(0x1e2024),
                 track_color: Rgba::hex(0x8b7be0),
                 hot_cue: Rgba::hex(0xe8667a),
+                hot_cue_colors: [
+                    Rgba::hex(0xe8667a), // rose
+                    Rgba::hex(0xe0a33a), // amber
+                    Rgba::hex(0x5ab8ec), // sky
+                    Rgba::hex(0x6cc08b), // green
+                    Rgba::hex(0xa78bfa), // violet
+                    Rgba::hex(0xf0762a), // orange
+                    Rgba::hex(0x3fb8ae), // teal
+                    Rgba::hex(0xe878c8), // pink
+                ],
+                pad_tint: 0.04,
+                danger: Rgba::hex(0xe8667a),
+                danger_fill: Rgba::hex(0x3a1a20),
+                danger_text: Rgba::hex(0xf0a0ab),
                 overlay: Rgba::hex(0x000000).alpha(0.75),
             },
             font: TypeScale {
@@ -205,6 +230,8 @@ impl Theme {
                 label: 15.0,
                 small: 14.0,
                 caption: 13.0,
+                pad: 25.0,
+                rail_mode: 18.0,
                 button: 20.0,
                 chip: 16.0,
                 chip_large: 22.0,
