@@ -1,6 +1,6 @@
 # Keylock shootout (spike 2)
 
-Status 2026-10-21: Mac numbers in; blind listening and the Pi 5 run outstanding. Plan: `docs/research/engine.md`, "Crates, budget and spikes", item 2.
+Status 2026-10-21: Mac numbers and blind listening in (no audible difference at ±8 %; Bungee chosen); the Pi 5 run outstanding. Plan: `docs/research/engine.md`, "Crates, budget and spikes", item 2.
 
 ## Provisional read (Mac only)
 
@@ -34,9 +34,12 @@ cargo run -p keylock-shootout --release -- render --out target/keylock-shootout/
 
 `render` writes `NN-ref.wav` (the untouched excerpt) and `NN-<rate>-<A..F>.wav` (20 s from 60 s in, at 0.92x and 1.08x, candidates shuffled per track and rate), plus `listening-sheet.csv` to score and `key.csv`. Score the sheet before opening the key. Needs CMake for Bungee.
 
+## Listening result (2026-10-21)
+
+Blind A/B on the ten rendered tracks at 0.92x and 1.08x: the listener could not hear a difference between any of the six candidates. At DJ-normal tempo changes quality does not separate them, so the decision rests on the measured properties: **Bungee becomes the default** (keylock in reverse, 27 ms rate response, CPU close to Signalsmith's, no allocations). Differences are more likely to show at the WIDE extremes; worth a listen at 0.7x/1.3x if WIDE matters.
+
 ## Outstanding
 
-- Blind A/B on the ten tracks rendered on 2026-10-21 (`target/keylock-shootout/listening`, not in the repo).
 - The same `bench` on a Pi 5, built natively there, with RT priority.
 
 ## Raw results, macOS aarch64
