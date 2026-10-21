@@ -17,11 +17,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::db::{self, BACKUP_FILE, DB_FILE, DbError};
 use crate::hash::{AudioHash, FileHash, track_id};
-use crate::ids::{BlobId, DeviceId, LibraryId, TrackId, TrackRef, hex, unhex};
+use crate::ids::{BlobId, DeviceId, EntryId, LibraryId, PlaylistId, TrackId, TrackRef, hex, unhex};
 use crate::model::{
-    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Track, TrackTags,
-    WaveformRef, is_component,
+    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Playlist, PlaylistEntry,
+    PlaylistKind, Track, TrackTags, WaveformRef, is_component,
 };
+use crate::position;
 
 /// How to open a library.
 #[derive(Debug, Clone)]
@@ -117,6 +118,10 @@ pub enum WriteError {
     BadHotCueSlot(usize),
     BadAnalyzerName(String),
     NoSuchCue(String),
+    NoSuchPlaylist(PlaylistId),
+    NoSuchEntry(EntryId),
+    /// A playlist edit that can't be made (why).
+    BadPlaylistEdit(&'static str),
 }
 
 impl std::fmt::Display for WriteError {
@@ -126,15 +131,56 @@ impl std::fmt::Display for WriteError {
             WriteError::BadHotCueSlot(s) => write!(f, "hot cue slot {s} out of range"),
             WriteError::BadAnalyzerName(n) => write!(f, "bad analyzer name {n:?}"),
             WriteError::NoSuchCue(c) => write!(f, "no cue {c}"),
+            WriteError::NoSuchPlaylist(p) => write!(f, "no playlist {p}"),
+            WriteError::NoSuchEntry(e) => write!(f, "no playlist entry {e}"),
+            WriteError::BadPlaylistEdit(why) => f.write_str(why),
         }
     }
 }
 
 impl std::error::Error for WriteError {}
 
-/// An edit to one track of this library.
+/// An edit to one track or one playlist of this library.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Edit {
+    /// A new playlist or folder (`kind` [`PlaylistKind::List`] or [`PlaylistKind::Folder`])
+    /// at the end of folder `parent` (`None`: the top).
+    CreatePlaylist {
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        kind: PlaylistKind,
+        name: String,
+    },
+    RenamePlaylist(PlaylistId, String),
+    /// Into folder `parent` (`None`: the top), before its child `before` or at the end.
+    MovePlaylist {
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        before: Option<PlaylistId>,
+    },
+    /// A playlist with its entries, or a folder with everything in it. Never the tag list.
+    DeletePlaylist(PlaylistId),
+    /// Tracks into a list, in order, before entry `before` or at the end.
+    AddEntries {
+        playlist: PlaylistId,
+        tracks: Vec<TrackId>,
+        before: Option<EntryId>,
+    },
+    /// An entry to before `before` (in its own list) or to the end.
+    MoveEntry {
+        entry: EntryId,
+        before: Option<EntryId>,
+    },
+    RemoveEntries(Vec<EntryId>),
+    /// Every entry of a list.
+    ClearPlaylist(PlaylistId),
+    /// MAKE PLAYLIST on the tag list: its entries become the new list `id`, at the end of
+    /// `parent`; the tag list is left empty.
+    ConvertTagList {
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        name: String,
+    },
     SetRating(TrackId, Option<u8>),
     /// A new memory cue or loop.
     AddCue(TrackId, Cue),
@@ -202,6 +248,34 @@ enum Op {
     Analysis(TrackId, String, AnalysisRef),
     Waveform(TrackId, WaveformRef),
     Tags(TrackId, TrackTags),
+    PutPlaylist {
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        kind: PlaylistKind,
+        name: String,
+        position: String,
+    },
+    RenamePlaylist(PlaylistId, String),
+    MovePlaylist {
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        position: String,
+    },
+    DeletePlaylist(PlaylistId),
+    PutEntry {
+        id: EntryId,
+        playlist: PlaylistId,
+        track: TrackId,
+        position: String,
+    },
+    MoveEntry(EntryId, String),
+    RemoveEntry(EntryId),
+    ClearPlaylist(PlaylistId),
+    /// Every entry of `from` into `to`, keeping their positions.
+    MoveEntries {
+        from: PlaylistId,
+        to: PlaylistId,
+    },
 }
 
 /// Edits and blobs a dropped library could not write, by library.
@@ -564,6 +638,10 @@ impl Library {
     /// Make an edit. Edits to a track that was merged into another go to the survivor.
     /// Returns the cue's id for [`Edit::AddCue`] and [`Edit::ReplaceCue`].
     pub fn apply(&mut self, edit: Edit) -> Result<Option<String>, WriteError> {
+        let edit = match self.apply_playlist(edit)? {
+            None => return Ok(None),
+            Some(track_edit) => track_edit,
+        };
         let track = match &edit {
             Edit::SetRating(t, _)
             | Edit::AddCue(t, _)
@@ -573,6 +651,7 @@ impl Library {
             | Edit::SetAnalysis(t, _, _)
             | Edit::SetWaveform(t, _)
             | Edit::SetTags(t, _) => *t,
+            _ => unreachable!("playlist edits are applied above"),
         };
         // Without a readable file (a pulled stick) the edit is queued unchecked.
         let t = resolve(&self.conn, track).unwrap_or(track);
@@ -618,9 +697,336 @@ impl Library {
             }
             Edit::SetWaveform(_, w) => (Op::Waveform(t, w), None),
             Edit::SetTags(_, tags) => (Op::Tags(t, tags), None),
+            _ => unreachable!("playlist edits are applied above"),
         };
         self.write(op);
         Ok(id)
+    }
+
+    /// Apply `edit` if it is a playlist edit (`Ok(None)`); hand any other edit back.
+    fn apply_playlist(&mut self, edit: Edit) -> Result<Option<Edit>, WriteError> {
+        match edit {
+            Edit::CreatePlaylist {
+                id,
+                parent,
+                kind,
+                name,
+            } => {
+                if kind == PlaylistKind::Tag {
+                    return Err(WriteError::BadPlaylistEdit("there is one tag list"));
+                }
+                self.check_folder(parent)?;
+                let position = position::after(self.last_child(parent).as_deref());
+                self.write(Op::PutPlaylist {
+                    id,
+                    parent,
+                    kind,
+                    name,
+                    position,
+                });
+            }
+            Edit::RenamePlaylist(id, name) => {
+                self.playlist_kind(id)?;
+                self.write(Op::RenamePlaylist(id, name));
+            }
+            Edit::MovePlaylist { id, parent, before } => {
+                if self.playlist_kind(id)? == PlaylistKind::Tag {
+                    return Err(WriteError::BadPlaylistEdit("the tag list stays at the top"));
+                }
+                self.check_folder(parent)?;
+                // Not into itself or a folder inside it.
+                let mut up = parent;
+                while let Some(p) = up {
+                    if p == id {
+                        return Err(WriteError::BadPlaylistEdit(
+                            "a folder can't go inside itself",
+                        ));
+                    }
+                    up = self.playlist(p).ok().flatten().and_then(|p| p.parent);
+                }
+                let position = match before {
+                    Some(b) => {
+                        let at = self
+                            .playlist(b)
+                            .ok()
+                            .flatten()
+                            .filter(|p| p.parent == parent)
+                            .ok_or(WriteError::NoSuchPlaylist(b))?;
+                        let prev = self.child_before(parent, &at.position, id);
+                        position::between(prev.as_deref(), Some(&at.position))
+                    }
+                    None => position::after(self.last_child_except(parent, id).as_deref()),
+                };
+                self.write(Op::MovePlaylist {
+                    id,
+                    parent,
+                    position,
+                });
+            }
+            Edit::DeletePlaylist(id) => {
+                if self.playlist_kind(id)? == PlaylistKind::Tag {
+                    return Err(WriteError::BadPlaylistEdit(
+                        "the tag list can be cleared, not deleted",
+                    ));
+                }
+                self.write(Op::DeletePlaylist(id));
+            }
+            Edit::AddEntries {
+                playlist,
+                tracks,
+                before,
+            } => {
+                if self.playlist_kind(playlist)? == PlaylistKind::Folder {
+                    return Err(WriteError::BadPlaylistEdit("a folder holds playlists"));
+                }
+                let positions = match before {
+                    Some(b) => {
+                        let at = self
+                            .entry(b)?
+                            .filter(|(p, _)| *p == playlist)
+                            .ok_or(WriteError::NoSuchEntry(b))?
+                            .1;
+                        let prev = self.entry_before(playlist, &at, None);
+                        position::between_n(prev.as_deref(), Some(&at), tracks.len())
+                    }
+                    None => {
+                        let last = self.last_entry(playlist, None);
+                        position::after_n(last.as_deref(), tracks.len())
+                    }
+                };
+                for (track, position) in tracks.into_iter().zip(positions) {
+                    self.write(Op::PutEntry {
+                        id: EntryId::random(),
+                        playlist,
+                        track,
+                        position,
+                    });
+                }
+            }
+            Edit::MoveEntry { entry, before } => {
+                let (playlist, _) = self.entry(entry)?.ok_or(WriteError::NoSuchEntry(entry))?;
+                let position = match before {
+                    Some(b) => {
+                        let at = self
+                            .entry(b)?
+                            .filter(|(p, _)| *p == playlist)
+                            .ok_or(WriteError::NoSuchEntry(b))?
+                            .1;
+                        let prev = self.entry_before(playlist, &at, Some(entry));
+                        position::between(prev.as_deref(), Some(&at))
+                    }
+                    None => position::after(self.last_entry(playlist, Some(entry)).as_deref()),
+                };
+                self.write(Op::MoveEntry(entry, position));
+            }
+            Edit::RemoveEntries(entries) => {
+                for e in entries {
+                    self.write(Op::RemoveEntry(e));
+                }
+            }
+            Edit::ClearPlaylist(id) => {
+                self.playlist_kind(id)?;
+                self.write(Op::ClearPlaylist(id));
+            }
+            Edit::ConvertTagList { id, parent, name } => {
+                self.check_folder(parent)?;
+                let position = position::after(self.last_child(parent).as_deref());
+                self.write(Op::PutPlaylist {
+                    id,
+                    parent,
+                    kind: PlaylistKind::List,
+                    name,
+                    position,
+                });
+                self.write(Op::MoveEntries {
+                    from: PlaylistId::TAG_LIST,
+                    to: id,
+                });
+            }
+            other => return Ok(Some(other)),
+        }
+        Ok(None)
+    }
+
+    /// `parent` is the top or a folder.
+    fn check_folder(&self, parent: Option<PlaylistId>) -> Result<(), WriteError> {
+        match parent {
+            None => Ok(()),
+            Some(p) => match self.playlist_kind(p)? {
+                PlaylistKind::Folder => Ok(()),
+                _ => Err(WriteError::BadPlaylistEdit("only a folder holds playlists")),
+            },
+        }
+    }
+
+    fn playlist_kind(&self, id: PlaylistId) -> Result<PlaylistKind, WriteError> {
+        self.playlist(id)
+            .ok()
+            .flatten()
+            .map(|p| p.kind)
+            .ok_or(WriteError::NoSuchPlaylist(id))
+    }
+
+    /// The last position among `parent`'s children.
+    fn last_child(&self, parent: Option<PlaylistId>) -> Option<String> {
+        self.last_child_except(parent, PlaylistId::nil())
+    }
+
+    fn last_child_except(&self, parent: Option<PlaylistId>, except: PlaylistId) -> Option<String> {
+        let parent = parent.map(|p| p.bytes().to_vec());
+        self.conn
+            .query_row(
+                "SELECT max(position) FROM playlists WHERE parent IS ?1 AND id != ?2",
+                params![parent, &except.bytes()[..]],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// The position just before `at` among `parent`'s children, leaving `except` out.
+    fn child_before(
+        &self,
+        parent: Option<PlaylistId>,
+        at: &str,
+        except: PlaylistId,
+    ) -> Option<String> {
+        let parent = parent.map(|p| p.bytes().to_vec());
+        self.conn
+            .query_row(
+                "SELECT max(position) FROM playlists WHERE parent IS ?1 AND position < ?2 \
+                 AND id != ?3",
+                params![parent, at, &except.bytes()[..]],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten()
+    }
+
+    fn last_entry(&self, playlist: PlaylistId, except: Option<EntryId>) -> Option<String> {
+        let except = except.unwrap_or(EntryId::nil());
+        self.conn
+            .query_row(
+                "SELECT max(position) FROM playlist_entries WHERE playlist = ?1 AND id != ?2",
+                params![&playlist.bytes()[..], &except.bytes()[..]],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten()
+    }
+
+    fn entry_before(
+        &self,
+        playlist: PlaylistId,
+        at: &str,
+        except: Option<EntryId>,
+    ) -> Option<String> {
+        let except = except.unwrap_or(EntryId::nil());
+        self.conn
+            .query_row(
+                "SELECT max(position) FROM playlist_entries WHERE playlist = ?1 \
+                 AND position < ?2 AND id != ?3",
+                params![&playlist.bytes()[..], at, &except.bytes()[..]],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// An entry's playlist and position.
+    fn entry(&self, id: EntryId) -> Result<Option<(PlaylistId, String)>, WriteError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT playlist, position FROM playlist_entries WHERE id = ?1",
+                [&id.bytes()[..]],
+                |r| Ok((playlist_of(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten())
+    }
+
+    // Playlists: reading
+
+    /// Every playlist and folder, the tag list first, then the tree depth first in order.
+    pub fn playlists(&self) -> Result<Vec<Playlist>, ReadError> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT p.id, p.parent, p.kind, p.name, p.position, \
+             (SELECT count(*) FROM playlist_entries e WHERE e.playlist = p.id) \
+             FROM playlists p ORDER BY p.position",
+        )?;
+        let all: Vec<Playlist> = st
+            .query_map([], |r| {
+                let parent: Option<Vec<u8>> = r.get(1)?;
+                Ok(Playlist {
+                    id: playlist_of(&r.get::<_, Vec<u8>>(0)?),
+                    parent: parent.map(|p| playlist_of(&p)),
+                    kind: PlaylistKind::parse(&r.get::<_, String>(2)?),
+                    name: r.get(3)?,
+                    position: r.get(4)?,
+                    entries: r.get::<_, i64>(5)? as usize,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        // Depth first from the top, each level in position order (`all` is sorted).
+        let mut out = Vec::with_capacity(all.len());
+        fn visit(all: &[Playlist], parent: Option<PlaylistId>, out: &mut Vec<Playlist>) {
+            let mut kids: Vec<&Playlist> = all.iter().filter(|p| p.parent == parent).collect();
+            // The tag list leads the top level.
+            kids.sort_by_key(|p| (p.kind != PlaylistKind::Tag, p.position.clone()));
+            for k in kids {
+                out.push(k.clone());
+                if k.kind == PlaylistKind::Folder {
+                    visit(all, Some(k.id), out);
+                }
+            }
+        }
+        visit(&all, None, &mut out);
+        Ok(out)
+    }
+
+    /// One playlist or folder.
+    pub fn playlist(&self, id: PlaylistId) -> Result<Option<Playlist>, ReadError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT p.parent, p.kind, p.name, p.position, \
+                 (SELECT count(*) FROM playlist_entries e WHERE e.playlist = p.id) \
+                 FROM playlists p WHERE p.id = ?1",
+                [&id.bytes()[..]],
+                |r| {
+                    let parent: Option<Vec<u8>> = r.get(0)?;
+                    Ok(Playlist {
+                        id,
+                        parent: parent.map(|p| playlist_of(&p)),
+                        kind: PlaylistKind::parse(&r.get::<_, String>(1)?),
+                        name: r.get(2)?,
+                        position: r.get(3)?,
+                        entries: r.get::<_, i64>(4)? as usize,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// A list's entries in order, each track resolved to the survivor of any merge.
+    pub fn entries(&self, playlist: PlaylistId) -> Result<Vec<PlaylistEntry>, ReadError> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT e.id, coalesce(a.new, e.track), e.position FROM playlist_entries e \
+             LEFT JOIN aliases a ON a.old = e.track WHERE e.playlist = ?1 \
+             ORDER BY e.position, e.id",
+        )?;
+        let rows = st
+            .query_map([&playlist.bytes()[..]], |r| {
+                Ok(PlaylistEntry {
+                    id: EntryId::from_bytes(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 16])),
+                    track: track_of(&r.get::<_, Vec<u8>>(1)?),
+                    position: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// `Some(true)` if the track has a record, `None` if the file can't be read.
@@ -1058,6 +1464,101 @@ impl Op {
                     dev
                 ])?;
             }
+            Op::PutPlaylist {
+                id,
+                parent,
+                kind,
+                name,
+                position,
+            } => {
+                c.prepare_cached(
+                    "INSERT INTO playlists(id, parent, kind, name, position, created, updated_at, \
+                     device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7) ON CONFLICT(id) DO UPDATE SET \
+                     parent = excluded.parent, kind = excluded.kind, name = excluded.name, \
+                     position = excluded.position, updated_at = excluded.updated_at, \
+                     device = excluded.device",
+                )?
+                .execute(params![
+                    &id.bytes()[..],
+                    parent.map(|p| p.bytes().to_vec()),
+                    kind.as_str(),
+                    name,
+                    position,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::RenamePlaylist(id, name) => {
+                c.prepare_cached(
+                    "UPDATE playlists SET name = ?2, updated_at = ?3, device = ?4 WHERE id = ?1",
+                )?
+                .execute(params![&id.bytes()[..], name, now, dev])?;
+            }
+            Op::MovePlaylist {
+                id,
+                parent,
+                position,
+            } => {
+                c.prepare_cached(
+                    "UPDATE playlists SET parent = ?2, position = ?3, updated_at = ?4, \
+                     device = ?5 WHERE id = ?1",
+                )?
+                .execute(params![
+                    &id.bytes()[..],
+                    parent.map(|p| p.bytes().to_vec()),
+                    position,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::DeletePlaylist(id) => {
+                c.prepare_cached("DELETE FROM playlists WHERE id = ?1 AND kind != 'tag'")?
+                    .execute([&id.bytes()[..]])?;
+            }
+            Op::PutEntry {
+                id,
+                playlist,
+                track,
+                position,
+            } => {
+                c.prepare_cached(
+                    "INSERT INTO playlist_entries(id, playlist, track, position, added, \
+                     updated_at, device) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6) \
+                     ON CONFLICT(id) DO UPDATE SET playlist = excluded.playlist, \
+                     track = excluded.track, position = excluded.position, \
+                     updated_at = excluded.updated_at, device = excluded.device",
+                )?
+                .execute(params![
+                    &id.bytes()[..],
+                    &playlist.bytes()[..],
+                    &resolve(c, *track)?.0[..],
+                    position,
+                    now,
+                    dev
+                ])?;
+            }
+            Op::MoveEntry(id, position) => {
+                c.prepare_cached(
+                    "UPDATE playlist_entries SET position = ?2, updated_at = ?3, device = ?4 \
+                     WHERE id = ?1",
+                )?
+                .execute(params![&id.bytes()[..], position, now, dev])?;
+            }
+            Op::RemoveEntry(id) => {
+                c.prepare_cached("DELETE FROM playlist_entries WHERE id = ?1")?
+                    .execute([&id.bytes()[..]])?;
+            }
+            Op::ClearPlaylist(id) => {
+                c.prepare_cached("DELETE FROM playlist_entries WHERE playlist = ?1")?
+                    .execute([&id.bytes()[..]])?;
+            }
+            Op::MoveEntries { from, to } => {
+                c.prepare_cached(
+                    "UPDATE playlist_entries SET playlist = ?2, updated_at = ?3, device = ?4 \
+                     WHERE playlist = ?1",
+                )?
+                .execute(params![&from.bytes()[..], &to.bytes()[..], now, dev])?;
+            }
             Op::Tags(t, g) => {
                 c.prepare_cached(
                     "UPDATE tracks SET title = ?2, artist = ?3, album = ?4, genre = ?5, \
@@ -1119,6 +1620,10 @@ fn merge(
         [f, i],
     )?;
     c.execute("UPDATE cues SET track = ?2 WHERE track = ?1", [f, i])?;
+    c.execute(
+        "UPDATE playlist_entries SET track = ?2 WHERE track = ?1",
+        [f, i],
+    )?;
     c.execute(
         "INSERT INTO hot_cues(track, slot, at, end_at, color, comment, updated_at, device) \
          SELECT ?2, slot, at, end_at, color, comment, updated_at, device FROM hot_cues h \
@@ -1184,6 +1689,10 @@ fn tags_at(r: &Row, i: usize) -> rusqlite::Result<TrackTags> {
         key: r.get(i + 5)?,
         duration: r.get(i + 6)?,
     })
+}
+
+fn playlist_of(b: &[u8]) -> PlaylistId {
+    PlaylistId::from_bytes(b.try_into().unwrap_or([0; 16]))
 }
 
 fn track_of(b: &[u8]) -> TrackId {

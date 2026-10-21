@@ -11,7 +11,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 /// The schema this build writes, in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The file inside `DJPLAYER/`.
 pub const DB_FILE: &str = "library.db";
@@ -59,6 +59,24 @@ CREATE TABLE aliases(
   old BLOB PRIMARY KEY, new BLOB NOT NULL,
   updated_at INTEGER NOT NULL, device BLOB NOT NULL) WITHOUT ROWID;
 CREATE INDEX aliases_new ON aliases(new);
+"#;
+
+/// Version 2: playlists. Entries name their track without a foreign key: a merge moves
+/// them to the survivor, and a reader resolves an older id through `aliases`.
+pub const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS playlists(
+  id BLOB PRIMARY KEY,
+  parent BLOB REFERENCES playlists(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL, name TEXT NOT NULL, position TEXT NOT NULL, created INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL, device BLOB NOT NULL) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS playlists_parent ON playlists(parent, position);
+CREATE TABLE IF NOT EXISTS playlist_entries(
+  id BLOB PRIMARY KEY,
+  playlist BLOB NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+  track BLOB NOT NULL, position TEXT NOT NULL, added INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL, device BLOB NOT NULL) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS playlist_entries_order ON playlist_entries(playlist, position);
+CREATE INDEX IF NOT EXISTS playlist_entries_track ON playlist_entries(track);
 "#;
 
 /// Why a file can't be used.
@@ -163,8 +181,9 @@ pub fn prepare(c: &Connection, new_id: [u8; 16]) -> Result<([u8; 16], bool), DbE
     let tables: i64 = c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
     if version == 0 && tables == 0 {
         c.execute_batch(&format!(
-            "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
+            "BEGIN; {SCHEMA} {SCHEMA_V2} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
         ))?;
+        tag_list(c)?;
         c.execute(
             "INSERT INTO meta(key, value) VALUES ('library_id', ?1), ('min_reader_version', 1), \
              ('clean_unmount', 1)",
@@ -190,8 +209,27 @@ pub fn prepare(c: &Connection, new_id: [u8; 16]) -> Result<([u8; 16], bool), DbE
         meta("clean_unmount")?,
         Some(rusqlite::types::Value::Integer(0))
     );
-    // Migrations from older versions go here, one step per version.
+    // Migrations from older versions, one step per version. A newer file this build may
+    // still write keeps its version.
+    let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version < 2 {
+        c.execute_batch(&format!(
+            "BEGIN; {SCHEMA_V2} PRAGMA user_version = 2; COMMIT;"
+        ))?;
+    }
+    tag_list(c)?;
     Ok((id, clean))
+}
+
+/// Make the tag list if the file has none (a new file, a migrated one, or one an older
+/// version wrote to after a newer one made the tables).
+fn tag_list(c: &Connection) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO playlists(id, parent, kind, name, position, created, updated_at, device) \
+         VALUES (?1, NULL, 'tag', 'TAG LIST', '0i', 0, 0, ?2) ON CONFLICT(id) DO NOTHING",
+        params![&crate::PlaylistId::TAG_LIST.bytes()[..], &[0u8; 16][..]],
+    )
+    .map(drop)
 }
 
 /// Mark the file in use (`clean = false`, in the first write transaction) or cleanly closed.

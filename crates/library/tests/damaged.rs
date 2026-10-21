@@ -133,7 +133,7 @@ fn a_newer_version_is_written_unless_it_says_not_to() {
         let c = Connection::open(dir.join("library.db")).unwrap();
         c.execute_batch(
             "ALTER TABLE hot_cues ADD COLUMN quantized INTEGER; \
-             UPDATE hot_cues SET quantized = 1; PRAGMA user_version = 2;",
+             UPDATE hot_cues SET quantized = 1; PRAGMA user_version = 3;",
         )
         .unwrap();
     }
@@ -150,14 +150,14 @@ fn a_newer_version_is_written_unless_it_says_not_to() {
         .unwrap();
     assert_eq!((at, q), (2.0, 1), "the newer column survives the edit");
     c.execute(
-        "UPDATE meta SET value = 2 WHERE key = 'min_reader_version'",
+        "UPDATE meta SET value = 3 WHERE key = 'min_reader_version'",
         [],
     )
     .unwrap();
     drop(c);
     assert!(matches!(
         Library::mount(&dir, MountOptions::new(DeviceId::random())),
-        Err(MountError::Newer(2))
+        Err(MountError::Newer(3))
     ));
     cleanup(&dir);
 }

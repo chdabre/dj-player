@@ -126,6 +126,23 @@ uuid_id!(
     LibraryId
 );
 
+uuid_id!(
+    /// A playlist or playlist folder: a random UUID, except the tag list's fixed one.
+    PlaylistId
+);
+
+impl PlaylistId {
+    /// The tag list: every library has it, under this id.
+    pub const TAG_LIST: PlaylistId = PlaylistId([
+        0x74, 0x61, 0x67, 0x2d, 0x6c, 0x69, 0x73, 0x74, 0, 0, 0, 0, 0, 0, 0, 1,
+    ]);
+}
+
+uuid_id!(
+    /// One entry of a playlist (a track may be in a playlist more than once).
+    EntryId
+);
+
 /// A track: the first 16 bytes of BLAKE3 over `"track" ‖ file_hash` when the file was first
 /// seen (see [`crate::hash::track_id`]).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -45,6 +45,58 @@ pub struct Listed {
     pub analysed: bool,
 }
 
+/// What a playlist row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlaylistKind {
+    /// Holds playlists and folders.
+    Folder,
+    /// Holds tracks.
+    List,
+    /// The tag list: a list every library has, at the top.
+    Tag,
+}
+
+impl PlaylistKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PlaylistKind::Folder => "folder",
+            PlaylistKind::List => "list",
+            PlaylistKind::Tag => "tag",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Self {
+        match s {
+            "folder" => PlaylistKind::Folder,
+            "tag" => PlaylistKind::Tag,
+            _ => PlaylistKind::List,
+        }
+    }
+}
+
+/// A playlist or folder of playlists, as [`crate::Library::playlists`] gives them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Playlist {
+    pub id: crate::PlaylistId,
+    /// The folder holding it; `None` at the top.
+    pub parent: Option<crate::PlaylistId>,
+    pub kind: PlaylistKind,
+    pub name: String,
+    /// Its place among its siblings (a fractional position, see [`crate::position`]).
+    pub position: String,
+    /// Tracks in it (0 for a folder).
+    pub entries: usize,
+}
+
+/// One entry of a playlist, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistEntry {
+    pub id: crate::EntryId,
+    /// The track (through any merge: the survivor).
+    pub track: TrackId,
+    pub position: String,
+}
+
 /// Where a file is and what it is: one location of a track.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileIdentity {

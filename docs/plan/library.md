@@ -69,7 +69,7 @@ DJPLAYER/
   blobs/<aa>/<hash>  BLAKE3-named waveforms and analysis results, written once
 ```
 
-## Schema (version 1)
+## Schema (version 2)
 
 | Table | Key | Holds |
 | --- | --- | --- |
@@ -80,8 +80,10 @@ DJPLAYER/
 | `cues` | id (16 random bytes) | track, kind (memory or loop), at, end, colour, comment |
 | `analysis` | (track, analyzer) | version, params, blob, created |
 | `aliases` | old track id | the track it was merged into |
+| `playlists` | `id` (16 random bytes; the tag list's is fixed) | parent folder, kind (folder, list, tag), name, fractional position (version 2, `docs/plan/playlists.md`) |
+| `playlist_entries` | `id` (16 random bytes) | playlist, track (moved to the survivor by a merge), fractional position (version 2) |
 
-Every row of an edit carries `updated_at` (wall-clock ms, 0 without a clock) and `device`. Playlists, tags, history, settings and the FTS5 search index come with the features that use them, as schema version 2 and later.
+Every row of an edit carries `updated_at` (wall-clock ms, 0 without a clock) and `device`. Playlists came with version 2: a version 1 file gets the two tables and the tag list on its first mount, and `min_reader_version` stays 1. Tags, history, settings and the FTS5 search index come with the features that use them, as later versions.
 
 **Versions.** `PRAGMA user_version` is the schema version, and `meta.min_reader_version` the oldest version that may still read and write the file. A newer file whose `min_reader_version` this build meets is used as is: writes name their columns (`INSERT … ON CONFLICT DO UPDATE SET` the columns this version knows, never `INSERT OR REPLACE`), so columns a newer version added survive. Otherwise it is refused.
 
@@ -151,7 +153,7 @@ The first build (CRC-framed JSON-lines journals per device, HLC, CRDT merge, ver
 
 - Library views beyond the track list (artist, album, BPM, key categories), and an FTS5 search index once libraries get large (search is a linear match over tags in RAM today).
 - Artwork is read from the files each session; it isn't stored as a blob.
-- Rekordbox import and overlay, playlists, tags, history and play counts, settings, "remove from library", blob GC, the link protocol and the cloud with its sync layer.
+- Rekordbox import and overlay, playlists (designed: `docs/plan/playlists.md`), tags, history and play counts, settings, "remove from library", blob GC, the link protocol and the cloud with its sync layer.
 - Hot cues 9–16 (bank B) are stored but the deck has 8 pads and no bank switch yet. Memory cues are stored and restored as the load cue point, but there is no CALL / memory-delete on the deck yet.
 - A salvage path (the recovery extension) for a damaged file with no usable backup; today it starts empty and keeps the damaged file.
 - Two decks loading from one stick at once: both workers would open the file, and the second waits up to 5 s for the lock. Share one library per stick when the player gets its second deck.

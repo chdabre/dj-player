@@ -18,16 +18,17 @@ pub mod hash;
 pub mod ids;
 mod library;
 pub mod model;
+pub mod position;
 
 pub use hash::{AUDIO_HASH_VERSION, AudioHash, ContentHasher, FileHash, track_id};
-pub use ids::{BadId, BlobId, DeviceId, LibraryId, TrackId, TrackRef};
+pub use ids::{BadId, BlobId, DeviceId, EntryId, LibraryId, PlaylistId, TrackId, TrackRef};
 pub use library::{
     Edit, Found, Library, MountError, MountOptions, MountStats, Persistence, ReadError, WriteError,
     rfc3339, system_ms,
 };
 pub use model::{
-    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Track, TrackTags,
-    WaveformRef,
+    AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Playlist, PlaylistEntry,
+    PlaylistKind, Track, TrackTags, WaveformRef,
 };
 
 /// A file's path as the library stores it: `/` separators and Unicode NFC, so the same
