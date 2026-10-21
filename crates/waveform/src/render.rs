@@ -187,6 +187,8 @@ pub struct ZoomView {
     pub height: usize,
     /// Beats across the view.
     pub beats: f64,
+    /// How the 3-band mode lays out the bands; overlaid by default.
+    pub layout: Layout,
 }
 
 impl Default for ZoomView {
@@ -195,6 +197,7 @@ impl Default for ZoomView {
             width: 703,
             height: 211,
             beats: 20.0,
+            layout: Layout::Overlaid,
         }
     }
 }
@@ -204,6 +207,8 @@ impl Default for ZoomView {
 pub struct OverviewView {
     pub width: usize,
     pub height: usize,
+    /// How the 3-band mode lays out the bands; stacked by default.
+    pub layout: Layout,
 }
 
 impl Default for OverviewView {
@@ -211,6 +216,7 @@ impl Default for OverviewView {
         OverviewView {
             width: 703,
             height: 67,
+            layout: Layout::Stacked,
         }
     }
 }
@@ -258,7 +264,8 @@ fn paint_column(
 ) {
     for y in top..bottom {
         let d = ((y as f32 + 0.5) - cy).abs() / half;
-        if let Some(c) = col.color_at(d) {
+        let under = canvas.get(x as usize, y);
+        if let Some(c) = col.color_at(d, under) {
             canvas.put(x, y as i64, c, 1.0);
         }
     }
@@ -318,7 +325,7 @@ pub fn render_zoom(
         let e = wf.entries[a as usize..b as usize]
             .iter()
             .fold(Entry::SILENT, |m, &e| m.max(e));
-        let mut col = column(e, mode, Layout::Overlaid, style);
+        let mut col = column(e, mode, view.layout, style);
         if j < j0 {
             col = col.dimmed(style.played);
         }
@@ -396,7 +403,7 @@ pub fn render_overview(
         let e = ov.columns[a..b]
             .iter()
             .fold(Entry::SILENT, |m, &e| m.max(e));
-        let mut col = column(e, mode, Layout::Stacked, style);
+        let mut col = column(e, mode, view.layout, style);
         if (x as i64) < played {
             col = col.dimmed(style.played);
         }
@@ -482,6 +489,7 @@ mod tests {
             width: 200,
             height: 100,
             beats: 20.0,
+            ..ZoomView::default()
         };
         let style = Style::default();
         let c = render_zoom(
@@ -533,6 +541,7 @@ mod tests {
             width: 300,
             height: 60,
             beats: 20.0,
+            ..ZoomView::default()
         };
         let spp = 20.0 * 0.5 / 300.0;
         let at = |t: f64| {
@@ -572,6 +581,7 @@ mod tests {
         let view = OverviewView {
             width: 600,
             height: 40,
+            ..OverviewView::default()
         };
         let style = Style::default();
         let ov = wf.overview();
@@ -602,6 +612,7 @@ mod tests {
             width: 200,
             height: 100,
             beats: 20.0,
+            ..ZoomView::default()
         };
         let markers = Markers {
             cue: Some(6.0),
@@ -630,5 +641,88 @@ mod tests {
         assert_eq!(c.get(140, 50), Theme::DEFAULT.pads[0]);
         assert_eq!(c.get(160, 50), Theme::DEFAULT.loop_color);
         assert_ne!(c.get(170, 50), Style::default().theme.bands[2]); // shaded
+    }
+
+    #[test]
+    fn either_view_takes_either_layout() {
+        let (wf, grid) = fixture();
+        let style = Style::default();
+        let bands = style.theme.bands;
+        // Zoom stacked, overview style: lows at the centre, highs outside.
+        let view = ZoomView {
+            width: 200,
+            height: 100,
+            layout: Layout::Stacked,
+            ..ZoomView::default()
+        };
+        let c = render_zoom(
+            &wf,
+            &grid,
+            5.0,
+            &Markers::default(),
+            Mode::ThreeBand,
+            &style,
+            &view,
+        );
+        assert_eq!(c.get(150, 50), bands[0]);
+        let overlaid = ZoomView {
+            layout: Layout::Overlaid,
+            ..view
+        };
+        let c2 = render_zoom(
+            &wf,
+            &grid,
+            5.0,
+            &Markers::default(),
+            Mode::ThreeBand,
+            &style,
+            &overlaid,
+        );
+        assert_eq!(c2.get(150, 50), bands[2]);
+        // Overview overlaid, zoom style: highs at the centre.
+        let ov = wf.overview();
+        let view = OverviewView {
+            width: 300,
+            height: 40,
+            layout: Layout::Overlaid,
+        };
+        let cy = (OVERVIEW_TOP + 40 - OVERVIEW_BOTTOM) / 2;
+        let c = render_overview(
+            &ov,
+            &grid,
+            0.0,
+            &Markers::default(),
+            Mode::ThreeBand,
+            &style,
+            &view,
+        );
+        assert_eq!(c.get(150, cy), bands[2]);
+    }
+
+    #[test]
+    fn translucent_bands_blend_over_the_grid_and_background() {
+        let (wf, grid) = fixture();
+        let style = Style {
+            theme: Theme::BLENDED,
+            ..Style::default()
+        };
+        let view = ZoomView {
+            width: 200,
+            height: 100,
+            ..ZoomView::default()
+        };
+        let c = render_zoom(
+            &wf,
+            &grid,
+            5.0,
+            &Markers::default(),
+            Mode::ThreeBand,
+            &style,
+            &view,
+        );
+        // Mid (60 %) over low (opaque), between the high core and the low edge.
+        let mid = Theme::BLENDED.bands[1].over(Theme::BLENDED.bands[0], 0.6);
+        let row = (30..50).find(|&y| c.get(150, y) == mid);
+        assert!(row.is_some(), "no blended mid pixel in column 150");
     }
 }

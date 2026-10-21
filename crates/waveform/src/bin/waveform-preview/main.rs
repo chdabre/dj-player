@@ -9,8 +9,10 @@
 //! Options: `--out DIR` (default `.`), `--at F,F,...` playhead positions as fractions of the
 //! track (default 0.15,0.42,0.65), `--bpm N` a constant grid from 0 s instead of gridfit,
 //! `--rate HZ` the synthetic signal's sample rate (default 44100), `--no-markers` to leave
-//! out the demo cue, hot cue and loop overlays, `--theme NAME` (default, findings, spectrum),
-//! `--gain auto|off|N` the per-track display gain (default auto).
+//! out the demo cue, hot cue and loop overlays, `--theme NAME` (default, findings, spectrum,
+//! blended), `--gain auto|off|N` the per-track display gain (default auto),
+//! `--zoom-layout` / `--overview-layout overlaid|stacked` how 3-band lays out the bands in
+//! each view (default overlaid in the zoom, stacked in the overview).
 
 mod synth;
 
@@ -26,7 +28,7 @@ use waveform::display::{Theme, TrackGain};
 use waveform::render::{
     Canvas, GridBeat, HotCue, Loop, Markers, OverviewView, ZoomView, render_overview, render_zoom,
 };
-use waveform::{Mode, Style};
+use waveform::{Layout, Mode, Style};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -39,6 +41,8 @@ struct Options {
     markers: bool,
     theme: Theme,
     gain: TrackGain,
+    zoom_layout: Layout,
+    overview_layout: Layout,
 }
 
 enum Input {
@@ -56,6 +60,8 @@ fn parse(args: &[String]) -> Result<Options> {
         markers: true,
         theme: Theme::DEFAULT,
         gain: TrackGain::Auto,
+        zoom_layout: Layout::Overlaid,
+        overview_layout: Layout::Stacked,
     };
     let mut input = None;
     let mut it = args.iter();
@@ -77,6 +83,8 @@ fn parse(args: &[String]) -> Result<Options> {
                 let name = value()?;
                 o.theme = Theme::by_name(name).ok_or_else(|| format!("unknown theme {name}"))?;
             }
+            "--zoom-layout" => o.zoom_layout = layout(value()?)?,
+            "--overview-layout" => o.overview_layout = layout(value()?)?,
             "--gain" => {
                 o.gain = match value()?.as_str() {
                     "auto" => TrackGain::Auto,
@@ -90,6 +98,21 @@ fn parse(args: &[String]) -> Result<Options> {
     }
     o.input = input.ok_or("no FILE or --synth")?;
     Ok(o)
+}
+
+fn layout(name: &str) -> Result<Layout> {
+    match name {
+        "overlaid" => Ok(Layout::Overlaid),
+        "stacked" => Ok(Layout::Stacked),
+        _ => Err(format!("unknown layout {name} (overlaid, stacked)").into()),
+    }
+}
+
+fn layout_name(l: Layout) -> &'static str {
+    match l {
+        Layout::Overlaid => "overlaid",
+        Layout::Stacked => "stacked",
+    }
 }
 
 fn main() -> ExitCode {
@@ -209,13 +232,24 @@ fn run(o: &Options) -> Result<()> {
         "  theme {}, track gain {:.2}",
         o.theme.name, style.track_gain
     );
-    let name = if o.theme == Theme::DEFAULT {
-        name
-    } else {
-        format!("{name}-{}", o.theme.name)
+    let mut name = name;
+    if o.theme != Theme::DEFAULT {
+        name = format!("{name}-{}", o.theme.name);
+    }
+    let zoom = ZoomView {
+        layout: o.zoom_layout,
+        ..ZoomView::default()
     };
-    let zoom = ZoomView::default();
-    let overview = OverviewView::default();
+    let overview = OverviewView {
+        layout: o.overview_layout,
+        ..OverviewView::default()
+    };
+    if zoom.layout != ZoomView::default().layout {
+        name = format!("{name}-zoom-{}", layout_name(zoom.layout));
+    }
+    if overview.layout != OverviewView::default().layout {
+        name = format!("{name}-overview-{}", layout_name(overview.layout));
+    }
     std::fs::create_dir_all(&o.out)?;
     for mode in Mode::ALL {
         let gap = 8;

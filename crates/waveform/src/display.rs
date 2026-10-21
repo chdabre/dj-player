@@ -2,13 +2,17 @@
 //!
 //! Every mode draws from the same stored data. A column is a list of mirrored segments,
 //! measured from the centre line outwards (0 = centre, 1 = the view's half-height), drawn
-//! in order, later ones on top:
+//! in order, later ones on top, each at its band's opacity over what is below:
 //!
 //! - [`Mode::Single`]: one segment, the combined level ([`Entry::combined`]), one colour.
-//! - [`Mode::ThreeBand`]: one segment per band in the theme's band colours. In the zoom
-//!   ([`Layout::Overlaid`]) each band starts at the centre, painted low → mid → high, so
-//!   the wide indigo body is behind and the cream highs are an inner core. In the overview
-//!   ([`Layout::Stacked`]) the bands stack outwards: low, then mid on it, then high.
+//! - [`Mode::ThreeBand`]: one segment per band in the theme's band colours and opacities,
+//!   in one of two layouts, which either view can use:
+//!   - [`Layout::Overlaid`] (the zoom's default): each band starts at the centre, painted
+//!     low → mid → high, so the wide low body is behind and the highs are an inner core.
+//!     With a mid opacity below 1, mids blend with the lows where they overlap (as the
+//!     CDJ-3000's 3-band detail does).
+//!   - [`Layout::Stacked`] (the overview's default): the bands stack outwards, low, then
+//!     mid on it, then high.
 //! - [`Mode::Rgb`]: one segment at the combined level, coloured from the band ratios.
 //!
 //! Heights are `track gain · band gain · value / 255`: the stored square-root curve is the
@@ -85,6 +89,8 @@ pub struct Theme {
     pub single: Rgb,
     /// 3-band mode: low, mid, high.
     pub bands: [Rgb; 3],
+    /// 3-band mode: each band's opacity (0..=1) over what is painted below it.
+    pub band_alpha: [f32; 3],
     /// RGB mode: the colour each band contributes (low, mid, high) ...
     pub rgb: [Rgb; 3],
     /// ... and how much: each band's value is weighted by this before mixing.
@@ -118,6 +124,7 @@ impl Theme {
         name: "default",
         single: Rgb::hex(0x7CB4FF),
         bands: BLUE_ORANGE_WHITE,
+        band_alpha: [1.0; 3],
         rgb: [Rgb::hex(0xFF0000), Rgb::hex(0x00FF00), Rgb::hex(0x0000FF)],
         rgb_weights: [1.0, 0.85, 0.7],
         background: Rgb::hex(0x000000),
@@ -152,7 +159,20 @@ impl Theme {
         ..Theme::DEFAULT
     };
 
-    pub const ALL: [Theme; 3] = [Theme::DEFAULT, Theme::FINDINGS, Theme::SPECTRUM];
+    /// The default colours with the mids at 60 % opacity, so they blend with the lows
+    /// where both are drawn and show darker over the background, as on the CDJ-3000.
+    pub const BLENDED: Theme = Theme {
+        name: "blended",
+        band_alpha: [1.0, 0.6, 1.0],
+        ..Theme::DEFAULT
+    };
+
+    pub const ALL: [Theme; 4] = [
+        Theme::DEFAULT,
+        Theme::FINDINGS,
+        Theme::SPECTRUM,
+        Theme::BLENDED,
+    ];
 
     pub fn by_name(name: &str) -> Option<Theme> {
         Theme::ALL.into_iter().find(|t| t.name == name)
@@ -256,6 +276,8 @@ pub struct Segment {
     pub from: f32,
     pub to: f32,
     pub color: Rgb,
+    /// Opacity over what is below (0..=1).
+    pub alpha: f32,
 }
 
 /// What one column draws: up to three segments, in paint order.
@@ -283,14 +305,20 @@ impl Column {
         self
     }
 
-    /// The colour at distance `d` from the centre (0..=1), if any segment covers it:
-    /// the last one painted wins.
-    pub fn color_at(&self, d: f32) -> Option<Rgb> {
-        self.segments()
+    /// The colour at distance `d` from the centre (0..=1) over `under` (the background
+    /// or grid there): every segment covering `d` blended on in paint order. `None` if no
+    /// segment covers it.
+    pub fn color_at(&self, d: f32, under: Rgb) -> Option<Rgb> {
+        let mut covered = false;
+        let c = self
+            .segments()
             .iter()
-            .rev()
-            .find(|s| d >= s.from && d < s.to)
-            .map(|s| s.color)
+            .filter(|s| d >= s.from && d < s.to)
+            .fold(under, |below, s| {
+                covered = true;
+                s.color.over(below, s.alpha)
+            });
+        covered.then_some(c)
     }
 }
 
@@ -307,11 +335,13 @@ pub fn column(e: Entry, mode: Mode, layout: Layout, style: &Style) -> Column {
             from: 0.0,
             to: combined(),
             color: style.theme.single,
+            alpha: 1.0,
         }),
         Mode::Rgb => c.push(Segment {
             from: 0.0,
             to: combined(),
             color: rgb_color(e, &style.theme),
+            alpha: 1.0,
         }),
         Mode::ThreeBand => {
             let mut base = 0.0;
@@ -327,6 +357,7 @@ pub fn column(e: Entry, mode: Mode, layout: Layout, style: &Style) -> Column {
                         from,
                         to,
                         color: style.theme.bands[i],
+                        alpha: style.theme.band_alpha[i],
                     });
                 }
             }
@@ -389,7 +420,8 @@ mod tests {
             [Segment {
                 from: 0.0,
                 to: 1.0,
-                color: s.theme.single
+                color: s.theme.single,
+                alpha: 1.0,
             }]
         );
         let c = column(e(128, 128, 0), Mode::Single, Layout::Stacked, &s);
@@ -412,10 +444,11 @@ mod tests {
             [1.0, 0.4, 0.2]
         );
         // Highs are the inner core, mids around them, lows outside.
-        assert_eq!(c.color_at(0.1), Some(s.theme.bands[2]));
-        assert_eq!(c.color_at(0.3), Some(s.theme.bands[1]));
-        assert_eq!(c.color_at(0.9), Some(s.theme.bands[0]));
-        assert_eq!(c.color_at(1.0), None);
+        let bg = s.theme.background;
+        assert_eq!(c.color_at(0.1, bg), Some(s.theme.bands[2]));
+        assert_eq!(c.color_at(0.3, bg), Some(s.theme.bands[1]));
+        assert_eq!(c.color_at(0.9, bg), Some(s.theme.bands[0]));
+        assert_eq!(c.color_at(1.0, bg), None);
         // A silent band draws nothing.
         assert_eq!(
             column(e(0, 0, 9), Mode::ThreeBand, Layout::Overlaid, &s)
@@ -589,5 +622,34 @@ mod tests {
         assert_eq!(TrackGain::Off.resolve(&track(0.01)), 1.0);
         assert_eq!(TrackGain::Fixed(2.5).resolve(&track(1.0)), 2.5);
         assert_eq!(TrackGain::Auto.resolve(&track(1.0)), auto_gain(&track(1.0)));
+    }
+
+    #[test]
+    fn band_opacity_blends_with_what_is_below() {
+        let s = Style {
+            theme: Theme {
+                bands: [Rgb(0, 0, 200), Rgb(200, 100, 0), Rgb(250, 250, 250)],
+                band_alpha: [1.0, 0.5, 1.0],
+                ..Theme::DEFAULT
+            },
+            ..flat()
+        };
+        let bg = Rgb(0, 0, 0);
+        let c = column(e(255, 153, 51), Mode::ThreeBand, Layout::Overlaid, &s);
+        // Highs opaque on top; mids half over the lows; lows alone outside.
+        assert_eq!(c.color_at(0.1, bg), Some(Rgb(250, 250, 250)));
+        assert_eq!(c.color_at(0.5, bg), Some(Rgb(100, 50, 100)));
+        assert_eq!(c.color_at(0.9, bg), Some(Rgb(0, 0, 200)));
+        // Mids taller than the lows: half over the background.
+        let c = column(e(51, 204, 0), Mode::ThreeBand, Layout::Overlaid, &s);
+        assert_eq!(c.color_at(0.5, bg), Some(Rgb(100, 50, 0)));
+        // Opaque bands (the default theme) give exactly the topmost colour.
+        let d = Style::default();
+        let c = column(e(255, 153, 51), Mode::ThreeBand, Layout::Overlaid, &d);
+        assert_eq!(c.color_at(0.3, Rgb(9, 9, 9)), Some(d.theme.bands[1]));
+        assert_eq!(
+            Theme::by_name("blended").unwrap().band_alpha,
+            [1.0, 0.6, 1.0]
+        );
     }
 }
