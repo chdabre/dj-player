@@ -846,6 +846,7 @@ dependencies = [
 name = "engine-stretch"
 version = "0.1.0"
 dependencies = [
+ "rustfft",
  "signalsmith-stretch",
 ]
 

@@ -2,12 +2,15 @@
 //!
 //! Every backend sits behind [`Stretcher`], so the keylock spike can compare Signalsmith,
 //! Bungee and Rubber Band in the same deck. See `docs/research/engine.md` ("Rate, scratching
-//! and keylock"). Only Signalsmith Stretch exists so far.
+//! and keylock"). Two backends: Signalsmith Stretch through its C++ wrapper behind the push
+//! API, and [`bungee`], a pure-Rust port of Bungee Basic with its own pull (grain) API.
 //!
 //! Construct stretchers off the audio thread: construction allocates. After that,
 //! [`Stretcher::seek`], [`Stretcher::process`] and [`Stretcher::reset`] must be real-time
 //! safe. Note that `assert_no_alloc` only sees Rust's allocator; allocations inside a C++
 //! backend go straight to `malloc` and are invisible to it.
+
+pub mod bungee;
 
 #[cfg(feature = "signalsmith")]
 mod signalsmith;
