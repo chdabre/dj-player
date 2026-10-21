@@ -1,0 +1,22 @@
+[package]
+name = "library"
+description = "Our own library format: per-device journals, HLC merge, content-addressed blobs. No I/O beyond the Store trait."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+blake3.workspace = true
+sha2.workspace = true
+crc32c.workspace = true
+getrandom.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

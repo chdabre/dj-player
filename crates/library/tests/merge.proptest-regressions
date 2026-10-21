@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 22ce1864649b92247eed659f8c23e9b2377ca593e08c7142370761183e8f921d # shrinks to h = [[[]], [[(0, Rm(1, 2))]], [[(0, Add(1, 2, 0))], []]], a = 0, b = 2
+cc 3d45592c9b0f2144315fef84a94f375fd95cb02b0d0fc9943cb38fb1736569d9 # shrinks to h = [[[], [(34, Add(1, 1, 0))]], [[]], [[(0, Rm(1, 1))]]], cut = [0, 0, 2]
+cc 868b309f36c5585ab3cbf86318e72f57d7d76053cfd0ac1c3fd9cf9695dba90f # shrinks to h = [[[], [(0, Rm(2, 4))]], [[(0, Add(2, 4, 0))]], [[]]], order = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dups = []

@@ -15,6 +15,7 @@ engine-io = { path = "crates/engine-io" }
 engine-stretch = { path = "crates/engine-stretch" }
 engine-analysis = { path = "crates/engine-analysis" }
 waveform = { path = "crates/waveform", default-features = false }
+library = { path = "crates/library" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"
@@ -29,6 +30,12 @@ hound = "3.5"
 criterion = "0.8"
 crossterm = "0.29"
 png = "0.18"
+blake3 = { version = "1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+crc32c = "0.6"
+getrandom = "0.3"
+unicode-normalization = "0.1"
+proptest = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
