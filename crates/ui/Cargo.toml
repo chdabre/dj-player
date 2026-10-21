@@ -11,6 +11,12 @@ publish = false
 name = "dj-ui"
 path = "src/main.rs"
 
+[features]
+default = ["standin"]
+# The hardware stand-in: on-screen stand-ins for the physical controls around the device
+# screen, for development on a laptop. A device build leaves it out (--no-default-features).
+standin = []
+
 [dependencies]
 engine-core.workspace = true
 engine-io.workspace = true

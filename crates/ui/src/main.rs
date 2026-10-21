@@ -9,6 +9,10 @@
 //! p performance screen (hot cue / beat jump pads, beat loops), d timing overlay,
 //! f fullscreen, q quit.
 //!
+//! With the `standin` feature (on by default) the window also shows the hardware stand-in:
+//! the player's physical controls drawn around the device screen (`standin.rs`), as a
+//! separate layer. `--no-standin` shows the device screen alone, as on the Pi.
+//!
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
 
 mod clock;
@@ -16,6 +20,8 @@ mod gfx;
 mod perform;
 mod scene;
 mod screen;
+#[cfg(feature = "standin")]
+mod standin;
 mod stats;
 mod theme;
 mod waves;
@@ -50,7 +56,7 @@ use waveform::display::{Mode, TrackGain};
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
-const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] \
+const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] [--no-standin] \
                      [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--perform] [--pad-mode hotcue|beatjump|delete] \
                      [--hot-cues <s,s,…>] [--at <seconds>] [--play] [--run-for <seconds>] \
                      [--screenshot <out.png>]";
@@ -62,6 +68,9 @@ struct Args {
     file: PathBuf,
     request: StreamRequest,
     fullscreen: bool,
+    /// Draw the hardware stand-in around the device screen (feature `standin`).
+    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
+    standin: bool,
     screenshot: Option<PathBuf>,
     at: Option<f64>,
     play: bool,
@@ -77,6 +86,7 @@ fn parse_args() -> Result<Args, String> {
     let mut file = None;
     let mut request = StreamRequest::default();
     let (mut fullscreen, mut screenshot, mut at) = (false, None, None);
+    let mut standin = cfg!(feature = "standin");
     let (mut play, mut run_for) = (false, None);
     let mut theme = Theme::default();
     let mut wave_theme: Option<String> = None;
@@ -93,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
                 request.buffer_frames = Some(n.parse().map_err(|_| format!("bad buffer {n:?}"))?);
             }
             "--fullscreen" => fullscreen = true,
+            "--no-standin" => standin = false,
             "--screenshot" => {
                 screenshot = Some(PathBuf::from(
                     args.next().ok_or("--screenshot needs a path")?,
@@ -177,6 +188,7 @@ fn parse_args() -> Result<Args, String> {
         file: file.ok_or("no file given")?,
         request,
         fullscreen,
+        standin,
         screenshot,
         at,
         play,
@@ -239,7 +251,15 @@ fn main() -> ExitCode {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
+    #[cfg(feature = "standin")]
+    let sample_rate = player.format.sample_rate;
     let mut app = App {
+        pointer_on: PointerOn::Device,
+        #[cfg(feature = "standin")]
+        standin: args.standin.then(|| standin::Standin::new(sample_rate)),
+        #[cfg(feature = "standin")]
+        shell_scene: Scene::default(),
+        last_frame: None,
         clock: PlayheadClock::new(player.format.sample_rate),
         last_shown: None,
         scrub: None,
@@ -270,8 +290,6 @@ fn main() -> ExitCode {
         pressed: None,
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
-        rate_steps: 0,
-        quantize: true,
         zoom: 1,
         debug: true,
         stats: FrameStats::default(),
@@ -298,8 +316,22 @@ struct Scrub {
     shown: f64,
 }
 
+/// Who got the pointer when it went down: the device screen or the stand-in shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerOn {
+    Device,
+    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
+    Shell,
+}
+
 struct App {
     player: Player,
+    pointer_on: PointerOn,
+    #[cfg(feature = "standin")]
+    standin: Option<standin::Standin>,
+    #[cfg(feature = "standin")]
+    shell_scene: Scene,
+    last_frame: Option<Instant>,
     title: String,
     fullscreen: bool,
     screenshot: Option<PathBuf>,
@@ -321,8 +353,6 @@ struct App {
     pressed: Option<Target>,
     cursor: (f64, f64),
     modifiers: ModifiersState,
-    rate_steps: i32,
-    quantize: bool,
     zoom: usize,
     debug: bool,
     clock: PlayheadClock,
@@ -339,6 +369,81 @@ impl App {
     fn send(&mut self, cmd: DeckCommand) {
         if !self.player.send(cmd) {
             eprintln!("command ring full, dropped");
+        }
+    }
+
+    /// The pointer went down at window pixels (`x`, `y`); `alt` = right button or shift.
+    fn pointer_down(&mut self, x: f64, y: f64, alt: bool) {
+        #[cfg(feature = "standin")]
+        if self.standin.is_some()
+            && let Some(gfx) = &self.gfx
+            && !gfx.on_device(x, y)
+            && let Some((sx, sy)) = gfx.to_shell(x, y)
+        {
+            self.pointer_on = PointerOn::Shell;
+            let view = self.shell_view();
+            let alt = alt || self.modifiers.shift_key();
+            let cmds = self
+                .standin
+                .as_mut()
+                .map(|s| s.press(sx, sy, alt, &view))
+                .unwrap_or_default();
+            for c in cmds {
+                self.send(c);
+            }
+            return;
+        }
+        let _ = alt;
+        self.pointer_on = PointerOn::Device;
+        self.press(x, y);
+    }
+
+    fn pointer_move(&mut self, x: f64, y: f64) {
+        #[cfg(feature = "standin")]
+        if self.pointer_on == PointerOn::Shell {
+            let point = self.gfx.as_ref().and_then(|g| g.to_shell(x, y));
+            let cmds = match (point, self.standin.as_mut()) {
+                (Some((sx, sy)), Some(s)) => s.drag(sx, sy),
+                _ => Vec::new(),
+            };
+            for c in cmds {
+                self.send(c);
+            }
+            return;
+        }
+        self.drag(x, y);
+    }
+
+    fn pointer_up(&mut self) {
+        #[cfg(feature = "standin")]
+        if self.pointer_on == PointerOn::Shell {
+            let cmds = self
+                .standin
+                .as_mut()
+                .map(|s| s.release())
+                .unwrap_or_default();
+            for c in cmds {
+                self.send(c);
+            }
+            self.pointer_on = PointerOn::Device;
+            return;
+        }
+        self.release();
+    }
+
+    /// What the stand-in shows of the deck.
+    #[cfg(feature = "standin")]
+    fn shell_view(&self) -> standin::ShellView {
+        let st = self.player.state();
+        standin::ShellView {
+            playing: st.playing.load(Ordering::Relaxed),
+            reverse: st.reverse.load(Ordering::Relaxed),
+            keylock: st.keylock_enabled.load(Ordering::Relaxed),
+            quantize: st.quantize.load() > 0.0,
+            looping: st.looping.load(Ordering::Relaxed),
+            hot_cues: st.hot_cues.load(Ordering::Relaxed),
+            rate: st.rate.load(),
+            position: st.position.load() / f64::from(self.player.format.sample_rate),
         }
     }
 
@@ -512,24 +617,15 @@ impl App {
                         }
                         return;
                     }
-                    "+" | "=" => {
-                        self.rate_steps += 1;
-                        DeckCommand::SetRate(1.0 + f64::from(self.rate_steps) * RATE_STEP)
-                    }
-                    "-" | "_" => {
-                        self.rate_steps -= 1;
-                        DeckCommand::SetRate(1.0 + f64::from(self.rate_steps) * RATE_STEP)
-                    }
-                    "0" => {
-                        self.rate_steps = 0;
-                        DeckCommand::SetRate(1.0)
-                    }
+                    "+" | "=" => DeckCommand::NudgeRate(RATE_STEP),
+                    "-" | "_" => DeckCommand::NudgeRate(-RATE_STEP),
+                    "0" => DeckCommand::SetRate(1.0),
                     "k" => DeckCommand::ToggleKeylock,
                     "r" => DeckCommand::ToggleReverse,
                     "s" => DeckCommand::ToggleSlip,
                     "z" => {
-                        self.quantize = !self.quantize;
-                        DeckCommand::SetQuantize(self.quantize.then_some(1.0))
+                        let on = self.player.state().quantize.load() > 0.0;
+                        DeckCommand::SetQuantize((!on).then_some(1.0))
                     }
                     "i" => DeckCommand::LoopIn,
                     "o" => DeckCommand::LoopOut,
@@ -554,6 +650,23 @@ impl App {
     /// Draw one frame; true when the app should exit (a screenshot was taken).
     fn frame(&mut self) -> bool {
         let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        self.last_frame = Some(now);
+        #[cfg(feature = "standin")]
+        {
+            let cmds = self
+                .standin
+                .as_mut()
+                .map(|s| s.tick(dt))
+                .unwrap_or_default();
+            for c in cmds {
+                self.send(c);
+            }
+        }
+        #[cfg(not(feature = "standin"))]
+        let _ = dt;
         let st = Arc::clone(self.player.state());
         let sr = f64::from(self.player.format.sample_rate);
         let playing = st.playing.load(Ordering::Relaxed);
@@ -625,7 +738,21 @@ impl App {
         };
         let build_start = Instant::now();
         self.hits = screen::build(&view, &self.theme, &mut self.overview, &mut self.scene);
+        #[cfg(feature = "standin")]
+        let shell_view = self.shell_view();
+        #[cfg(feature = "standin")]
+        if let Some(s) = self.standin.as_mut() {
+            s.build(&shell_view, &mut self.shell_scene);
+        }
         let build = build_start.elapsed();
+        #[cfg(feature = "standin")]
+        let shell = self.standin.as_ref().map(|_| gfx::ShellFrame {
+            scene: &self.shell_scene,
+            size: standin::SIZE,
+            display: standin::DISPLAY,
+        });
+        #[cfg(not(feature = "standin"))]
+        let shell: Option<gfx::ShellFrame> = None;
 
         let Some(gfx) = &mut self.gfx else {
             return false;
@@ -635,15 +762,15 @@ impl App {
                 && self.player.source.is_complete()
                 && self.wave_complete;
             if ready || self.started.elapsed() > Duration::from_secs(30) {
-                let pixels = gfx.screenshot(&self.scene);
-                match write_png(path, &pixels) {
+                let (w, h, pixels) = gfx.screenshot(&self.scene, shell);
+                match write_png(path, w, h, &pixels) {
                     Ok(()) => eprintln!("wrote {}", path.display()),
                     Err(e) => self.error = Some(format!("screenshot: {e}")),
                 }
                 return true;
             }
         }
-        if let Some(timing) = gfx.render(&self.scene) {
+        if let Some(timing) = gfx.render(&self.scene, shell) {
             self.stats.record(now, build, timing);
         }
         if let Some(summary) = self.stats.take_if_due(now, Duration::from_secs(2)) {
@@ -678,13 +805,29 @@ fn hot_cue_key(key: &KeyEvent) -> Option<usize> {
     }
 }
 
-fn write_png(path: &std::path::Path, rgba: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+fn write_png(
+    path: &std::path::Path,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = png::Encoder::new(file, gfx::DESIGN_W as u32, gfx::DESIGN_H as u32);
+    let mut enc = png::Encoder::new(file, w, h);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()?.write_image_data(rgba)?;
     Ok(())
+}
+
+impl App {
+    /// The window's logical size: the device screen, or the stand-in around it.
+    fn window_size(&self) -> LogicalSize<f32> {
+        #[cfg(feature = "standin")]
+        if self.standin.is_some() {
+            return LogicalSize::new(standin::SIZE.0, standin::SIZE.1);
+        }
+        LogicalSize::new(gfx::DESIGN_W, gfx::DESIGN_H)
+    }
 }
 
 impl ApplicationHandler for App {
@@ -694,7 +837,7 @@ impl ApplicationHandler for App {
         }
         let mut attrs = Window::default_attributes()
             .with_title("dj-ui")
-            .with_inner_size(LogicalSize::new(gfx::DESIGN_W, gfx::DESIGN_H))
+            .with_inner_size(self.window_size())
             .with_resizable(true);
         if self.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -742,22 +885,25 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => self.key(event_loop, &event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                self.drag(position.x, position.y);
+                self.pointer_move(position.x, position.y);
             }
             WindowEvent::MouseInput {
                 state,
-                button: MouseButton::Left,
+                button: button @ (MouseButton::Left | MouseButton::Right),
                 ..
             } => match state {
-                ElementState::Pressed => self.press(self.cursor.0, self.cursor.1),
-                ElementState::Released => self.release(),
+                ElementState::Pressed => {
+                    let alt = button == MouseButton::Right;
+                    self.pointer_down(self.cursor.0, self.cursor.1, alt)
+                }
+                ElementState::Released => self.pointer_up(),
             },
             WindowEvent::Touch(Touch {
                 phase, location, ..
             }) => match phase {
-                TouchPhase::Started => self.press(location.x, location.y),
-                TouchPhase::Moved => self.drag(location.x, location.y),
-                TouchPhase::Ended | TouchPhase::Cancelled => self.release(),
+                TouchPhase::Started => self.pointer_down(location.x, location.y, false),
+                TouchPhase::Moved => self.pointer_move(location.x, location.y),
+                TouchPhase::Ended | TouchPhase::Cancelled => self.pointer_up(),
             },
             _ => {}
         }
