@@ -1,11 +1,14 @@
 # Waveforms (spike)
 
-Status 2026-10-21: desk research only. No code yet. One measurement: I decoded the ANLZ files of the rekordcrate sweep fixture to check the 3-band byte order (see "Rekordbox").
+Status 2026-10-21: desk research, now implemented in `crates/waveform` (draft PR chdabre/dj-player#1). One measurement: I decoded the ANLZ files of the rekordcrate sweep fixture to check the 3-band byte order (see "Rekordbox").
 
 ## Decisions (project owner, 2026-10-21)
 
 - **Always compute our own waveform**, during decode, for every track. An imported Rekordbox tag is at most a placeholder until ours is ready. This supersedes `docs/research/engine.md` ("use ANLZ waveforms when present"); update the living doc to match.
 - **Three display modes:** single colour, 3-band and RGB (colour from spectral content). All three are drawn from the same stored data: the three band peaks below, with single colour from their combined level and RGB from their ratios. No mode needs extra stored data.
+- **Per-track auto gain** (2026-10-21): loud masters filled the whole height, so heights are normalised per track at display time. The stored data stays absolute. The gain puts the 95th percentile of the combined level at 0.8 of the half-height, clamped to 0.5–4 (silence: 1). It multiplies every height in the zoom and the overview alike, as one uniform. Auto, off or a fixed value is a setting. Implemented as `waveform::display::auto_gain` and `Style::track_gain`.
+- **Colours are a renderer parameter** (2026-10-21), so themes can be applied. Every colour the views draw (waveform palettes, the RGB mode's per-band colours and weights, background, grid, labels, cues, loop, playhead, pad colours) lives in one `Theme` of plain colours and floats (shader uniforms). The renderer hard-codes none. Presets: `default`, `findings` (the old palette) and `spectrum` (RGB weighted low 0.45 / mid 1.0 / high 2.2, since equal weights come out red on real music). Gains and dimming stay display settings next to the theme.
+- **Default 3-band colours: blue low, orange mid, white high** (2026-10-21). This **supersedes the findings.md palette** (indigo #4B4FC2 / teal #3FB8AE / cream #F4EAD2), which stays available as the `findings` theme; the living doc needs updating. Values chosen by eye on the previews: low #2F6FE8, mid #F0762A, high #F5F5F2. The orange started at #F0952E and was moved towards red-orange, because it merged with the amber cue and loop overlays (#E0A33A / #F2C06A). The cue colours were left alone.
 
 ## Short answer
 
