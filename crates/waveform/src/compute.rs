@@ -8,8 +8,13 @@
 //! - **Encoding:** one `u8` per band, `round(255·√min(peak, 1))`; absolute levels, never
 //!   normalised.
 //! - **Time base:** seconds. Entry `k` covers `[k, k + 1) / 150` s from the first decoded
-//!   frame, so the data does not depend on the file's or the device's sample rate.
+//!   frame, so the data does not depend on the file's or the device's sample rate. The
+//!   [`Timeline`] records whether that frame is the gapless-trimmed start (ours) or the
+//!   untrimmed one (Rekordbox's), and the trim.
+//! - **Incremental:** [`Builder`] takes the audio chunk by chunk during decode; [`compute`]
+//!   is the same for a whole track in memory.
 
+use std::collections::VecDeque;
 use std::f64::consts::{FRAC_1_SQRT_2, TAU};
 
 /// Detail entries per second (Rekordbox's PWV7 rate, so its 3-band tags import 1:1).
@@ -98,7 +103,7 @@ impl Params {
 /// Where a waveform came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Provenance {
-    /// Computed by [`compute`].
+    /// Computed by [`Builder`] / [`compute`].
     #[default]
     Own,
     /// Imported from Rekordbox's 3-band detail tag (PWV7, `.2EX`); placeholder only.
@@ -111,11 +116,47 @@ pub enum Provenance {
     RekordboxPwv3,
 }
 
+/// Where entry 0 of a waveform sits, so waveforms from different decoders line up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Origin {
+    /// Not known (e.g. an import whose convention is unverified).
+    Unknown,
+    /// The first frame after gapless trimming: the engine's timeline, what [`Builder`] sees
+    /// from our decoder.
+    #[default]
+    Trimmed,
+    /// The decoder's first frame without gapless trimming (Rekordbox's convention, which
+    /// starts an MP3 `start_trim` frames earlier).
+    Untrimmed,
+}
+
+/// Entry 0's origin and the file's gapless trim, so a consumer can move between the trimmed
+/// and the untrimmed timeline: the untrimmed one starts `start_trim / file_rate` seconds
+/// earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Timeline {
+    pub origin: Origin,
+    /// Frames the decoder drops from the start for gapless playback, at the file's rate
+    /// (`engine_media::TrackInfo::start_trim`); 0 if none or unknown.
+    pub start_trim: u32,
+    /// The file's own sample rate; 0 if unknown.
+    pub file_rate: u32,
+}
+
+impl Timeline {
+    /// Seconds from the untrimmed start to the trimmed one, if known.
+    pub fn trim_seconds(&self) -> Option<f64> {
+        (self.file_rate > 0).then(|| f64::from(self.start_trim) / f64::from(self.file_rate))
+    }
+}
+
 /// A track's detail waveform.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Waveform {
     pub params: Params,
     pub provenance: Provenance,
+    /// Where entry 0 sits on the file's timeline.
+    pub timeline: Timeline,
     /// Track length in seconds (frames ÷ the file's rate).
     pub duration: f64,
     /// Entry `k` covers `[k, k + 1) / entries_per_second` seconds.
@@ -127,6 +168,7 @@ impl Waveform {
     pub fn overview(&self) -> Overview {
         Overview {
             duration: self.duration,
+            timeline: self.timeline,
             columns: overview(&self.entries, OVERVIEW_COLUMNS),
         }
     }
@@ -141,6 +183,7 @@ impl Waveform {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overview {
     pub duration: f64,
+    pub timeline: Timeline,
     pub columns: Vec<Entry>,
 }
 
@@ -158,54 +201,149 @@ pub fn overview(detail: &[Entry], columns: usize) -> Vec<Entry> {
         .collect()
 }
 
-/// Compute the detail waveform of interleaved stereo at the file's own `sample_rate`.
+/// Compute the detail waveform of a whole track at once: interleaved stereo (L, R, L, R,
+/// ...; a trailing half frame is ignored) at `sample_rate`. A thin wrapper over [`Builder`].
 pub fn compute(stereo: &[f32], sample_rate: u32, params: &Params) -> Waveform {
-    let frames = stereo.len() / 2;
-    let sr = u64::from(sample_rate);
-    let eps = u64::from(params.entries_per_second);
-    // Entry k starts at frame floor(k·sr/eps); there are as many entries as start inside
-    // the track.
-    let count = (frames as u64 * eps).div_ceil(sr) as usize;
-    let start = |k: usize| (k as u64 * sr / eps) as usize;
+    let mut b = Builder::new(sample_rate, params);
+    b.push(stereo);
+    b.finish()
+}
 
-    let mut split = [
-        Splitter::new(params, sample_rate),
-        Splitter::new(params, sample_rate),
-    ];
-    let mut peaks = Vec::with_capacity(count);
-    for k in 0..count {
-        let mut peak = [0.0f32; 3];
-        for frame in stereo[2 * start(k)..2 * start(k + 1).min(frames)].chunks_exact(2) {
-            for (ch, &x) in frame.iter().enumerate() {
-                let bands = split[ch].process(f64::from(x));
-                for (p, b) in peak.iter_mut().zip(bands) {
-                    *p = p.max(b.abs() as f32);
-                }
-            }
-        }
-        peaks.push(peak);
-        split.iter_mut().for_each(Splitter::flush);
+/// Computes a waveform incrementally, chunk by chunk, as a decoder or loader produces audio:
+/// [`Builder::push`] each chunk of interleaved stereo, then [`Builder::finish`]. The result is
+/// the same as [`compute`] on the whole track, byte for byte, however the audio is chunked.
+///
+/// The rate is that of the audio pushed (the device rate in the loader); entries are timed in
+/// seconds, so it does not matter which. Memory stays constant apart from the entries: the
+/// centred low-band max holds back the last `r` entries (±12 ms) until their right
+/// neighbours exist.
+pub struct Builder {
+    params: Params,
+    sample_rate: u32,
+    split: [Splitter; 2],
+    /// Frames pushed so far.
+    frames: u64,
+    /// Index of the entry being accumulated, and the frame the next one starts at.
+    current: u64,
+    next_start: u64,
+    peak: [f32; 3],
+    /// A left sample whose right sample is in the next chunk.
+    half: Option<f32>,
+    /// Raw peaks of the entries not yet final: indices `first..first + raw.len()`.
+    raw: VecDeque<[f32; 3]>,
+    first: usize,
+    entries: Vec<Entry>,
+}
+
+impl Builder {
+    pub fn new(sample_rate: u32, params: &Params) -> Self {
+        let mut b = Builder {
+            params: *params,
+            sample_rate,
+            split: [
+                Splitter::new(params, sample_rate),
+                Splitter::new(params, sample_rate),
+            ],
+            frames: 0,
+            current: 0,
+            next_start: 0,
+            peak: [0.0; 3],
+            half: None,
+            raw: VecDeque::new(),
+            first: 0,
+            entries: Vec::new(),
+        };
+        b.next_start = b.start(1);
+        b
     }
 
-    let r = params.low_smoothing_entries();
-    let entries = (0..count)
-        .map(|k| {
-            let low = peaks[k.saturating_sub(r)..(k + r + 1).min(count)]
-                .iter()
-                .fold(0.0f32, |a, p| a.max(p[0]));
-            Entry {
-                low: encode_level(low),
-                mid: encode_level(peaks[k][1]),
-                high: encode_level(peaks[k][2]),
-            }
-        })
-        .collect();
+    /// First frame of entry `k`: `floor(k·rate/entries_per_second)`.
+    fn start(&self, k: u64) -> u64 {
+        k * u64::from(self.sample_rate) / u64::from(self.params.entries_per_second)
+    }
 
-    Waveform {
-        params: *params,
-        provenance: Provenance::Own,
-        duration: frames as f64 / f64::from(sample_rate),
-        entries,
+    /// Add the next chunk of interleaved stereo. Chunks may split a frame.
+    pub fn push(&mut self, stereo: &[f32]) {
+        let mut rest = stereo;
+        if let Some(l) = self.half.take() {
+            let Some((&r, tail)) = rest.split_first() else {
+                self.half = Some(l);
+                return;
+            };
+            self.frame(l, r);
+            rest = tail;
+        }
+        let mut frames = rest.chunks_exact(2);
+        for f in &mut frames {
+            self.frame(f[0], f[1]);
+        }
+        self.half = frames.remainder().first().copied();
+    }
+
+    fn frame(&mut self, l: f32, r: f32) {
+        for (ch, x) in [l, r].into_iter().enumerate() {
+            let bands = self.split[ch].process(f64::from(x));
+            for (p, b) in self.peak.iter_mut().zip(bands) {
+                *p = p.max(b.abs() as f32);
+            }
+        }
+        self.frames += 1;
+        if self.frames == self.next_start {
+            self.end_entry();
+        }
+    }
+
+    /// The current entry is complete.
+    fn end_entry(&mut self) {
+        self.raw.push_back(std::mem::take(&mut self.peak));
+        self.current += 1;
+        self.next_start = self.start(self.current + 1);
+        self.split.iter_mut().for_each(Splitter::flush);
+        // Entry k is final once entry k + r exists.
+        let r = self.params.low_smoothing_entries();
+        let done = self.first + self.raw.len();
+        if done > r {
+            self.finalize(done - 1 - r, done);
+        }
+    }
+
+    /// Encode entry `k`, whose low band takes the max over `[k - r, k + r]` of the entries
+    /// that exist (`< done`), and drop raw peaks no later entry needs.
+    fn finalize(&mut self, k: usize, done: usize) {
+        let r = self.params.low_smoothing_entries();
+        let raw = |i: usize| self.raw[i - self.first];
+        let low = (k.saturating_sub(r).max(self.first)..(k + r + 1).min(done))
+            .map(|i| raw(i)[0])
+            .fold(0.0f32, f32::max);
+        let p = raw(k);
+        self.entries.push(Entry {
+            low: encode_level(low),
+            mid: encode_level(p[1]),
+            high: encode_level(p[2]),
+        });
+        while self.first + r < k + 1 {
+            self.raw.pop_front();
+            self.first += 1;
+        }
+    }
+
+    /// Finish the track: a partly filled last entry counts, and the held-back entries are
+    /// encoded. A trailing half frame is dropped.
+    pub fn finish(mut self) -> Waveform {
+        if self.frames > self.start(self.current) {
+            self.end_entry();
+        }
+        let done = self.first + self.raw.len();
+        for k in self.entries.len()..done {
+            self.finalize(k, done);
+        }
+        Waveform {
+            params: self.params,
+            provenance: Provenance::Own,
+            timeline: Timeline::default(),
+            duration: self.frames as f64 / f64::from(self.sample_rate),
+            entries: self.entries,
+        }
     }
 }
 
@@ -411,6 +549,38 @@ mod tests {
         // A partial last entry still counts.
         let wf = compute(&vec![0.0; 2 * 44_101], 44_100, &Params::default());
         assert_eq!(wf.entries.len(), 151);
+    }
+
+    #[test]
+    fn chunked_equals_batch() {
+        // Tone, silence and a burst, so every band and the smoothing see edges.
+        let mut audio = tone(44_100, 45.0, 0.6, 0.0, 1.0);
+        audio.extend(vec![0.0; 2 * 4410]);
+        audio.extend(tone(44_100, 3000.0, 0.3, 0.0, 0.7));
+        audio.push(0.25); // a trailing half frame, ignored by both
+        for params in [
+            Params::default(),
+            Params {
+                low_smoothing: 0.0,
+                ..Params::default()
+            },
+            Params {
+                low_smoothing: 0.05,
+                ..Params::default()
+            },
+        ] {
+            let batch = compute(&audio, 44_100, &params);
+            assert_eq!(batch.entries.len(), 270); // 1.8 s
+            // 1 and 3 floats split frames; 97 and 255 are under one entry (294 frames).
+            for chunk in [1, 3, 97, 255, 588, 1001, 44_100, audio.len()] {
+                let mut b = Builder::new(44_100, &params);
+                for c in audio.chunks(chunk) {
+                    b.push(c);
+                }
+                b.push(&[]);
+                assert_eq!(b.finish(), batch, "chunks of {chunk}");
+            }
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub mod render;
 
 pub use blob::DecodeError;
 pub use compute::{
-    Entry, OVERVIEW_COLUMNS, Overview, Params, Provenance, Waveform, compute, encode_level, level,
-    overview,
+    Builder, Entry, OVERVIEW_COLUMNS, Origin, Overview, Params, Provenance, Timeline, Waveform,
+    compute, encode_level, level, overview,
 };
 pub use display::{Column, Layout, Mode, Rgb, Segment, Style};

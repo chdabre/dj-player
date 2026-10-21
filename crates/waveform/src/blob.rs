@@ -1,37 +1,58 @@
-//! Binary encoding of a waveform blob (detail or overview), version 1. Little-endian.
+//! Binary encoding of a waveform blob (detail or overview), format version 1. Little-endian.
 //!
 //! | Offset | Size | Field |
 //! | --- | --- | --- |
 //! | 0 | 4 | magic `DJWF` |
 //! | 4 | 2 | format version (1) |
-//! | 6 | 2 | header length in bytes, signal table included; the data starts here |
-//! | 8 | 1 | layout: 0 = detail (timed entries), 1 = overview (columns spread over the track) |
-//! | 9 | 1 | value curve: 1 = `round(255·√peak)` |
-//! | 10 | 1 | filter: 1 = Linkwitz-Riley 4th order, per channel, peak of max(L, R) |
-//! | 11 | 1 | provenance: 0 own, 1 Rekordbox PWV7, 2 PWV6, 3 PWV5, 4 PWV3 |
-//! | 12 | 4 | entry rate in millihertz (150 /s = 150 000); 0 for an overview |
-//! | 16 | 4 | entry count |
-//! | 20 | 8 | track duration, seconds (f64) |
-//! | 28 | 4 | low-band smoothing half-width, seconds (f32) |
-//! | 32 | 1 | signal count N |
-//! | 33 | 3 | reserved, 0 |
-//! | 36 | 12·N | signal table: kind (u8), 3 reserved bytes, lower and upper edge in Hz (f32; 0 = open) |
-//! | header length | count·N | data, entry-major: N bytes per entry, in signal-table order |
+//! | 6 | 2 | data offset: header length in bytes, signal table included |
+//! | 8 | 2 | signal table offset: length of the fixed fields (48 in version 1) |
+//! | 10 | 1 | signal descriptor size (12 in version 1) |
+//! | 11 | 1 | signal count N |
+//! | 12 | 1 | layout: 0 = detail (timed entries), 1 = overview (columns spread over the track) |
+//! | 13 | 1 | value curve: 0 = imported / unknown, 1 = `round(255·√peak)` |
+//! | 14 | 1 | filter: 0 = imported / unknown, 1 = Linkwitz-Riley 4th order per channel, peak of max(L, R) |
+//! | 15 | 1 | provenance: 0 own, 1 Rekordbox PWV7, 2 PWV6, 3 PWV5, 4 PWV3 |
+//! | 16 | 4 | entry rate in millihertz (150 /s = 150 000); 0 for an overview |
+//! | 20 | 4 | entry count |
+//! | 24 | 8 | track duration, seconds (f64) |
+//! | 32 | 4 | low-band smoothing half-width, seconds (f32) |
+//! | 36 | 1 | timeline origin of entry 0: 0 unknown, 1 gapless-trimmed (ours), 2 untrimmed (Rekordbox) |
+//! | 37 | 3 | reserved, 0 |
+//! | 40 | 4 | gapless start trim, frames at the file's rate |
+//! | 44 | 4 | the file's sample rate, Hz (0 = unknown) |
+//! | 48 | 12·N | signal table: kind (u8), 3 reserved bytes, lower and upper edge in Hz (f32; 0 = open) |
+//! | data offset | count·N | data, entry-major: N bytes per entry, in signal-table order |
 //!
-//! Kinds: 1 low, 2 mid, 3 high; 16 + i for stem i (later). A reader takes the signals it
-//! knows and skips the rest, and starts the data at the header length, so later versions can
-//! add signals and header fields without breaking older readers.
+//! Signal kinds: 1 low, 2 mid, 3 high; 16 + i for stem i (later).
+//!
+//! A blob that is not our own computation (provenance other than own) is written with value
+//! curve and filter 0: an import must not claim our curve or crossovers.
+//!
+//! **Versioning.** The version changes only on a breaking change, one an older reader would
+//! misread; a reader rejects any version it does not know. Additive changes keep the version:
+//!
+//! - a new header field goes after the existing fixed fields (the signal table offset grows),
+//! - a new per-signal field goes at the end of each descriptor (the descriptor size grows),
+//! - a new signal kind is a new row; readers skip kinds they do not know,
+//!
+//! and readers locate the signal table, each descriptor and the data through the recorded
+//! offsets and sizes, never through constants, so they read what they know and skip the
+//! rest.
 
-use crate::compute::{ENTRIES_PER_SECOND, Entry, Overview, Params, Provenance, Waveform};
+use crate::compute::{
+    ENTRIES_PER_SECOND, Entry, Origin, Overview, Params, Provenance, Timeline, Waveform,
+};
 
 pub const MAGIC: [u8; 4] = *b"DJWF";
 pub const VERSION: u16 = 1;
 
-const FIXED_HEADER: usize = 36;
+/// Fixed fields written by this version; the signal table starts here.
+const FIXED_HEADER: usize = 48;
 const SIGNAL_DESC: usize = 12;
 
 const LAYOUT_DETAIL: u8 = 0;
 const LAYOUT_OVERVIEW: u8 = 1;
+const UNKNOWN: u8 = 0;
 const CURVE_SQRT: u8 = 1;
 const FILTER_LR4_PEAK: u8 = 1;
 
@@ -103,7 +124,7 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// The bands of a waveform this crate computes, in storage order.
+/// The bands of a waveform, in storage order.
 fn bands(p: &Params) -> [Signal; 3] {
     [
         Signal {
@@ -126,11 +147,32 @@ fn bands(p: &Params) -> [Signal; 3] {
 
 struct Header {
     layout: u8,
+    curve: u8,
+    filter: u8,
     provenance: Provenance,
     rate_mhz: u32,
     duration: f64,
     low_smoothing: f32,
+    timeline: Timeline,
     signals: Vec<Signal>,
+}
+
+impl Header {
+    fn new(layout: u8, params: &Params, provenance: Provenance, timeline: Timeline) -> Self {
+        let own = provenance == Provenance::Own;
+        let code = |c| if own { c } else { UNKNOWN };
+        Header {
+            layout,
+            curve: code(CURVE_SQRT),
+            filter: code(FILTER_LR4_PEAK),
+            provenance,
+            rate_mhz: 0,
+            duration: 0.0,
+            low_smoothing: params.low_smoothing,
+            timeline,
+            signals: bands(params).to_vec(),
+        }
+    }
 }
 
 fn encode(h: &Header, entries: &[Entry]) -> Vec<u8> {
@@ -139,17 +181,17 @@ fn encode(h: &Header, entries: &[Entry]) -> Vec<u8> {
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(header_len as u16).to_le_bytes());
-    out.extend_from_slice(&[
-        h.layout,
-        CURVE_SQRT,
-        FILTER_LR4_PEAK,
-        provenance_code(h.provenance),
-    ]);
+    out.extend_from_slice(&(FIXED_HEADER as u16).to_le_bytes());
+    out.extend_from_slice(&[SIGNAL_DESC as u8, h.signals.len() as u8]);
+    out.extend_from_slice(&[h.layout, h.curve, h.filter, provenance_code(h.provenance)]);
     out.extend_from_slice(&h.rate_mhz.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     out.extend_from_slice(&h.duration.to_le_bytes());
     out.extend_from_slice(&h.low_smoothing.to_le_bytes());
-    out.extend_from_slice(&[h.signals.len() as u8, 0, 0, 0]);
+    out.extend_from_slice(&[origin_code(h.timeline.origin), 0, 0, 0]);
+    out.extend_from_slice(&h.timeline.start_trim.to_le_bytes());
+    out.extend_from_slice(&h.timeline.file_rate.to_le_bytes());
+    debug_assert_eq!(out.len(), FIXED_HEADER);
     for s in &h.signals {
         out.extend_from_slice(&[s.kind.code(), 0, 0, 0]);
         out.extend_from_slice(&s.low_hz.to_le_bytes());
@@ -173,25 +215,33 @@ fn decode(blob: &[u8]) -> Result<(Header, Vec<Entry>), DecodeError> {
     if version != VERSION {
         return Err(DecodeError::UnsupportedVersion(version));
     }
-    let header_len = usize::from(u16_at(6)?);
-    let [layout, curve, filter, provenance] = bytes(8, 4)?.try_into().unwrap();
-    if curve != CURVE_SQRT {
-        return Err(DecodeError::Unsupported("value curve"));
-    }
-    if filter != FILTER_LR4_PEAK {
-        return Err(DecodeError::Unsupported("filter"));
-    }
-    let rate_mhz = u32_at(12)?;
-    let count = u32_at(16)? as usize;
-    let duration = f64::from_le_bytes(bytes(20, 8)?.try_into().unwrap());
-    let low_smoothing = f32_at(28)?;
-    let n = usize::from(bytes(32, 1)?[0]);
-    if header_len < FIXED_HEADER + SIGNAL_DESC * n {
+    let data_at = usize::from(u16_at(6)?);
+    let table_at = usize::from(u16_at(8)?);
+    let [desc_len, n] = bytes(10, 2)?.try_into().unwrap();
+    let (desc_len, n) = (usize::from(desc_len), usize::from(n));
+    // Every version-1 field must be there; later additions may make both longer.
+    if table_at < FIXED_HEADER || desc_len < SIGNAL_DESC || data_at < table_at + desc_len * n {
         return Err(DecodeError::Truncated);
     }
+    let [layout, curve, filter, provenance] = bytes(12, 4)?.try_into().unwrap();
+    if curve > CURVE_SQRT {
+        return Err(DecodeError::Unsupported("value curve"));
+    }
+    if filter > FILTER_LR4_PEAK {
+        return Err(DecodeError::Unsupported("filter"));
+    }
+    let rate_mhz = u32_at(16)?;
+    let count = u32_at(20)? as usize;
+    let duration = f64::from_le_bytes(bytes(24, 8)?.try_into().unwrap());
+    let low_smoothing = f32_at(32)?;
+    let timeline = Timeline {
+        origin: origin_from_code(bytes(36, 1)?[0])?,
+        start_trim: u32_at(40)?,
+        file_rate: u32_at(44)?,
+    };
     let signals = (0..n)
         .map(|i| {
-            let at = FIXED_HEADER + SIGNAL_DESC * i;
+            let at = table_at + desc_len * i;
             Ok(Signal {
                 kind: SignalKind::from_code(bytes(at, 1)?[0]),
                 low_hz: f32_at(at + 4)?,
@@ -210,7 +260,7 @@ fn decode(blob: &[u8]) -> Result<(Header, Vec<Entry>), DecodeError> {
         column(SignalKind::Mid)?,
         column(SignalKind::High)?,
     );
-    let data = bytes(header_len, count * n)?;
+    let data = bytes(data_at, count * n)?;
     let entries = data
         .chunks_exact(n)
         .map(|e| Entry {
@@ -221,10 +271,13 @@ fn decode(blob: &[u8]) -> Result<(Header, Vec<Entry>), DecodeError> {
         .collect();
     let header = Header {
         layout,
+        curve,
+        filter,
         provenance: provenance_from_code(provenance)?,
         rate_mhz,
         duration,
         low_smoothing,
+        timeline,
         signals,
     };
     Ok((header, entries))
@@ -251,16 +304,30 @@ fn provenance_from_code(c: u8) -> Result<Provenance, DecodeError> {
     })
 }
 
+fn origin_code(o: Origin) -> u8 {
+    match o {
+        Origin::Unknown => 0,
+        Origin::Trimmed => 1,
+        Origin::Untrimmed => 2,
+    }
+}
+
+fn origin_from_code(c: u8) -> Result<Origin, DecodeError> {
+    Ok(match c {
+        0 => Origin::Unknown,
+        1 => Origin::Trimmed,
+        2 => Origin::Untrimmed,
+        _ => return Err(DecodeError::Unsupported("timeline origin")),
+    })
+}
+
 impl Waveform {
     /// Encode as a detail blob.
     pub fn to_blob(&self) -> Vec<u8> {
         let header = Header {
-            layout: LAYOUT_DETAIL,
-            provenance: self.provenance,
             rate_mhz: self.params.entries_per_second * 1000,
             duration: self.duration,
-            low_smoothing: self.params.low_smoothing,
-            signals: bands(&self.params).to_vec(),
+            ..Header::new(LAYOUT_DETAIL, &self.params, self.provenance, self.timeline)
         };
         encode(&header, &self.entries)
     }
@@ -289,6 +356,7 @@ impl Waveform {
                 low_smoothing: h.low_smoothing,
             },
             provenance: h.provenance,
+            timeline: h.timeline,
             duration: h.duration,
             entries,
         })
@@ -299,12 +367,8 @@ impl Overview {
     /// Encode as an overview blob; `params` are those of the detail it was reduced from.
     pub fn to_blob(&self, params: &Params, provenance: Provenance) -> Vec<u8> {
         let header = Header {
-            layout: LAYOUT_OVERVIEW,
-            provenance,
-            rate_mhz: 0,
             duration: self.duration,
-            low_smoothing: params.low_smoothing,
-            signals: bands(params).to_vec(),
+            ..Header::new(LAYOUT_OVERVIEW, params, provenance, self.timeline)
         };
         encode(&header, &self.columns)
     }
@@ -317,6 +381,7 @@ impl Overview {
         }
         Ok(Overview {
             duration: h.duration,
+            timeline: h.timeline,
             columns,
         })
     }
@@ -335,6 +400,11 @@ mod tests {
         Waveform {
             params: Params::default(),
             provenance: Provenance::Own,
+            timeline: Timeline {
+                origin: Origin::Trimmed,
+                start_trim: 1105,
+                file_rate: 44_100,
+            },
             duration: 2.5,
             entries: (0..375u32)
                 .map(|i| Entry {
@@ -353,15 +423,66 @@ mod tests {
         assert_eq!(blob.len(), detail_size(2.5));
         assert_eq!(&blob[..4], b"DJWF");
         assert_eq!(blob[4..6], [1, 0]);
-        assert_eq!(blob[12..16], 150_000u32.to_le_bytes());
+        assert_eq!(blob[13..15], [CURVE_SQRT, FILTER_LR4_PEAK]);
+        assert_eq!(blob[16..20], 150_000u32.to_le_bytes());
         assert_eq!(Waveform::from_blob(&blob).unwrap(), wf);
-        for p in [Provenance::RekordboxPwv7, Provenance::RekordboxPwv3] {
+    }
+
+    #[test]
+    fn timeline_round_trips() {
+        for timeline in [
+            Timeline::default(),
+            Timeline {
+                origin: Origin::Untrimmed,
+                start_trim: 1105,
+                file_rate: 48_000,
+            },
+            Timeline {
+                origin: Origin::Unknown,
+                start_trim: 0,
+                file_rate: 0,
+            },
+        ] {
+            let wf = Waveform {
+                timeline,
+                ..sample()
+            };
+            assert_eq!(
+                Waveform::from_blob(&wf.to_blob()).unwrap().timeline,
+                timeline
+            );
+            let ov = wf.overview();
+            let blob = ov.to_blob(&wf.params, wf.provenance);
+            assert_eq!(Overview::from_blob(&blob).unwrap().timeline, timeline);
+        }
+        assert_eq!(sample().timeline.trim_seconds(), Some(1105.0 / 44_100.0));
+        assert_eq!(Timeline::default().trim_seconds(), None);
+    }
+
+    #[test]
+    fn imports_do_not_claim_our_curve_or_filter() {
+        for p in [
+            Provenance::RekordboxPwv7,
+            Provenance::RekordboxPwv6,
+            Provenance::RekordboxPwv5,
+            Provenance::RekordboxPwv3,
+        ] {
             let wf = Waveform {
                 provenance: p,
                 ..sample()
             };
-            assert_eq!(Waveform::from_blob(&wf.to_blob()).unwrap(), wf);
+            let blob = wf.to_blob();
+            assert_eq!(blob[13..15], [UNKNOWN, UNKNOWN], "{p:?}");
+            assert_eq!(Waveform::from_blob(&blob).unwrap(), wf);
+            let blob = wf.overview().to_blob(&wf.params, p);
+            assert_eq!(blob[13..15], [UNKNOWN, UNKNOWN], "{p:?}");
         }
+        let mut blob = sample().to_blob();
+        blob[13] = 2;
+        assert_eq!(
+            Waveform::from_blob(&blob).unwrap_err(),
+            DecodeError::Unsupported("value curve")
+        );
     }
 
     #[test]
@@ -398,36 +519,40 @@ mod tests {
         );
     }
 
+    /// A blob from a later writer of the same version: 8 bytes of new header fields, 4 new
+    /// bytes per signal descriptor, a stem signal between the bands and 8 bytes of padding
+    /// before the data. This version's reader skips all of it.
     #[test]
-    fn extra_signals_and_header_fields_are_skipped() {
-        // A later writer: a stem signal between the bands and 8 bytes of new header fields.
+    fn additive_changes_keep_the_version() {
         let wf = sample();
-        let mut h = Header {
-            layout: LAYOUT_DETAIL,
-            provenance: Provenance::Own,
-            rate_mhz: 150_000,
-            duration: wf.duration,
-            low_smoothing: wf.params.low_smoothing,
-            signals: bands(&wf.params).to_vec(),
-        };
-        h.signals.insert(
-            1,
-            Signal {
-                kind: SignalKind::Stem(0),
-                low_hz: 0.0,
-                high_hz: 0.0,
-            },
-        );
-        let three = encode(&h, &wf.entries);
-        // Re-lay the data with a fourth byte per entry and grow the header.
-        let n = h.signals.len();
-        let header_len = FIXED_HEADER + SIGNAL_DESC * n;
-        let mut blob = three[..header_len].to_vec();
-        blob[6..8].copy_from_slice(&((header_len + 8) as u16).to_le_bytes());
+        let ours = wf.to_blob();
+        let extra_fields = 8;
+        let desc = SIGNAL_DESC + 4;
+        let signals = [
+            (1u8, 0.0f32, 250.0f32),
+            (16, 0.0, 0.0),
+            (2, 250.0, 2500.0),
+            (3, 2500.0, 0.0),
+        ];
+        let table_at = FIXED_HEADER + extra_fields;
+        let data_at = table_at + desc * signals.len() + 8;
+        let mut blob = ours[..FIXED_HEADER].to_vec();
+        blob[6..8].copy_from_slice(&(data_at as u16).to_le_bytes());
+        blob[8..10].copy_from_slice(&(table_at as u16).to_le_bytes());
+        blob[10] = desc as u8;
+        blob[11] = signals.len() as u8;
         blob.extend_from_slice(&[0xAA; 8]);
+        for (kind, lo, hi) in signals {
+            blob.extend_from_slice(&[kind, 0, 0, 0]);
+            blob.extend_from_slice(&lo.to_le_bytes());
+            blob.extend_from_slice(&hi.to_le_bytes());
+            blob.extend_from_slice(&[0xBB; 4]);
+        }
+        blob.extend_from_slice(&[0xCC; 8]);
         for e in &wf.entries {
             blob.extend_from_slice(&[e.low, 99, e.mid, e.high]);
         }
+        assert_eq!(&blob[4..6], &[1, 0]);
         assert_eq!(Waveform::from_blob(&blob).unwrap(), wf);
     }
 
@@ -442,18 +567,26 @@ mod tests {
             Waveform::from_blob(&[]).unwrap_err(),
             DecodeError::NotAWaveform
         );
-        for cut in [5, 20, 40, blob.len() - 1] {
+        for cut in [5, 20, 40, 60, blob.len() - 1] {
             assert_eq!(
                 Waveform::from_blob(&blob[..cut]).unwrap_err(),
                 DecodeError::Truncated,
                 "{cut}"
             );
         }
+        // A breaking change bumps the version, and this reader refuses it.
         let mut v2 = blob.clone();
         v2[4] = 2;
         assert_eq!(
             Waveform::from_blob(&v2).unwrap_err(),
             DecodeError::UnsupportedVersion(2)
+        );
+        // A table offset inside the version-1 fields means fields are missing.
+        let mut short = blob.clone();
+        short[8..10].copy_from_slice(&40u16.to_le_bytes());
+        assert_eq!(
+            Waveform::from_blob(&short).unwrap_err(),
+            DecodeError::Truncated
         );
         let mut no_high = blob.clone();
         no_high[FIXED_HEADER + 2 * SIGNAL_DESC] = 99;
