@@ -7,7 +7,19 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["cli"]
+# `waveform-preview`: decode a file (or make a synthetic one), compute, run gridfit, write
+# PNG previews. The library itself has no dependencies.
+cli = ["dep:engine-analysis", "dep:png"]
+
 [dependencies]
+engine-analysis = { path = "../engine-analysis", default-features = false, optional = true }
+png = { workspace = true, optional = true }
+
+[[bin]]
+name = "waveform-preview"
+required-features = ["cli"]
 
 [lints]
 workspace = true

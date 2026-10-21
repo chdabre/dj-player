@@ -184,6 +184,7 @@ pub fn compute(stereo: &[f32], sample_rate: u32, params: &Params) -> Waveform {
             }
         }
         peaks.push(peak);
+        split.iter_mut().for_each(Splitter::flush);
     }
 
     let r = params.low_smoothing_entries();
@@ -236,6 +237,17 @@ impl Splitter {
         let high = run(&mut self.high, x);
         [low, mid, high]
     }
+
+    fn flush(&mut self) {
+        for b in [
+            &mut self.low,
+            &mut self.mid_hp,
+            &mut self.mid_lp,
+            &mut self.high,
+        ] {
+            b.iter_mut().for_each(Biquad::flush);
+        }
+    }
 }
 
 /// Second-order Butterworth section (RBJ cookbook, Q = 1/√2), transposed direct form II.
@@ -278,6 +290,17 @@ impl Biquad {
         self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
         self.z[1] = self.b[2] * x - self.a[1] * y;
         y
+    }
+
+    /// Zero a state that has decayed to nothing. A tail left to decay in silence turns
+    /// subnormal, which is many times slower on x86. Called once per entry; within one
+    /// entry (≤ 7 ms) a state at 1e-30 cannot reach the subnormal range.
+    fn flush(&mut self) {
+        for z in &mut self.z {
+            if z.abs() < 1e-30 {
+                *z = 0.0;
+            }
+        }
     }
 }
 
