@@ -46,6 +46,17 @@ These settle the open questions and extend the design; where this section and th
 - `DJPLAYER/` folder; CRC-32C-framed JSON-lines journals and snapshots; BLAKE3 blobs; HLC-stamped `set` / `add` / `rm` / `event` operations.
 - Tuning: flush within 2 s; segment per mount and every 64 KB; snapshot past about 50 segments or 5 MB; tombstones kept 90 days; cloud segments sealed 30 s after their last write.
 
+**After the first build (owner, 2026-10-21)**
+- **Alias merges:** the older track survives (as above): the one with the earliest HLC among its location element ids, the lower id on a tie.
+- **Cue point at load:** the first stored memory cue if there is one; else, with auto cue on, the first sound at or above the auto cue level; else no cue point and the playhead at 0. Auto cue is a player setting (on by default at −36 dB; `--auto-cue off|<dB>`).
+- **Hot cue bank B:** stored and merged now; the deck's bank switch comes later.
+- **Snapshot size:** no smaller encoding or compression in version 1.
+- **Author field and audio hash:** each operation carries its author as `dev`; the audio hash lives in the location identity and is updated by rm + add.
+- **Default library location:** automatic only on removable volumes (USB sticks, SD cards), never internal storage. The internal-storage mode will name its own library folder.
+- **Stored analysis:** once one analyzer reruns, every later one reruns too.
+- **Device id on dev machines:** `~/.config/djplayer/device-id`, overridden by `$DJPLAYER_CONFIG`.
+- **Clock:** HLCs after 2200-01-01 are dropped. A player with a trusted clock (NTP-synchronised, or a kept RTC) also doesn't follow stamps more than a day ahead of it; that affects only what its clock observes, never the merge.
+
 **First build (scope)**
 - The `library` crate on a folder store: the record format, HLC and merge, with property tests.
 - Identity: content hash, versioned audio hash, aliases.
@@ -173,7 +184,7 @@ Rekordbox's data is never copied in. It is read at mount and overlaid: for each 
 | Register | Highest HLC wins (last writer wins) |
 | Set | An element is present if its `add` has no `rm` with the same id (add-wins for a re-add, which gets a new id). Editing a cue is an `rm` + `add` |
 | Log | Union of events, ordered by HLC; duplicates (same HLC + device) dropped |
-| Track identity | Two track ids whose identities share a `file_hash` or `audio_hash` are merged: the lower id survives, the other gets an `alias`. Each field merges by its own rule |
+| Track identity | Two track ids whose identities share a `file_hash` or `audio_hash` are merged: the older one (seen first) survives, the lower id on a tie; the other gets an `alias`. Each field merges by its own rule |
 
 The rules are commutative and idempotent. Replaying segments in any order, or twice, gives the same state; a property test checks this on random histories.
 
@@ -281,11 +292,20 @@ All answered on 2026-10-21; see "Decisions" at the top.
 
 The snapshot is about 3× the 15 MB estimated above: every line carries the full author UUID, and element ids repeat it.
 
+**After the review and the owner's answers (2026-10-21)**
+
+- **Durability:** `FolderStore` syncs the folder after a rename and after making a file or folder. A writable mount removes files in `tmp/` older than an hour (left by interrupted writes; a live writer's are newer).
+- **Writer lock:** before its first segment, a library takes `journal/<device>/writer.lock` (an OS file lock, released if the program dies, so never stale). Another program journaling as the same device keeps its edits in RAM, reported unsaved; libraries in one process share the lock. A file system without locks journals anyway, each mount in its own segment.
+- **Unsaved status:** a RAM-only session reports `Unsaved`, and the UI's status band shows SAVED / SAVING / UNSAVED.
+- **Fields kept:** `AnalysisRef` and `WaveformRef` keep unknown fields. A hot cue moved on the deck keeps its colour, comment, unknown fields and loop end (dropped only if it would now come before the start).
+- **Auto cue:** the decode tap finds the first frame at or above the level; it is applied once the library has said there is no memory cue (or there is no library), filling only, so a cue point the DJ set stays.
+- **Clock:** `MountOptions::trusted_clock`; `engined` trusts the clock when `timedatectl` says it is NTP-synchronised, and on macOS.
+- **Rust 1.89** is the minimum (the writer lock uses `File::try_lock`).
+
 **Left**
 
 - Rekordbox import and overlay, playlists, tags, history and play counts, settings, "remove from library", compaction (deleting covered segments, dominated snapshots), tombstone expiry, blob GC, the link protocol (`apply_remote` exists; nothing calls it) and the cloud.
 - Hot cues 9–16 (bank B) are stored and merged but the deck has 8 pads and no bank switch yet. Memory cues are stored and restored as the load cue point, but there is no CALL / memory-delete on the deck yet.
 - A durability test with a store that truncates writes at random points; the scale numbers on the Mac and the Pi.
-- From the 2026-10-21 review, not fixed yet: a directory fsync after renames and new files, and sweeping `tmp/` on mount; `Auto` must not pick internal storage (a track on the Pi's boot disk) and the write probe belongs inside `DJPLAYER/`; the RAM-only library reports `Saved`, not `Unsaved`, and the UI shows no save status; `AnalysisRef` / `WaveformRef` and the hot-cue write-back drop unknown fields and a hot cue's end, colour and comment; two processes as one device on one stick still share a clock (each claims its own segment).
 - A smaller line encoding or zstd for snapshots, if the Pi's mount time asks for it.
 
