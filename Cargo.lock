@@ -1162,6 +1162,7 @@ dependencies = [
  "engine-core",
  "engine-io",
  "engine-media",
+ "waveform",
 ]
 
 [[package]]
@@ -4076,6 +4077,7 @@ dependencies = [
  "glyphon",
  "png",
  "pollster",
+ "waveform",
  "wgpu",
  "winit",
 ]

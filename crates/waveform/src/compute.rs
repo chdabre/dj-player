@@ -329,6 +329,12 @@ impl Builder {
         }
     }
 
+    /// The entries that are final so far, for a progressive display during decode. The
+    /// last few (the low-band smoothing radius) and a partly filled entry follow later.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     /// Finish the track: a partly filled last entry counts, and the held-back entries are
     /// encoded. A trailing half frame is dropped.
     pub fn finish(mut self) -> Waveform {

@@ -2,13 +2,14 @@
 //! shared by the `engined` terminal CLI and the UI spike.
 //!
 //! [`Player::open`] picks the device format, starts decoding the file at that rate, starts
-//! the stream and analyses the file on a background thread. The owner calls [`Player::poll`]
+//! the stream and analyses the file on a background thread. The waveform is computed during
+//! the decode, from exactly the frames the deck plays, and grows in [`Player::waveform`]. The owner calls [`Player::poll`]
 //! regularly: it hands the analysed grid to the deck, collects retired objects off the audio
 //! thread and reports loader and stream errors.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -16,6 +17,7 @@ use engine_core::{
     DeckCommand, DeckGrid, DeckState, Engine, EngineConfig, EngineHandle, LoadMeter, Source,
 };
 use engine_io::{AudioBackend, AudioStream, CpalBackend, CpalStream, StreamFormat, StreamRequest};
+use waveform::compute::{Builder, Entry, Origin, Params, Timeline, Waveform};
 
 /// The deck everything here drives.
 pub const DECK: usize = 0;
@@ -32,6 +34,7 @@ pub struct Player {
     analysis: Receiver<Result<Analysed, String>>,
     /// The analysis result, once it arrived.
     pub analysed: Option<Analysed>,
+    waveform: Arc<LiveWaveform>,
 }
 
 impl Player {
@@ -44,7 +47,15 @@ impl Player {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // The device decides the engine rate; tracks are resampled to it at load.
         let format = backend.format(request)?;
-        let loading = engine_media::load_file(file, format.sample_rate)?;
+        let waveform = Arc::new(LiveWaveform::default());
+        let tap = WaveTap::new(format.sample_rate, Arc::clone(&waveform));
+        let loading = engine_media::load_file_tapped(file, format.sample_rate, Some(tap.boxed()))?;
+        waveform.set_timeline(Timeline {
+            // Our decoder trims gapless padding: entry 0 is the deck's frame 0.
+            origin: Origin::Trimmed,
+            start_trim: loading.info.start_trim,
+            file_rate: loading.info.file_sample_rate,
+        });
         let source = Arc::clone(&loading.source);
         let (mut engine, mut handle) = Engine::new(EngineConfig {
             sample_rate: format.sample_rate,
@@ -72,6 +83,7 @@ impl Player {
             loader: Some(loading.thread),
             analysis,
             analysed: None,
+            waveform,
         })
     }
 
@@ -81,6 +93,11 @@ impl Player {
 
     pub fn buffer_frames(&self) -> Option<u32> {
         self.stream.as_ref().and_then(|s| s.buffer_frames())
+    }
+
+    /// The track's waveform, growing while the track decodes.
+    pub fn waveform(&self) -> &Arc<LiveWaveform> {
+        &self.waveform
     }
 
     pub fn state(&self) -> &Arc<DeckState> {
@@ -139,6 +156,101 @@ impl Drop for Player {
     fn drop(&mut self) {
         drop(self.stream.take());
         self.handle.collect_retired();
+    }
+}
+
+/// A waveform being computed on the loader thread and read by the UI.
+#[derive(Debug, Default)]
+pub struct LiveWaveform {
+    state: Mutex<LiveState>,
+}
+
+#[derive(Debug, Default)]
+struct LiveState {
+    entries: Vec<Entry>,
+    done: Option<Waveform>,
+    timeline: Timeline,
+}
+
+impl LiveWaveform {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LiveState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_timeline(&self, timeline: Timeline) {
+        self.lock().timeline = timeline;
+    }
+
+    /// Append the entries `have` does not have yet. Returns true once the waveform is
+    /// complete (and `have` holds all of it).
+    pub fn update(&self, have: &mut Vec<Entry>) -> bool {
+        let s = self.lock();
+        let entries = s.done.as_ref().map_or(&s.entries, |w| &w.entries);
+        if have.len() > entries.len() {
+            have.clear();
+        }
+        have.extend_from_slice(&entries[have.len()..]);
+        s.done.is_some()
+    }
+
+    /// The finished waveform, with its timeline, once the decode is done.
+    pub fn finished(&self) -> Option<Waveform> {
+        let s = self.lock();
+        s.done.clone().map(|mut w| {
+            w.timeline = s.timeline;
+            w
+        })
+    }
+}
+
+/// Feeds the decoded audio to a [`Builder`] on the loader thread and publishes the entries
+/// every so often. Dropping it (the loader is done) finishes the waveform.
+struct WaveTap {
+    builder: Option<Builder>,
+    live: Arc<LiveWaveform>,
+    /// Frames since the last publish.
+    pending: usize,
+    publish_every: usize,
+}
+
+impl WaveTap {
+    fn new(sample_rate: u32, live: Arc<LiveWaveform>) -> Self {
+        Self {
+            builder: Some(Builder::new(sample_rate, &Params::default())),
+            live,
+            pending: 0,
+            // A quarter second of audio: the display grows smoothly, the lock stays rare.
+            publish_every: sample_rate as usize / 4,
+        }
+    }
+
+    fn boxed(mut self) -> engine_media::Tap {
+        Box::new(move |stereo: &[f32]| self.push(stereo))
+    }
+
+    fn push(&mut self, stereo: &[f32]) {
+        let Some(b) = self.builder.as_mut() else {
+            return;
+        };
+        b.push(stereo);
+        self.pending += stereo.len() / 2;
+        if self.pending >= self.publish_every {
+            self.pending = 0;
+            let mut s = self.live.lock();
+            let have = s.entries.len();
+            s.entries.extend_from_slice(&b.entries()[have..]);
+        }
+    }
+}
+
+impl Drop for WaveTap {
+    fn drop(&mut self) {
+        if let Some(b) = self.builder.take() {
+            let wf = b.finish();
+            let mut s = self.live.lock();
+            s.entries.clear();
+            s.done = Some(wf);
+        }
     }
 }
 
@@ -236,4 +348,36 @@ fn analyze(
         key,
         summary,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_live_waveform_grows_during_decode_and_ends_as_computed() {
+        let sr = 48_000;
+        let audio: Vec<f32> = (0..sr * 3)
+            .flat_map(|i| {
+                let x = (std::f32::consts::TAU * 220.0 * i as f32 / sr as f32).sin() * 0.5;
+                [x, x]
+            })
+            .collect();
+        let live = Arc::new(LiveWaveform::default());
+        let mut tap = WaveTap::new(sr as u32, Arc::clone(&live)).boxed();
+        let mut seen = Vec::new();
+        let mut grew = 0;
+        for chunk in audio.chunks(4096) {
+            tap(chunk);
+            let before = seen.len();
+            assert!(!live.update(&mut seen), "not complete while decoding");
+            grew += usize::from(seen.len() > before);
+        }
+        assert!(grew >= 8, "published {grew} times");
+        drop(tap); // the loader is done
+        assert!(live.update(&mut seen));
+        let batch = waveform::compute::compute(&audio, sr as u32, &Params::default());
+        assert_eq!(seen, batch.entries);
+        assert_eq!(live.finished().unwrap().entries, batch.entries);
+    }
 }

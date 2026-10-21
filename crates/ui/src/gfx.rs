@@ -81,6 +81,104 @@ fn fs(o: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Waveform columns, drawn from per-column segment data (`waves.rs`). Each instance is one
+/// waveform area; its columns are rows `row..row + 6` of the column texture: three rows of
+/// (from, to, alpha) and three of the segment colours (sRGB). A fragment box-filters the
+/// columns under its pixel, so fractional column positions scroll smoothly, and blends a
+/// column's segments in sRGB values, as the CPU reference does.
+const WAVE_SHADER: &str = r#"
+struct View { xform: vec4<f32>, size: vec4<f32> };  // size.z: 1 = sRGB surface
+@group(0) @binding(0) var<uniform> view: View;
+@group(1) @binding(0) var cols: texture_2d<f32>;
+
+struct Inst {
+    @location(0) rect: vec4<f32>,
+    @location(1) params: vec4<f32>,  // first x, column width, column count, first row
+    @location(2) extra: vec4<f32>,   // align: 0 mirrored, 1 bottom
+};
+struct Out {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) design: vec2<f32>,
+    @location(1) rect: vec4<f32>,
+    @location(2) params: vec4<f32>,
+    @location(3) extra: vec4<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> Out {
+    let corner = vec2<f32>(f32(vi & 1u), f32(vi >> 1u));
+    let d = i.rect.xy + corner * i.rect.zw;
+    let p = d * view.xform.x + view.xform.yz;
+    var o: Out;
+    o.pos = vec4(p.x / view.size.x * 2.0 - 1.0, 1.0 - p.y / view.size.y * 2.0, 0.0, 1.0);
+    o.design = d;
+    o.rect = i.rect;
+    o.params = i.params;
+    o.extra = i.extra;
+    return o;
+}
+
+// Premultiplied sRGB colour of column `j` at height `d` (0 = baseline, 1 = edge).
+fn column_color(j: i32, d: f32, count: i32, row: i32) -> vec4<f32> {
+    if (j < 0 || j >= count) {
+        return vec4(0.0);
+    }
+    var acc = vec4(0.0);
+    for (var s = 0; s < 3; s = s + 1) {
+        let seg = textureLoad(cols, vec2<i32>(j, row + s), 0);
+        if (seg.y > seg.x && d >= seg.x && d < seg.y) {
+            let c = textureLoad(cols, vec2<i32>(j, row + 3 + s), 0).rgb;
+            let a = seg.z;
+            acc = vec4(c * a, a) + acc * (1.0 - a);
+        }
+    }
+    return acc;
+}
+
+fn to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return select(hi, lo, c <= vec3(0.04045));
+}
+
+@fragment
+fn fs(o: Out) -> @location(0) vec4<f32> {
+    let count = i32(o.params.z);
+    let row = i32(o.params.w);
+    var d: f32;
+    if (o.extra.x < 0.5) {
+        let half = o.rect.w * 0.5;
+        d = abs(o.design.y - (o.rect.y + half)) / half;
+    } else {
+        d = (o.rect.y + o.rect.w - o.design.y) / o.rect.w;
+    }
+    // This pixel's footprint in columns, and the two columns it can straddle.
+    let fw = 1.0 / (view.xform.x * o.params.y);
+    let u = (o.design.x - o.params.x) / o.params.y;
+    let a = u - fw * 0.5;
+    let j0 = floor(a);
+    let w1 = clamp((a + fw - (j0 + 1.0)) / fw, 0.0, 1.0);
+    let c = mix(
+        column_color(i32(j0), d, count, row),
+        column_color(i32(j0) + 1, d, count, row),
+        w1,
+    );
+    if (view.size.z < 0.5 || c.a <= 0.0) {
+        return c;
+    }
+    return vec4(to_linear(c.rgb / c.a) * c.a, c.a);
+}
+"#;
+
+/// Waveform areas per frame (zoom and overview, with room for two decks).
+const MAX_WAVES: usize = 4;
+/// Columns per waveform area: the panel is 1024 design pixels wide.
+const WAVE_COLUMNS: u32 = 1088;
+const WAVE_ROWS: u32 = 6;
+const WAVE_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
+const WAVE_INSTANCE_BYTES: u64 = 12 * 4;
+
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
 const INSTANCE_BYTES: u64 = 16 * 4;
@@ -121,6 +219,11 @@ pub struct Gfx {
     instances: wgpu::Buffer,
     instance_capacity: u64,
     instance_bytes: Vec<u8>,
+    wave_pipeline: wgpu::RenderPipeline,
+    wave_texture: wgpu::Texture,
+    wave_bind: wgpu::BindGroup,
+    wave_instances: wgpu::Buffer,
+    wave_bytes: Vec<u8>,
 
     fonts: FontSystem,
     swash: SwashCache,
@@ -185,7 +288,8 @@ impl Gfx {
             label: Some("view"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // The waveform fragment shader reads the scale and the sRGB flag.
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -244,6 +348,90 @@ impl Gfx {
             cache: None,
             multiview_mask: None,
         });
+        let wave_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("waveform columns"),
+            size: wgpu::Extent3d {
+                width: WAVE_COLUMNS,
+                height: WAVE_ROWS * MAX_WAVES as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let wave_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("waveform columns"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let wave_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("waveform columns"),
+            layout: &wave_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &wave_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                ),
+            }],
+        });
+        let wave_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("waveform"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(WAVE_SHADER)),
+        });
+        let wave_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            bind_group_layouts: &[Some(&view_layout), Some(&wave_layout)],
+            ..Default::default()
+        });
+        let wave_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("waveform"),
+            layout: Some(&wave_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &wave_shader,
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: WAVE_INSTANCE_BYTES,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &WAVE_ATTRS,
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &wave_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+        let wave_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("waveform instances"),
+            size: MAX_WAVES as u64 * WAVE_INSTANCE_BYTES,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let instance_capacity = 1024;
         let instances = Self::instance_buffer(&device, instance_capacity);
 
@@ -267,6 +455,11 @@ impl Gfx {
             instances,
             instance_capacity,
             instance_bytes: Vec::new(),
+            wave_pipeline,
+            wave_texture,
+            wave_bind,
+            wave_instances,
+            wave_bytes: Vec::new(),
             fonts,
             swash: SwashCache::new(),
             viewport,
@@ -437,7 +630,8 @@ impl Gfx {
     ) -> wgpu::CommandBuffer {
         let (s, ox, oy) = transform(w, h);
         let mut view = Vec::with_capacity(32);
-        for v in [s, ox, oy, 0.0, w as f32, h as f32, 0.0, 0.0] {
+        let srgb = if self.srgb { 1.0 } else { 0.0 };
+        for v in [s, ox, oy, 0.0, w as f32, h as f32, srgb, 0.0] {
             view.extend_from_slice(&v.to_ne_bytes());
         }
         self.queue.write_buffer(&self.view_buffer, 0, &view);
@@ -463,6 +657,7 @@ impl Gfx {
             self.queue
                 .write_buffer(&self.instances, 0, &self.instance_bytes);
         }
+        let waves = self.upload_waves(scene);
         self.prepare_text(scene, w, h);
         let [r, g, b, a] = self.color(scene.background).map(f64::from);
         let clear = wgpu::Color { r, g, b, a };
@@ -487,17 +682,115 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if count > 0 {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.view_bind, &[]);
-                pass.set_vertex_buffer(0, self.instances.slice(..count * INSTANCE_BYTES));
-                pass.draw(0..4, 0..count as u32);
+            // Rectangles in batches, with each waveform after the rectangles below it.
+            let mut drawn = 0u32;
+            for k in 0..=waves {
+                let until = scene
+                    .waves
+                    .get(k)
+                    .filter(|_| k < waves)
+                    .map_or(count as u32, |(at, _)| *at as u32);
+                if until > drawn {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.view_bind, &[]);
+                    pass.set_vertex_buffer(0, self.instances.slice(..count * INSTANCE_BYTES));
+                    pass.draw(0..4, drawn..until);
+                    drawn = until;
+                }
+                if k < waves {
+                    pass.set_pipeline(&self.wave_pipeline);
+                    pass.set_bind_group(0, &self.view_bind, &[]);
+                    pass.set_bind_group(1, &self.wave_bind, &[]);
+                    pass.set_vertex_buffer(0, self.wave_instances.slice(..));
+                    pass.draw(0..4, k as u32..k as u32 + 1);
+                }
             }
             if let Err(e) = self.text.render(&self.atlas, &self.viewport, &mut pass) {
                 eprintln!("text render: {e}");
             }
         }
         encoder.finish()
+    }
+
+    /// Write the scene's waveform columns into the column texture and their instances;
+    /// returns how many waveforms to draw.
+    fn upload_waves(&mut self, scene: &Scene) -> usize {
+        if scene.waves.len() > MAX_WAVES {
+            eprintln!("only {MAX_WAVES} waveforms per frame; dropping the rest");
+        }
+        let waves = scene.waves.len().min(MAX_WAVES);
+        self.wave_bytes.clear();
+        let mut texels: Vec<u8> = Vec::new();
+        for (k, (_, wave)) in scene.waves.iter().take(waves).enumerate() {
+            let n = wave.columns.len().min(WAVE_COLUMNS as usize);
+            let row = k as u32 * WAVE_ROWS;
+            let align = match wave.align {
+                crate::waves::Align::Mirrored => 0.0,
+                crate::waves::Align::Bottom => 1.0,
+            };
+            for v in [
+                wave.x,
+                wave.y,
+                wave.w,
+                wave.h,
+                wave.first_x,
+                wave.column_width,
+                n as f32,
+                row as f32,
+                align,
+                0.0,
+                0.0,
+                0.0,
+            ] {
+                self.wave_bytes.extend_from_slice(&v.to_ne_bytes());
+            }
+            if n == 0 {
+                continue;
+            }
+            // Six rows: (from, to, alpha, 0) for each segment, then each segment's colour.
+            texels.clear();
+            for r in 0..WAVE_ROWS as usize {
+                for col in &wave.columns[..n] {
+                    let segs = col.segments();
+                    let v = match segs.get(r % 3) {
+                        None => [0.0; 4],
+                        Some(seg) if r < 3 => [seg.from, seg.to, seg.alpha, 0.0],
+                        Some(seg) => {
+                            let c = seg.color;
+                            let f = |x: u8| f32::from(x) / 255.0;
+                            [f(c.0), f(c.1), f(c.2), 1.0]
+                        }
+                    };
+                    for x in v {
+                        texels.extend_from_slice(&x.to_ne_bytes());
+                    }
+                }
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.wave_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: row, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &texels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(n as u32 * 16),
+                    rows_per_image: Some(WAVE_ROWS),
+                },
+                wgpu::Extent3d {
+                    width: n as u32,
+                    height: WAVE_ROWS,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        if waves > 0 {
+            self.queue
+                .write_buffer(&self.wave_instances, 0, &self.wave_bytes);
+        }
+        waves
     }
 
     fn prepare_text(&mut self, scene: &Scene, w: u32, h: u32) {

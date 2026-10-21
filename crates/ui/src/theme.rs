@@ -6,9 +6,10 @@
 //! tokens (`docs/research/findings.md`, "Reference UI wireframes — design tokens", and the
 //! 1024×600 canvas).
 //!
-//! The waveform colours here cover the stand-in drawing (grid, cue, loop, playhead). When the
-//! waveform renderer lands, its theme (band palettes, RGB weights) joins [`WaveformTokens`],
-//! so one theme drives both the screen and the waveform shader.
+//! The waveform itself is drawn with the waveform crate's [`waveform::display::Style`] (band
+//! palettes, RGB weights, per-band gains, played-part dimming), held in [`WaveformTokens`]
+//! next to the colours of what the UI draws around it (grid, cue, loop, playhead), so one
+//! theme drives the screen and the waveform shader.
 
 use crate::scene::Rgba;
 
@@ -117,9 +118,12 @@ pub struct Shape {
     pub border_active: f32,
 }
 
-/// Colours of the waveform areas (stand-in drawing for now).
+/// The waveform areas: the waveform's own style, and what the UI draws around it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaveformTokens {
+    /// Palettes, gains and dimming of the waveform (the waveform crate's theme). The track
+    /// gain inside it is set per track at run time.
+    pub style: waveform::display::Style,
     pub background: Rgba,
     pub center_line: Rgba,
     pub beat_line: Rgba,
@@ -209,6 +213,7 @@ impl Theme {
                 border_active: 2.0,
             },
             waveform: WaveformTokens {
+                style: waveform::display::Style::default(),
                 background: Rgba::hex(0x07080a),
                 center_line: Rgba::hex(0x15171b),
                 beat_line: Rgba::hex(0x262a30),
@@ -226,6 +231,13 @@ impl Theme {
                 slip_shadow: accent.alpha(0.8),
             },
         }
+    }
+
+    /// The same theme with the waveform drawn in the waveform crate's theme `name` (its
+    /// presets: default, findings, spectrum, blended).
+    pub fn with_waveform_theme(mut self, name: &str) -> Option<Self> {
+        self.waveform.style.theme = waveform::display::Theme::by_name(name)?;
+        Some(self)
     }
 
     /// Every theme this build knows, by name.

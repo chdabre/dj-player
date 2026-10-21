@@ -101,12 +101,26 @@ pub struct Loading {
     pub thread: JoinHandle<Result<(), LoadError>>,
 }
 
+/// Sees every chunk of interleaved stereo the loader writes into the source, at the engine
+/// rate and in order, on the loader thread: what the deck will play, frame for frame. Used to
+/// compute the waveform during decode.
+pub type Tap = Box<dyn FnMut(&[f32]) + Send>;
+
 /// Probe `path` and start decoding it into a new [`Source`] at `sample_rate` on a loader
 /// thread.
 ///
 /// If the container does not state the track length, the whole file is decoded on the calling
 /// thread first (the source is then complete when this returns).
 pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, LoadError> {
+    load_file_tapped(path, sample_rate, None)
+}
+
+/// [`load_file`], with `tap` seeing the audio as it is written into the source.
+pub fn load_file_tapped(
+    path: impl AsRef<Path>,
+    sample_rate: u32,
+    mut tap: Option<Tap>,
+) -> Result<Loading, LoadError> {
     let path = path.as_ref().to_path_buf();
     let mut decoding = Decoding::open(&path)?;
     let info = TrackInfo {
@@ -126,7 +140,7 @@ pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, Lo
             let thread = std::thread::Builder::new()
                 .name("loader".into())
                 .spawn(move || {
-                    let mut sink = Sink::new(writer, decoding.sample_rate, sample_rate)?;
+                    let mut sink = Sink::new(writer, tap, decoding.sample_rate, sample_rate)?;
                     let result = decoding.run(&mut sink);
                     sink.finish()?;
                     result
@@ -145,6 +159,9 @@ pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, Lo
             } else {
                 resample_all(&collected, decoding.sample_rate, sample_rate)?
             };
+            if let Some(tap) = tap.as_mut() {
+                tap(&resampled);
+            }
             let source = Source::from_interleaved(sample_rate, &resampled);
             let thread = std::thread::Builder::new()
                 .name("loader".into())
@@ -417,19 +434,34 @@ fn to_stereo(interleaved: &[f32], channels: usize, out: &mut Vec<f32>) {
 
 /// Streams decoded stereo into a [`SourceWriter`], resampling on the way if needed.
 struct Sink {
-    writer: Option<SourceWriter>,
+    writer: Option<Tapped>,
     resampler: Option<StreamResampler>,
 }
 
+/// The source being loaded, plus whoever watches what goes into it.
+struct Tapped {
+    writer: SourceWriter,
+    tap: Option<Tap>,
+}
+
+impl FrameOut for Tapped {
+    fn put(&mut self, stereo: &[f32]) {
+        self.writer.push(stereo);
+        if let Some(tap) = self.tap.as_mut() {
+            tap(stereo);
+        }
+    }
+}
+
 impl Sink {
-    fn new(writer: SourceWriter, from: u32, to: u32) -> Result<Self, LoadError> {
+    fn new(writer: SourceWriter, tap: Option<Tap>, from: u32, to: u32) -> Result<Self, LoadError> {
         let resampler = if from == to {
             None
         } else {
             Some(StreamResampler::new(from, to)?)
         };
         Ok(Self {
-            writer: Some(writer),
+            writer: Some(Tapped { writer, tap }),
             resampler,
         })
     }
@@ -442,7 +474,7 @@ impl Sink {
             Some(r) => r.flush(&mut writer),
             None => Ok(()),
         };
-        writer.finish();
+        writer.writer.finish();
         result
     }
 }
@@ -455,7 +487,7 @@ impl StereoSink for &mut Sink {
         match self.resampler.as_mut() {
             Some(r) => r.push(stereo, writer),
             None => {
-                writer.push(stereo);
+                writer.put(stereo);
                 Ok(())
             }
         }
@@ -467,7 +499,7 @@ impl Drop for Sink {
         // Mark the source complete even if decoding failed half-way, so the callback plays
         // what exists instead of reporting it as still loading.
         if let Some(w) = self.writer.take() {
-            w.finish();
+            w.writer.finish();
         }
     }
 }
@@ -630,6 +662,33 @@ mod tests {
         use engine_core::FrameSource;
         for i in [0usize, 1, 999, 50_000, frames - 1] {
             assert_eq!(src.frame(i as i64), [samples[2 * i], samples[2 * i + 1]]);
+        }
+    }
+
+    #[test]
+    fn the_tap_sees_exactly_what_the_source_gets() {
+        use engine_core::FrameSource;
+        use std::sync::{Arc, Mutex};
+        let path = tmp("tap44.wav");
+        let frames = 44_100 * 3 / 2;
+        let samples: Vec<f32> = sine(44_100, 440.0, frames)
+            .into_iter()
+            .flat_map(|x| [x, -x])
+            .collect();
+        write_wav(&path, 44_100, 2, &samples);
+        for rate in [44_100, 48_000] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let tap: Tap = Box::new(move |s: &[f32]| sink.lock().unwrap().extend_from_slice(s));
+            let loading = load_file_tapped(&path, rate, Some(tap)).unwrap();
+            loading.thread.join().unwrap().unwrap();
+            let src = loading.source;
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2 * src.len_frames(), "{rate}");
+            for i in [0, 1, 12_345, src.len_frames() - 1] {
+                let f = src.frame(i as i64);
+                assert_eq!([seen[2 * i], seen[2 * i + 1]], f, "{rate} frame {i}");
+            }
         }
     }
 

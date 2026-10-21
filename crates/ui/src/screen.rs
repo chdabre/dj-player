@@ -2,14 +2,16 @@
 //! canvas version 28). Pure function of a [`View`]: it fills a [`Scene`] and returns the touch
 //! targets, so the layout can be tested and screenshotted without a device.
 //!
-//! The waveforms are stand-ins until the waveform work lands: the zoom view draws the beat
-//! grid, loop, cue and playhead; the overview draws the played part, loop, cue, loading
-//! progress and 16-bar ticks.
+//! The waveforms come from the deck's computed waveform (`waves.rs`), drawn between their
+//! panel and grid and the overlays (loop, cue, slip shadow, playhead), as the waveform crate's
+//! reference renderer orders them. Until the first entries exist, the views show the grid and
+//! markers alone.
 
 use engine_core::DeckGrid;
 
 use crate::scene::{Align, Rgba, Scene, Text, Weight};
 use crate::theme::Theme;
+use crate::waves::{OverviewCache, WaveSettings};
 
 /// Things on screen that can be touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,18 @@ pub struct View<'a> {
     pub pressed: Option<Target>,
     /// Frame timing line, if the overlay is on.
     pub debug: Option<&'a str>,
+    /// The track's waveform so far, if any.
+    pub wave: Option<Wave<'a>>,
+}
+
+/// A deck's waveform as the screen draws it.
+#[derive(Clone, Copy)]
+pub struct Wave<'a> {
+    pub entries: &'a [waveform::compute::Entry],
+    pub entries_per_second: f64,
+    pub settings: WaveSettings,
+    /// The theme's waveform style with this track's gain set.
+    pub style: waveform::display::Style,
 }
 
 struct Ui<'s> {
@@ -268,7 +282,12 @@ impl Ui<'_> {
 }
 
 /// Lay out the screen into `scene`; returns the touch targets.
-pub fn build(view: &View, theme: &Theme, scene: &mut Scene) -> Vec<HitBox> {
+pub fn build(
+    view: &View,
+    theme: &Theme,
+    overview: &mut OverviewCache,
+    scene: &mut Scene,
+) -> Vec<HitBox> {
     scene.clear();
     scene.background = theme.color.background;
     let mut ui = Ui {
@@ -295,7 +314,7 @@ pub fn build(view: &View, theme: &Theme, scene: &mut Scene) -> Vec<HitBox> {
     tabs(&mut ui);
     info(&mut ui, view);
     status(&mut ui, view);
-    bottom(&mut ui, view);
+    bottom(&mut ui, view, overview);
 
     if let Some(line) = view.debug.filter(|l| !l.is_empty()) {
         ui.scene.rounded(
@@ -679,6 +698,32 @@ fn zoom(ui: &mut Ui, v: &View) {
     let to_x = |pos: f64| x0 + ((pos - left) / fpp) as f32;
     let visible = |x: f32| x >= x0 && x <= x0 + w;
 
+    if let Some(g) = v.grid {
+        let first = g.beat_at(left).ceil() as i64;
+        let last = g.beat_at(left + span).floor() as i64;
+        for b in first..=last.min(first + 256) {
+            let pos = g.position_of(b as f64);
+            let x = to_x(pos);
+            if g.bar_position(pos + 0.5) == 1 {
+                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.bar_line);
+            } else {
+                ui.scene
+                    .fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, wf.beat_line);
+            }
+        }
+    }
+    if let Some(wave) = &v.wave {
+        let draw = crate::waves::zoom(
+            wave.entries,
+            wave.entries_per_second,
+            v.position / v.sample_rate,
+            fpp / v.sample_rate,
+            ZOOM,
+            &wave.settings,
+            &wave.style,
+        );
+        ui.scene.waveform(draw);
+    }
     if v.looping || v.loop_end > v.loop_start {
         let (a, b) = (to_x(v.loop_start).max(x0), to_x(v.loop_end).min(x0 + w));
         if b > a {
@@ -695,20 +740,6 @@ fn zoom(ui: &mut Ui, v: &View) {
                 if visible(e) {
                     ui.scene.fill(e - 1.0, y0, 2.0, h, edge);
                 }
-            }
-        }
-    }
-    if let Some(g) = v.grid {
-        let first = g.beat_at(left).ceil() as i64;
-        let last = g.beat_at(left + span).floor() as i64;
-        for b in first..=last.min(first + 256) {
-            let pos = g.position_of(b as f64);
-            let x = to_x(pos);
-            if g.bar_position(pos + 0.5) == 1 {
-                ui.scene.fill(x - 0.75, y0, 1.5, h, wf.bar_line);
-            } else {
-                ui.scene
-                    .fill(x - 0.5, y0 + 18.0, 1.0, h - 36.0, wf.beat_line);
             }
         }
     }
@@ -733,7 +764,7 @@ fn zoom(ui: &mut Ui, v: &View) {
         }
     }
     let label = match (v.grid, v.analysing) {
-        (Some(_), _) => "BEAT GRID · WAVEFORM PENDING",
+        (Some(_), _) => "",
         (None, true) => "ANALYSING…",
         (None, false) => "NO GRID",
     };
@@ -888,7 +919,7 @@ fn status(ui: &mut Ui, v: &View) {
     );
 }
 
-fn bottom(ui: &mut Ui, v: &View) {
+fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let t = ui.t;
     let wf = &t.waveform;
     let (x0, y0, w, h) = OVERVIEW;
@@ -904,6 +935,18 @@ fn bottom(ui: &mut Ui, v: &View) {
     );
     if v.length > 0.0 {
         let to_x = |pos: f64| x0 + (pos / v.length).clamp(0.0, 1.0) as f32 * w;
+        if let Some(wave) = &v.wave {
+            let draw = overview.draw(
+                wave.entries,
+                wave.entries_per_second,
+                v.length / v.sample_rate,
+                v.position / v.sample_rate,
+                OVERVIEW,
+                &wave.settings,
+                &wave.style,
+            );
+            ui.scene.waveform(draw);
+        }
         if v.loaded_fraction < 1.0 {
             let lx = to_x(v.loaded_fraction * v.length);
             ui.scene
@@ -921,7 +964,10 @@ fn bottom(ui: &mut Ui, v: &View) {
             }
         }
         let px = to_x(v.position);
-        ui.scene.fill(x0, y0 + 8.0, px - x0, h - 16.0, wf.played);
+        if v.wave.is_none() {
+            // Without a waveform the played part is shaded; with one it is dimmed.
+            ui.scene.fill(x0, y0 + 8.0, px - x0, h - 16.0, wf.played);
+        }
         if v.loop_end > v.loop_start {
             let (a, b) = (to_x(v.loop_start), to_x(v.loop_end));
             ui.scene.fill(
@@ -941,7 +987,11 @@ fn bottom(ui: &mut Ui, v: &View) {
         ui.scene.fill(px - 1.0, y0, 2.0, h, wf.playhead);
     }
     ui.text(
-        "OVERVIEW STAND-IN · TOUCH TO SEEK",
+        if v.wave.is_some() {
+            ""
+        } else {
+            "TOUCH TO SEEK"
+        },
         x0 + 8.0,
         y0 + 4.0,
         t.font.small,
@@ -1039,6 +1089,7 @@ mod tests {
             zoom_beats: 16.0,
             pressed: None,
             debug: None,
+            wave: None,
         }
     }
 
@@ -1046,7 +1097,12 @@ mod tests {
     fn everything_stays_on_the_panel_and_targets_do_not_overlap() {
         let grid = DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap();
         let mut scene = Scene::default();
-        let hits = build(&view(Some(&grid)), &Theme::default(), &mut scene);
+        let hits = build(
+            &view(Some(&grid)),
+            &Theme::default(),
+            &mut OverviewCache::default(),
+            &mut scene,
+        );
         for r in &scene.rects {
             assert!(
                 r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
@@ -1075,7 +1131,12 @@ mod tests {
     #[test]
     fn builds_without_a_grid() {
         let mut scene = Scene::default();
-        build(&view(None), &Theme::default(), &mut scene);
+        build(
+            &view(None),
+            &Theme::default(),
+            &mut OverviewCache::default(),
+            &mut scene,
+        );
         assert!(scene.texts.iter().any(|t| t.text == "--.-"));
     }
 }

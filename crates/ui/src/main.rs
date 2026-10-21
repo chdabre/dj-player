@@ -5,7 +5,8 @@
 //! overview to seek. Keys as in `engined`, plus a real CUE hold (the window sees key
 //! releases): space play/pause, c cue, 1–8 hot cues (shift: delete), i/o/l loop,
 //! b 4-beat loop, [ ] loop ½X / 2X, , . beat jump, ←/→ seek ±5 s, +/- rate, 0 reset,
-//! k keylock, r reverse, s slip, z quantize, d timing overlay, f fullscreen, q quit.
+//! k keylock, r reverse, s slip, z quantize, w waveform mode (3-band / RGB / single colour),
+//! d timing overlay, f fullscreen, q quit.
 //!
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
 
@@ -15,6 +16,7 @@ mod scene;
 mod screen;
 mod stats;
 mod theme;
+mod waves;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,13 +40,16 @@ use crate::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
+use crate::waves::{OverviewCache, WaveSettings};
+use waveform::compute::Entry;
+use waveform::display::{Mode, TrackGain};
 
 #[cfg(debug_assertions)]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [--fullscreen] \
-                     [--theme <name>] [--at <seconds>] [--play] [--run-for <seconds>] \
+                     [--theme <name>] [--wave-theme <name>] [--wave-mode 3band|rgb|single] [--at <seconds>] [--play] [--run-for <seconds>] \
                      [--screenshot <out.png>]";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
@@ -59,6 +64,7 @@ struct Args {
     play: bool,
     run_for: Option<f64>,
     theme: Theme,
+    wave_mode: Mode,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,6 +73,8 @@ fn parse_args() -> Result<Args, String> {
     let (mut fullscreen, mut screenshot, mut at) = (false, None, None);
     let (mut play, mut run_for) = (false, None);
     let mut theme = Theme::default();
+    let mut wave_theme: Option<String> = None;
+    let mut wave_mode = Mode::ThreeBand;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -86,6 +94,21 @@ fn parse_args() -> Result<Args, String> {
                 let s = args.next().ok_or("--at needs seconds")?;
                 at = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
             }
+            "--wave-theme" => {
+                let name = args.next().ok_or("--wave-theme needs a name")?;
+                wave_theme = Some(name);
+            }
+            "--wave-mode" => {
+                let name = args
+                    .next()
+                    .ok_or("--wave-mode needs 3band, rgb or single")?;
+                wave_mode = Mode::ALL
+                    .into_iter()
+                    .find(|m| m.name() == name)
+                    .ok_or(format!(
+                        "unknown waveform mode {name:?} (3band, rgb, single)"
+                    ))?;
+            }
             "--play" => play = true,
             "--theme" => {
                 let name = args.next().ok_or("--theme needs a name")?;
@@ -103,6 +126,18 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err("only one file, please".into()),
         }
     }
+    if let Some(name) = wave_theme {
+        let names: Vec<_> = waveform::display::Theme::ALL
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        theme = theme.with_waveform_theme(&name).ok_or_else(|| {
+            format!(
+                "unknown waveform theme {name:?} (themes: {})",
+                names.join(", ")
+            )
+        })?;
+    }
     Ok(Args {
         file: file.ok_or("no file given")?,
         request,
@@ -112,6 +147,7 @@ fn parse_args() -> Result<Args, String> {
         play,
         run_for,
         theme,
+        wave_mode,
     })
 }
 
@@ -173,6 +209,14 @@ fn main() -> ExitCode {
         gfx: None,
         theme: args.theme,
         scene: Scene::default(),
+        wave: Vec::new(),
+        wave_complete: false,
+        wave_settings: WaveSettings {
+            mode: args.wave_mode,
+            ..WaveSettings::default()
+        },
+        track_gain: (1.0, 0),
+        overview: OverviewCache::default(),
         hits: Vec::new(),
         pressed: None,
         cursor: (0.0, 0.0),
@@ -208,6 +252,12 @@ struct App {
     gfx: Option<Gfx>,
     theme: Theme,
     scene: Scene,
+    wave: Vec<Entry>,
+    wave_complete: bool,
+    wave_settings: WaveSettings,
+    /// The track gain, and the entry count it was computed from.
+    track_gain: (f32, usize),
+    overview: OverviewCache,
     hits: Vec<HitBox>,
     /// Touched target, held until release; the overview tracks the drag.
     pressed: Option<Target>,
@@ -299,6 +349,14 @@ impl App {
                         self.debug = !self.debug;
                         return;
                     }
+                    "w" => {
+                        self.wave_settings.mode = match self.wave_settings.mode {
+                            Mode::ThreeBand => Mode::Rgb,
+                            Mode::Rgb => Mode::Single,
+                            Mode::Single => Mode::ThreeBand,
+                        };
+                        return;
+                    }
                     "f" => {
                         if let Some(g) = &self.gfx {
                             let w = g.window();
@@ -370,6 +428,16 @@ impl App {
                 .record_playhead((position - p - expected) / sr * 1e3);
         }
         self.last_shown = Some((now, position));
+        if !self.wave_complete {
+            self.wave_complete = self.player.waveform().update(&mut self.wave);
+        }
+        // Auto gain over what has decoded so far; it settles as the track fills in.
+        let n = self.wave.len();
+        if n != self.track_gain.1 && (self.wave_complete || n >= self.track_gain.1 + 1500) {
+            self.track_gain = (TrackGain::Auto.resolve(&self.wave), n);
+        }
+        let mut wave_style = self.theme.waveform.style;
+        wave_style.track_gain = self.track_gain.0;
         let analysed = self.player.analysed.as_ref();
         let source = &self.player.source;
         let view = View {
@@ -395,16 +463,24 @@ impl App {
             zoom_beats: ZOOM_STEPS[self.zoom],
             pressed: self.pressed,
             debug: self.debug.then_some(self.overlay.as_str()),
+            wave: (!self.wave.is_empty()).then_some(screen::Wave {
+                entries: &self.wave,
+                entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),
+                settings: self.wave_settings,
+                style: wave_style,
+            }),
         };
         let build_start = Instant::now();
-        self.hits = screen::build(&view, &self.theme, &mut self.scene);
+        self.hits = screen::build(&view, &self.theme, &mut self.overview, &mut self.scene);
         let build = build_start.elapsed();
 
         let Some(gfx) = &mut self.gfx else {
             return false;
         };
         if let Some(path) = &self.screenshot {
-            let ready = self.player.analysed.is_some() && self.player.source.is_complete();
+            let ready = self.player.analysed.is_some()
+                && self.player.source.is_complete()
+                && self.wave_complete;
             if ready || self.started.elapsed() > Duration::from_secs(30) {
                 let pixels = gfx.screenshot(&self.scene);
                 match write_png(path, &pixels) {

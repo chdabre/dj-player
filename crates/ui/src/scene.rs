@@ -1,5 +1,7 @@
-//! What one frame draws, in layout pixels (the 1024×600 design canvas): rounded rectangles,
-//! then text on top. Colours are sRGB, as in the design tokens.
+//! What one frame draws, in layout pixels (the 1024×600 design canvas): rounded rectangles
+//! and waveforms in paint order, then text on top. Colours are sRGB, as in the design tokens.
+
+use crate::waves::WaveDraw;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rgba(pub [f32; 4]);
@@ -69,12 +71,16 @@ pub struct Scene {
     /// What the frame is cleared to before drawing.
     pub background: Rgba,
     pub rects: Vec<Rect>,
+    /// Waveforms, each drawn after the first `.0` rectangles and before the rest, so a
+    /// waveform sits on its panel and grid and under its overlays.
+    pub waves: Vec<(usize, WaveDraw)>,
     pub texts: Vec<Text>,
 }
 
 impl Scene {
     pub fn clear(&mut self) {
         self.rects.clear();
+        self.waves.clear();
         self.texts.clear();
     }
 
@@ -113,6 +119,11 @@ impl Scene {
             fill,
             stroke,
         });
+    }
+
+    /// Draw `wave` on top of everything so far.
+    pub fn waveform(&mut self, wave: WaveDraw) {
+        self.waves.push((self.rects.len(), wave));
     }
 
     pub fn text(&mut self, t: Text) {

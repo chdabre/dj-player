@@ -24,7 +24,7 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
 - **Input:**
   - mouse and touch (winit `Touch`) on SLIP, CALL ◀ ▶ (beat jump ∓4, or loop ½X / 2X in a loop), ZOOM, and the overview for needle search, with drag;
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
-- **Waveforms are stand-ins.** The zoom view draws the analysed beat grid (bar lines brighter), the loop, the cue, the slip shadow and a centred playhead. The overview draws the played part, loop, cue, loading progress and 16-bar ticks. The real waveform data and shader come from the waveform work.
+- **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view draws them on the analysed beat grid (bar lines brighter), under the loop, cue, slip shadow and centred playhead. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
 
 ## Design tokens
 
@@ -34,6 +34,16 @@ Every colour, font size, corner radius and line width the screen uses lives in o
 - **Switching:** `--theme <name>` picks a theme. Only `reference` exists so far; a new theme is one more constructor in `Theme::all()`.
 - **Waveforms:** `WaveformTokens` holds the stand-in's colours (grid, cue, loop, playhead, played part). The waveform renderer's own theme (3-band palette blue / orange / white, RGB weights, auto gain as a display setting) joins it when that crate lands, so one theme drives the screen and the waveform shader.
 - **Not tokens:** layout positions and sizes stay in `screen.rs`. They come from the canvas, per screen.
+
+## Waveforms
+
+- **Computed during decode.** `engine_media::load_file_tapped` hands every chunk the loader writes into the source to a tap. The tap is `engined`'s `WaveTap`, a `waveform::Builder` on the loader thread. So the waveform is built from exactly the frames the deck plays: at the engine rate, resampled and gapless-trimmed (timeline origin "trimmed"; the trim and the file rate are recorded for imports). Every quarter second of audio it publishes the finished entries to a `LiveWaveform`. The UI appends what's new each frame, so both views fill in while the track loads. Dropping the tap at the end of the decode finishes the waveform. Tests:
+  - the tap sees exactly what the source gets, on the resampling and the same-rate path;
+  - the live waveform grows during decode and ends byte-for-byte equal to `compute()` on the whole track.
+- **Auto gain:** recomputed as the track fills in (every 10 s of new audio, and at the end), so it settles on the whole track.
+- **Columns on the CPU, pixels on the GPU.** `waves.rs` builds the columns with the waveform crate's own `display::column`, so modes, gains, themes, layouts and alignment match its reference renderer. Each zoom column covers a fixed slice of the timeline. The columns are placed at their exact fractional position for the interpolated playhead. The waveform shader reads each column's segments (from, to, opacity, colour) from a small float texture. It blends a column's bands in sRGB values, as the reference does, and box-filters across the columns under each pixel. So the zoom scrolls smoothly, with no whole-pixel judder and no shimmer. A test checks that a column keeps its value and moves by exactly the playhead's fraction. The overview caches its per-pixel maxima until the waveform grows.
+- **Paint order:** panel and grid, then the waveform, then the loop, cues, slip shadow and playhead (`Scene` interleaves rectangle batches and waveform draws).
+- **Cost:** with both waveforms the main screen takes about 1.2 ms of CPU per frame at 120 fps on the M1 Max (0.8 ms without). Building the columns is about 0.1 ms of that.
 
 ## Measurements (Mac)
 
