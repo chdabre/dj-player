@@ -24,6 +24,9 @@ pub struct WaveSettings {
     pub overview_layout: Layout,
     pub zoom_align: Align,
     pub overview_align: Align,
+    /// Dim the played part of the zoom too. Off by default: the zoom stays bright on both
+    /// sides of the playhead, and only the overview shows how far the track has played.
+    pub zoom_dims_played: bool,
 }
 
 impl Default for WaveSettings {
@@ -33,7 +36,9 @@ impl Default for WaveSettings {
             zoom_layout: Layout::Overlaid,
             overview_layout: Layout::Stacked,
             zoom_align: Align::Mirrored,
-            overview_align: Align::Mirrored,
+            // Bands stacked up from the bottom, as on the CDJ-3000's overview.
+            overview_align: Align::Bottom,
+            zoom_dims_played: false,
         }
     }
 }
@@ -67,7 +72,8 @@ fn span_max(entries: &[Entry], a: i64, b: i64) -> Option<Entry> {
 }
 
 /// The zoom's columns around `playhead` (seconds), `seconds_per_px` per design pixel, the
-/// playhead at the centre of `area`; columns left of the playhead's column are dimmed.
+/// playhead at the centre of `area`. Columns left of the playhead's column are dimmed only
+/// if [`WaveSettings::zoom_dims_played`] is on.
 #[allow(clippy::too_many_arguments)]
 pub fn zoom(
     entries: &[Entry],
@@ -92,7 +98,7 @@ pub fn zoom(
             match span_max(entries, a, b) {
                 Some(e) if t1 > 0.0 => {
                     let c = column(e, settings.mode, settings.zoom_layout, style);
-                    if j < playhead_col {
+                    if settings.zoom_dims_played && j < playhead_col {
                         c.dimmed(style.played)
                     } else {
                         c
@@ -237,16 +243,35 @@ mod tests {
     }
 
     #[test]
-    fn zoom_dims_the_played_part_and_blanks_outside_the_track() {
-        let e = ramp(3_000); // 20 s
-        let (s, st) = (WaveSettings::default(), Style::default());
-        let d = zoom(&e, EPS, 1.0, 0.0133, area(), &s, &st);
-        // Before 0 s: empty columns.
-        assert!(d.columns[0].segments().is_empty());
-        let centre = ((d.x + d.w * 0.5 - d.first_x) / d.column_width) as usize;
-        let lit = d.columns[centre + 3].segments()[0].color;
-        let dim = d.columns[centre - 3].segments()[0].color;
-        assert!(dim.0 <= lit.0 && dim.1 <= lit.1 && dim.2 <= lit.2 && dim != lit);
+    fn zoom_stays_bright_unless_dimming_is_on_and_blanks_outside_the_track() {
+        // Flat entries, so a column's colour depends on dimming only.
+        let e = vec![
+            Entry {
+                low: 200,
+                mid: 120,
+                high: 60
+            };
+            3_000
+        ]; // 20 s
+        let st = Style::default();
+        let colours = |s: &WaveSettings| {
+            let d = zoom(&e, EPS, 1.0, 0.0133, area(), s, &st);
+            // Before 0 s: empty columns.
+            assert!(d.columns[0].segments().is_empty());
+            let centre = ((d.x + d.w * 0.5 - d.first_x) / d.column_width) as usize;
+            (
+                d.columns[centre - 3].segments()[0].color,
+                d.columns[centre + 3].segments()[0].color,
+            )
+        };
+        let (played, ahead) = colours(&WaveSettings::default());
+        assert_eq!(played, ahead, "the zoom is not dimmed by default");
+        let (played, ahead) = colours(&WaveSettings {
+            zoom_dims_played: true,
+            ..WaveSettings::default()
+        });
+        assert!(played.0 <= ahead.0 && played.1 <= ahead.1 && played.2 <= ahead.2);
+        assert_ne!(played, ahead);
     }
 
     #[test]
