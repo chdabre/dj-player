@@ -40,9 +40,33 @@ Until the control surface exists, the window draws the player's physical control
   - the jog's top plate scratches (one turn = 1.8 s, a record at 33⅓ rpm), its ring bends the pitch by its speed, and with JOG MODE off the top plate bends too;
   - the tempo fader (up is slower), with TEMPO cycling ±6 / ±10 / ±16 / WIDE.
 - **Lights follow the deck:** the CUE and PLAY rings, the quantize and keylock lights, REV, the loop buttons, the set pads, the fader cap (it follows the rate, bends included), and a marker that turns with the track on the jog.
-- **Not wired yet:** time mode, track search forward, BACK, TAG TRACK, the browse knob, F1 and F2 (there is no browser yet). The keyboard keys still work; `+` / `−` now nudge the rate, so they agree with the fader.
+- **Browse controls:** BACK goes up a level (leaving the browser at its root); the browse knob loads or opens the selection when pushed, and turns when dragged up or down (one step per 18 px) or under the mouse wheel; its ▲ / ▼ step once. Pushing it on another screen opens the browser.
+- **Not wired yet:** time mode, track search forward, TAG TRACK, F1 and F2. The keyboard keys still work; `+` / `−` now nudge the rate, so they agree with the fader.
 - **Tests** (`standin.rs`): CUE hold and release, pads set and delete, the fader's rate (top = −10 % on ±10), a quarter turn of the plate scratching a quarter of 1.8 s, ring bend and its release, SEARCH while held, and the display slot staying clear of the controls.
 - **Cost:** about 1.5 ms of CPU per frame with the shell at 100–114 fps on the M1 Max (1.2 ms without).
+
+## Browse screen
+
+`LIBRARY_DIR=<dir>` makes a folder the root of a stick (see `docs/dev-setup.md`); the browse screen ("Browse" on the canvas) lists it. Without a file the app starts there. Tab, the BROWSE tab or a push of the stand-in's knob opens it. The rail picks the source: USB (the folders on the stick) or LIBRARY, which opens on a menu: FOLDERS (the library's tracks in their folders, from the stored paths) and TRACKS (one flat list). A search from a library folder looks under that folder only.
+
+- **Scan question:** a stick with no library asks once, over the list: SCAN (then LIBRARY fills in as the scan goes, with SCANNING n / total in the header) or FOLDERS ONLY. Enter / Esc answer it.
+- **Header chips:** SORT cycles name, title, artist, BPM, key, time (folders stay first; unknown values sort last); SEARCH opens the search; SCAN (in LIBRARY) scans again.
+- **Search:** everything under the shown folder, or the whole library, matched by file name and tags, every word. An on-screen keyboard (11-unit rows: digits and ⌫, QWERTY and CLEAR, ASDF and DONE, ZXCV and SPACE) replaces the status band and the bottom strip, so all seven rows stay visible; a real keyboard types too, `/` opens it, Esc / BACK ends it.
+- **Rows:** BPM (ours once analysed), key and length at the right of the artist column, in the row's font and weight. Artwork in the jacket column: the front cover from the tags, scaled to 64×64 on the tag thread, drawn by an image pipeline in `gfx.rs` (one texture per picture, dropped after 600 frames unused).
+- **ANALYZE ALL:** in LIBRARY, while tracks lack our analysis, the header offers ANALYZE ALL; running, it shows "ANALYZING n / total" and a lit STOP. Results fill in BPM and key as they come (the listing is republished within a second of each). On the Mac the UI stayed at 120 fps through a 12-track run.
+- **One column without tracks:** a level with no tracks (the library menu, a folder of folders) is one column, the names across the full width and no divider; the title/artist divider appears where the level holds tracks (and always beside the info panel).
+- **Cursor:** stays on its entry when the list re-sorts as tags arrive; a list nobody has touched stays at its top.
+- **INFO in the browser** (the tab, or `i`), as on the players: the list narrows to its jacket and title columns and a panel beside it shows the selected track: the artwork (288×288, read on the tag thread for the selected track only; the list's thumbnail stands in until then) with title, artist, album and genre; BPM, key, time and rating (stars); the comment. The knob and ↑/↓ keep moving the cursor and the panel follows; push / Enter loads; BACK or INFO again closes it. BPM and key are ours once analysed; the rating is the library's, else the tag's.
+- **INFO screen** (INFO from any other screen): the loaded track, full width. Laid out denser than the canvas's "Info" artboard (which keeps the fields in a narrow list and leaves a third of the panel empty): a header with source, player and "ON DECK"; the artwork as tall as the panel (273 px, from a 288 px read); beside it title, artist, album · genre, large BPM / KEY / TIME / RATING readouts, and the comment across the rest. Its tags and artwork are read once when the track loads, so it works without a stick too. BACK, Esc, `i` or INFO return to the main screen. The canvas artboard should follow.
+
+- **Model in `engined::browse`:** the folder levels with a cursor and the first shown row each, folders first then tracks (sorted by name, case aside), and a tag reader thread that reads the shown folder's tracks first and keeps the results. No scan, no library writes: a track gets its record when it is loaded. Tests: listing and hiding, navigation with the cursor kept in view, scrolling, tags arriving.
+- **Screen in `browse.rs`:** the rail, the tabs (BROWSE lit), seven 40 px rows (jacket, title, artist with BPM and length at the right), the status band and the overview, as on the main screen. The loaded track's title is in the accent colour; a thin bar shows where the rows are in a long folder. Long titles end in an ellipsis: text can now have a maximum width, ellipsized by cosmic-text.
+- **Touch:** tapping a folder opens it; tapping a track selects it, tapping it again loads it (one tap can't replace a playing track by accident). A drag on the list scrolls it with the finger, and the wheel scrolls it. The header goes up a level.
+- **Keys:** ↑ / ↓ move, Enter loads or opens, Esc / Backspace go up (Esc no longer quits; `q` does), Tab toggles the screen. Loading shows the main screen.
+- **Run-time loading:** `Player::start` opens the output with an empty deck and `Player::load` replaces the track: new source, waveform, analysis and library record (`LoadedTrack`), one library worker for the whole session. The hot cues of a track come back when it is loaded again after another (`engined/tests/player.rs`, ignored by default since it needs an audio device).
+- **Selected row tint:** the wireframe's 22 % accent looks almost solid with linear-light blending; 9 % matches the canvas.
+- **Text is drawn above every rectangle and picture**, so anything over the list (the scan question) hides the rows instead of covering them. A modal layer in the scene would lift that.
+- **Open:** library categories (artist, album, BPM, key), and the on-screen keyboard's feel on the real panel.
 
 ## Scrubbing the waveform
 
@@ -120,5 +144,5 @@ MacBook Pro M1 Max, built-in 120 Hz panel, Metal, release build, playing an MP3 
 2. **Fast state:** replace the direct `DeckState` reads with the seqlock'd shared-memory block, and the command calls with the socket, so the UI runs as its own process as designed.
 3. **Waveforms:** draw the waveform data in its own pipeline, in the zoom and overview areas.
 4. **Remaining screens:**
-   - Performance, Browse (virtualized list), Info and Utility from the canvas;
+   - Info and Utility from the canvas; the browser's library views (playlists, tags, history) once the library has them;
    - taffy only if the hand layout gets painful (so far it hasn't).
