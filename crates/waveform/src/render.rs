@@ -25,6 +25,10 @@
 //! **Colours** all come from `style.theme` ([`crate::display::Theme`]); the renderer
 //! hard-codes none. A hot cue carries its own colour.
 //!
+//! **Alignment:** either view draws its columns mirrored around the middle (default) or
+//! bottom-aligned, growing up from the bottom of the waveform area ([`Align`]). Heights are
+//! then fractions of the full area instead of the half-height.
+//!
 //! **Overview** ([`render_overview`]): the whole track, 3-band stacked, played part
 //! dimmed, 16-bar ticks along the bottom, cue triangles along the top, hot cue tags along
 //! the bottom, the loop region and the playhead.
@@ -180,6 +184,14 @@ pub struct Markers {
     pub active_loop: Option<Loop>,
 }
 
+/// Where a view's columns start: mirrored around the middle line (heights are half-heights)
+/// or up from the bottom of the waveform area (heights are of the full area).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Mirrored,
+    Bottom,
+}
+
 /// Size of the zoomed view.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZoomView {
@@ -189,6 +201,8 @@ pub struct ZoomView {
     pub beats: f64,
     /// How the 3-band mode lays out the bands; overlaid by default.
     pub layout: Layout,
+    /// Mirrored around the middle (default) or growing up from the bottom.
+    pub align: Align,
 }
 
 impl Default for ZoomView {
@@ -198,6 +212,7 @@ impl Default for ZoomView {
             height: 211,
             beats: 20.0,
             layout: Layout::Overlaid,
+            align: Align::Mirrored,
         }
     }
 }
@@ -209,6 +224,9 @@ pub struct OverviewView {
     pub height: usize,
     /// How the 3-band mode lays out the bands; stacked by default.
     pub layout: Layout,
+    /// Mirrored around the middle (default) or growing up from the bottom, as on the
+    /// CDJ-3000's overview.
+    pub align: Align,
 }
 
 impl Default for OverviewView {
@@ -217,6 +235,7 @@ impl Default for OverviewView {
             width: 703,
             height: 67,
             layout: Layout::Stacked,
+            align: Align::Mirrored,
         }
     }
 }
@@ -251,19 +270,28 @@ fn bar_numbers(grid: &[GridBeat]) -> impl Iterator<Item = (GridBeat, Option<usiz
     })
 }
 
-/// Paint `col` mirrored around `cy` with half-height `half`, at column `x`, rows
-/// `[top, bottom)`: per pixel, the colour of the last segment covering its centre.
+/// Paint `col` at column `x` over rows `[top, bottom)`, mirrored around the middle or
+/// growing up from the bottom: per pixel, the segments covering its centre, blended in
+/// paint order onto what is there.
 fn paint_column(
     canvas: &mut Canvas,
     x: i64,
     top: usize,
     bottom: usize,
-    cy: f32,
-    half: f32,
+    align: Align,
     col: &crate::display::Column,
 ) {
+    let (top_f, bottom_f) = (top as f32, bottom as f32);
     for y in top..bottom {
-        let d = ((y as f32 + 0.5) - cy).abs() / half;
+        let yc = y as f32 + 0.5;
+        // Distance from the baseline, 0..1 of the drawable height.
+        let d = match align {
+            Align::Mirrored => {
+                let cy = (top_f + bottom_f) / 2.0;
+                (yc - cy).abs() / ((bottom_f - top_f) / 2.0)
+            }
+            Align::Bottom => (bottom_f - yc) / (bottom_f - top_f),
+        };
         let under = canvas.get(x as usize, y);
         if let Some(c) = col.color_at(d, under) {
             canvas.put(x, y as i64, c, 1.0);
@@ -289,8 +317,6 @@ pub fn render_zoom(
     let j0 = (playhead / spp).floor() as i64;
     let x_of = |t: f64| (t / spp).floor() as i64 - j0 + cx;
     let (top, bottom) = (ZOOM_TOP, h - ZOOM_BOTTOM);
-    let cy = (top + bottom) as f32 / 2.0;
-    let half = (bottom - top) as f32 / 2.0;
     let (t_min, t_max) = (
         playhead - (cx + 1) as f64 * spp,
         playhead + (w as f64 + 1.0) * spp,
@@ -329,7 +355,7 @@ pub fn render_zoom(
         if j < j0 {
             col = col.dimmed(style.played);
         }
-        paint_column(&mut canvas, x, top, bottom, cy, half, &col);
+        paint_column(&mut canvas, x, top, bottom, view.align, &col);
     }
 
     // Overlays, in front.
@@ -389,8 +415,6 @@ pub fn render_overview(
     let duration = ov.duration.max(f64::MIN_POSITIVE);
     let x_of = |t: f64| (t / duration * w as f64).floor() as i64;
     let (top, bottom) = (OVERVIEW_TOP, h - OVERVIEW_BOTTOM);
-    let cy = (top + bottom) as f32 / 2.0;
-    let half = (bottom - top) as f32 / 2.0;
     let n = ov.columns.len();
     let played = x_of(playhead);
 
@@ -407,7 +431,7 @@ pub fn render_overview(
         if (x as i64) < played {
             col = col.dimmed(style.played);
         }
-        paint_column(&mut canvas, x as i64, top, bottom, cy, half, &col);
+        paint_column(&mut canvas, x as i64, top, bottom, view.align, &col);
     }
 
     // 16-bar scale along the bottom.
@@ -685,6 +709,7 @@ mod tests {
             width: 300,
             height: 40,
             layout: Layout::Overlaid,
+            ..OverviewView::default()
         };
         let cy = (OVERVIEW_TOP + 40 - OVERVIEW_BOTTOM) / 2;
         let c = render_overview(
@@ -724,5 +749,63 @@ mod tests {
         let mid = Theme::BLENDED.bands[1].over(Theme::BLENDED.bands[0], 0.6);
         let row = (30..50).find(|&y| c.get(150, y) == mid);
         assert!(row.is_some(), "no blended mid pixel in column 150");
+    }
+
+    #[test]
+    fn bottom_aligned_columns_grow_up_from_the_bottom() {
+        let (wf, grid) = fixture();
+        let style = Style::default();
+        let bands = style.theme.bands;
+        let ov = wf.overview();
+        let view = OverviewView {
+            width: 300,
+            height: 40,
+            align: Align::Bottom,
+            ..OverviewView::default()
+        };
+        let c = render_overview(
+            &ov,
+            &grid,
+            0.0,
+            &Markers::default(),
+            Mode::ThreeBand,
+            &style,
+            &view,
+        );
+        let (top, bottom) = (OVERVIEW_TOP, 40 - OVERVIEW_BOTTOM);
+        let area = (bottom - top) as f32;
+        // Stacked from the bottom: lows on the baseline, mids above them.
+        let low = 1.0 / 3f32.sqrt(); // 255 at gain 1, times the stack scale
+        let row = |frac: f32| bottom - 1 - (frac * area) as usize;
+        assert_eq!(c.get(150, bottom - 1), bands[0]);
+        assert_eq!(c.get(150, row(low + 0.05)), bands[1]);
+        // Nothing above the column's top.
+        assert_eq!(c.get(150, top), style.theme.background);
+        // The zoom too: overlaid from the bottom puts the highs' core on the baseline, where
+        // a mirrored column has its low edge.
+        let z = ZoomView {
+            width: 200,
+            height: 100,
+            align: Align::Bottom,
+            ..ZoomView::default()
+        };
+        let render = |z: &ZoomView| {
+            render_zoom(
+                &wf,
+                &grid,
+                5.0,
+                &Markers::default(),
+                Mode::ThreeBand,
+                &style,
+                z,
+            )
+        };
+        let zb = 100 - ZOOM_BOTTOM;
+        assert_eq!(render(&z).get(150, zb - 1), bands[2]);
+        let mirrored = ZoomView {
+            align: Align::Mirrored,
+            ..z
+        };
+        assert_eq!(render(&mirrored).get(150, zb - 1), bands[0]);
     }
 }

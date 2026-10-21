@@ -12,7 +12,9 @@
 //! out the demo cue, hot cue and loop overlays, `--theme NAME` (default, findings, spectrum,
 //! blended), `--gain auto|off|N` the per-track display gain (default auto),
 //! `--zoom-layout` / `--overview-layout overlaid|stacked` how 3-band lays out the bands in
-//! each view (default overlaid in the zoom, stacked in the overview).
+//! each view (default overlaid in the zoom, stacked in the overview), `--zoom-align` /
+//! `--overview-align mirrored|bottom` mirrored around the middle (default) or growing up
+//! from the bottom.
 
 mod synth;
 
@@ -26,7 +28,8 @@ use engine_analysis::{Analyzer, CancelFlag, Feature, FeatureSet, GridFit, TrackA
 use waveform::compute::{Builder, Origin, Params, Timeline, Waveform};
 use waveform::display::{Theme, TrackGain};
 use waveform::render::{
-    Canvas, GridBeat, HotCue, Loop, Markers, OverviewView, ZoomView, render_overview, render_zoom,
+    Align, Canvas, GridBeat, HotCue, Loop, Markers, OverviewView, ZoomView, render_overview,
+    render_zoom,
 };
 use waveform::{Layout, Mode, Style};
 
@@ -43,6 +46,8 @@ struct Options {
     gain: TrackGain,
     zoom_layout: Layout,
     overview_layout: Layout,
+    zoom_align: Align,
+    overview_align: Align,
 }
 
 enum Input {
@@ -62,6 +67,8 @@ fn parse(args: &[String]) -> Result<Options> {
         gain: TrackGain::Auto,
         zoom_layout: Layout::Overlaid,
         overview_layout: Layout::Stacked,
+        zoom_align: Align::Mirrored,
+        overview_align: Align::Mirrored,
     };
     let mut input = None;
     let mut it = args.iter();
@@ -85,6 +92,8 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "--zoom-layout" => o.zoom_layout = layout(value()?)?,
             "--overview-layout" => o.overview_layout = layout(value()?)?,
+            "--zoom-align" => o.zoom_align = align(value()?)?,
+            "--overview-align" => o.overview_align = align(value()?)?,
             "--gain" => {
                 o.gain = match value()?.as_str() {
                     "auto" => TrackGain::Auto,
@@ -105,6 +114,14 @@ fn layout(name: &str) -> Result<Layout> {
         "overlaid" => Ok(Layout::Overlaid),
         "stacked" => Ok(Layout::Stacked),
         _ => Err(format!("unknown layout {name} (overlaid, stacked)").into()),
+    }
+}
+
+fn align(name: &str) -> Result<Align> {
+    match name {
+        "mirrored" => Ok(Align::Mirrored),
+        "bottom" => Ok(Align::Bottom),
+        _ => Err(format!("unknown alignment {name} (mirrored, bottom)").into()),
     }
 }
 
@@ -238,10 +255,12 @@ fn run(o: &Options) -> Result<()> {
     }
     let zoom = ZoomView {
         layout: o.zoom_layout,
+        align: o.zoom_align,
         ..ZoomView::default()
     };
     let overview = OverviewView {
         layout: o.overview_layout,
+        align: o.overview_align,
         ..OverviewView::default()
     };
     if zoom.layout != ZoomView::default().layout {
@@ -249,6 +268,12 @@ fn run(o: &Options) -> Result<()> {
     }
     if overview.layout != OverviewView::default().layout {
         name = format!("{name}-overview-{}", layout_name(overview.layout));
+    }
+    if zoom.align == Align::Bottom {
+        name = format!("{name}-zoom-bottom");
+    }
+    if overview.align == Align::Bottom {
+        name = format!("{name}-overview-bottom");
     }
     std::fs::create_dir_all(&o.out)?;
     for mode in Mode::ALL {
