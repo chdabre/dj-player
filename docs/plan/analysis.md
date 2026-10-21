@@ -82,8 +82,8 @@ Pick the best part for each feature, port it to Rust, and run everything in-proc
 3. ~~Key: port Essentia's `KeyExtractor`~~ (done: `hpcpkey`). Next: raise it from 50 %: other profiles (bgate, Krumhansl, Temperley are in the port), libKeyFinder, or a key CNN.
 4. Essentia (Python worker) and stratum-dsp stay as reference backends for the scorer only.
 5. ~~A second, independent ground-truth set~~ (done: the Validation playlist).
-6. **BPM range setting** (decided 2026-10-21): settles 87 vs 174 the way Rekordbox's range does.
-7. **MP3 start offset:** detect it automatically rather than hard-coding a correction.
+6. ~~BPM range setting~~ (done): `Settings::bpm_range`, `--bpm-range 88-176`. Tempos are folded by octaves into the range; `tempocnn` folds patch tempos before its vote, gridfit searches in the range and folds a hint. Default: no range (the network's choice). The nine 87/174-type misses on the validation set cannot all be fixed by one range: the reference itself has 80 and 85 on some and 180 and 185 on others (more than an octave apart).
+7. ~~MP3 start offset~~ (done, automatic): Rekordbox decodes MP3s without gapless trimming, so its times are later than ours by the file's own start trim (`engine_media::TrackInfo::start_trim` ÷ rate; 1105 frames for the usual LAME delay). Measured on 141 reliable MP3s: −23.4 ms at 48 kHz (predicted −23.0) and −25.4 ms at 44.1 kHz (predicted −25.1). `rekordbox::timeline_offset` gives it per file; the scorer applies it (`--no-offset-correction` to disable). After correction the median offset on a 20-track sample is +0.4 ms. Files with other encoder delays are untested but are handled by the same rule.
 8. **Licensing** (decided 2026-10-21): AGPL-3.0 is fine; the player may ship the TempoCNN model and `hpcpkey`.
 
 Each port is checked against the reference implementation it replaces (same outputs on the same audio) before it is scored.

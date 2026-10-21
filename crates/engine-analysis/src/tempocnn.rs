@@ -21,7 +21,7 @@ use tract_onnx::prelude::*;
 
 use crate::analyzer::{AnalysisError, Analyzer, CancelFlag};
 use crate::model::{
-    Analysed, Analysis, AnalyzerId, Feature, FeatureSet, Provenance, Tempo, TrackAudio,
+    Analysed, Analysis, AnalyzerId, BpmRange, Feature, FeatureSet, Provenance, Tempo, TrackAudio,
 };
 
 const RATE: u32 = 11_025;
@@ -38,6 +38,8 @@ type Model = Arc<TypedRunnableModel>;
 
 pub struct TempoCnn {
     model: Model,
+    /// The user's BPM range; patch tempos are folded into it before the vote.
+    range: Option<BpmRange>,
     /// Per band: first spectrum bin and its filter coefficients.
     filters: Vec<(usize, Vec<f32>)>,
     window: Vec<f32>,
@@ -60,10 +62,17 @@ impl TempoCnn {
             .collect();
         Ok(Self {
             model,
+            range: None,
             filters: mel_filters(),
             window,
             fft: FftPlanner::new().plan_fft_forward(FRAME),
         })
+    }
+
+    /// Show tempos in `range` (folded by octaves); `None` keeps the network's choice.
+    pub fn with_range(mut self, range: Option<BpmRange>) -> Self {
+        self.range = range;
+        self
     }
 
     /// `TEMPOCNN_MODEL` from the environment; `None` if not set.
@@ -232,7 +241,10 @@ impl Analyzer for TempoCnn {
         AnalyzerId {
             name: "tempocnn".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            params: "deeptemp-k16-3,onnx,tract".into(),
+            params: format!(
+                "deeptemp-k16-3,onnx,tract,bpm_range={}",
+                self.range.map_or("auto".into(), |r| r.to_string())
+            ),
         }
     }
 
@@ -252,7 +264,13 @@ impl Analyzer for TempoCnn {
             return Ok(Analysis::default());
         }
         let audio = audio.at_rate(RATE).map_err(AnalysisError::Backend)?;
-        let tempi = self.local_tempi(&audio.mono(), cancel)?;
+        let mut tempi = self.local_tempi(&audio.mono(), cancel)?;
+        // Folding before the vote lets patches that heard 87 and 174 vote together.
+        if let Some(r) = self.range {
+            for t in &mut tempi {
+                *t = r.fold(f64::from(*t)).round() as u32;
+            }
+        }
         let Some((bpm, votes)) = majority(&tempi) else {
             return Ok(Analysis::default());
         };

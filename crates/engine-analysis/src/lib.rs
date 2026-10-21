@@ -34,8 +34,8 @@ pub mod tempocnn;
 pub use analyzer::{AnalysisError, Analyzer, CancelFlag, RunResults, run_all};
 pub use gridfit::{GridFit, GridFitConfig, PhaseSource};
 pub use model::{
-    Analysed, Analysis, AnalyzerId, Beat, Beatgrid, Feature, FeatureSet, Key, Mode, PitchClass,
-    Provenance, Tempo, TrackAudio,
+    Analysed, Analysis, AnalyzerId, Beat, Beatgrid, BpmRange, Feature, FeatureSet, Key, Mode,
+    PitchClass, Provenance, Settings, Tempo, TrackAudio,
 };
 pub use select::{Policy, Source};
 #[cfg(feature = "stratum")]
@@ -50,11 +50,24 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<TrackAudio, engine_medi
     })
 }
 
-/// Every analyzer compiled into this build, in default preference order.
+/// Every analyzer compiled into this build, in default preference order, with default
+/// settings.
+pub fn analyzers() -> Vec<Box<dyn Analyzer>> {
+    analyzers_with(&Settings::default())
+}
+
+/// Every analyzer compiled into this build, configured with `settings`.
 // One push per backend, each behind its own feature.
 #[allow(unused_mut, clippy::vec_init_then_push)]
-pub fn analyzers() -> Vec<Box<dyn Analyzer>> {
-    let mut v: Vec<Box<dyn Analyzer>> = vec![Box::new(GridFit::default())];
+pub fn analyzers_with(settings: &Settings) -> Vec<Box<dyn Analyzer>> {
+    let gridfit = |hint: Option<&'static str>| {
+        GridFit::new(GridFitConfig {
+            tempo_hint: hint,
+            bpm_range: settings.bpm_range,
+            ..GridFitConfig::default()
+        })
+    };
+    let mut v: Vec<Box<dyn Analyzer>> = vec![Box::new(gridfit(None))];
     #[cfg(feature = "hpcpkey")]
     v.push(Box::new(hpcpkey::HpcpKey::default()));
     #[cfg(feature = "stratum")]
@@ -69,14 +82,14 @@ pub fn analyzers() -> Vec<Box<dyn Analyzer>> {
     }
     #[cfg(feature = "tempocnn")]
     match tempocnn::TempoCnn::from_env() {
-        Some(Ok(t)) => v.push(Box::new(t)),
+        Some(Ok(t)) => v.push(Box::new(t.with_range(settings.bpm_range))),
         Some(Err(e)) => eprintln!("tempocnn unavailable: {e}"),
         None => {}
     }
     #[cfg(feature = "tempocnn")]
-    v.push(Box::new(GridFit::hinted("tempocnn")));
+    v.push(Box::new(gridfit(Some("tempocnn"))));
     // Last, so TempoCNN has run: gridfit refines its tempo.
     #[cfg(feature = "essentia")]
-    v.push(Box::new(GridFit::hinted("essentia-tempocnn")));
+    v.push(Box::new(gridfit(Some("essentia-tempocnn"))));
     v
 }

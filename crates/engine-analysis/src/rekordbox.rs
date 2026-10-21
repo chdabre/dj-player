@@ -7,6 +7,19 @@
 //!
 //! Reading the USB export database and ANLZ files (rbox) belongs to the library crate later;
 //! this only reads the XML.
+//!
+//! # Timeline
+//!
+//! Rekordbox decodes MP3s without gapless trimming; we trim the encoder and decoder delay
+//! (see `engine_media::TrackInfo::start_trim`). Its times are therefore later than ours by
+//! [`timeline_offset`]: on 141 hand-checked MP3s the measured offset matched it to within
+//! 0.4 ms at both 44.1 and 48 kHz (25.1 and 23.0 ms for the usual 1105-frame delay). Apply it
+//! with [`XmlTrack::shift`] before comparing Rekordbox times with ours.
+
+/// Seconds to subtract from Rekordbox times of this file to land on our timeline.
+pub fn timeline_offset(info: &engine_media::TrackInfo) -> f64 {
+    f64::from(info.start_trim) / f64::from(info.file_sample_rate)
+}
 
 use std::path::PathBuf;
 
@@ -74,6 +87,14 @@ impl XmlTrack {
             }
         }
         Some(Beatgrid { beats })
+    }
+
+    /// Move every time (grid anchors) by `seconds`; negative moves earlier. Use
+    /// `-timeline_offset(..)` to bring Rekordbox times onto our timeline.
+    pub fn shift(&mut self, seconds: f64) {
+        for m in &mut self.tempo {
+            m.start += seconds;
+        }
     }
 
     /// Reference values for scoring.

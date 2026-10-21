@@ -1,9 +1,10 @@
 //! `engine-analyze FILE...`: analyse tracks and print tempo, key and grid.
+//! Every subcommand takes `--bpm-range MIN-MAX` (e.g. 88-176) to show tempos in that range.
 //! `engine-analyze score TRUTH.csv`: analyse the tracks a ground-truth CSV lists and score
 //! them. The CSV has a header and the columns `file,bpm,key` (paths relative to the CSV;
 //! empty cells are not scored).
 //! `engine-analyze rekordbox EXPORT.xml [--min-seconds N] [--limit N] [--only A,B]
-//! [--overrides FILE] [--playlist NAME]`: score
+//! [--overrides FILE] [--playlist NAME] [--no-offset-correction]`: score
 //! against the
 //! tempo, grid and key of every track Rekordbox analysed whose file is present.
 
@@ -12,16 +13,31 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use engine_analysis::score::{TrackScore, Truth, report, score_track};
-use engine_analysis::{Analysis, CancelFlag, FeatureSet, Key, TrackAudio, analyzers, load};
+use engine_analysis::{
+    Analysis, BpmRange, CancelFlag, FeatureSet, Key, Settings, TrackAudio, analyzers_with, load,
+};
+
+/// Settings from `--bpm-range`, shared by every subcommand.
+static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut settings = Settings::default();
+    if let Some(i) = args.iter().position(|a| a == "--bpm-range") {
+        let Some(range) = args.get(i + 1).and_then(|r| BpmRange::parse(r)) else {
+            eprintln!("engine-analyze: --bpm-range needs MIN-MAX, e.g. 88-176");
+            return ExitCode::from(2);
+        };
+        settings.bpm_range = Some(range);
+        args.drain(i..i + 2);
+    }
+    let _ = SETTINGS.set(settings);
     let result = match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => {
             eprintln!(
-                "usage: engine-analyze FILE...\n       engine-analyze score TRUTH.csv\n       \
+                "usage: engine-analyze [--bpm-range MIN-MAX] FILE...\n       engine-analyze score TRUTH.csv\n       \
                  engine-analyze rekordbox EXPORT.xml [--min-seconds N] [--limit N] [--only A,B] \
-                 [--overrides FILE] [--playlist NAME]"
+                 [--overrides FILE] [--playlist NAME] [--no-offset-correction]"
             );
             return ExitCode::from(2);
         }
@@ -82,7 +98,7 @@ fn run_audio(audio: &TrackAudio, only: &[String]) -> Result<Vec<(String, Analysi
 
 /// The compiled-in analyzers, or only those named in `only` (when not empty).
 fn selected(only: &[String]) -> Vec<Box<dyn engine_analysis::Analyzer>> {
-    analyzers()
+    analyzers_with(SETTINGS.get().unwrap_or(&Settings::default()))
         .into_iter()
         .filter(|a| only.is_empty() || only.contains(&a.id().name))
         .collect()
@@ -169,11 +185,13 @@ fn rekordbox(args: &[String]) -> Result<()> {
     let mut only: Vec<String> = Vec::new();
     let mut overrides = None;
     let mut playlist: Option<String> = None;
+    let mut offset_correction = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--min-seconds" => min_seconds = it.next().ok_or("--min-seconds N")?.parse()?,
             "--limit" => limit = it.next().ok_or("--limit N")?.parse()?,
+            "--no-offset-correction" => offset_correction = false,
             "--playlist" => playlist = Some(it.next().ok_or("--playlist NAME")?.clone()),
             "--overrides" => overrides = Some(PathBuf::from(it.next().ok_or("--overrides FILE")?)),
             "--only" => {
@@ -230,6 +248,12 @@ fn rekordbox(args: &[String]) -> Result<()> {
             format!("{} – {}", t.artist, t.name)
         };
         eprintln!("[{}/{}] {name}", n + 1, usable.len());
+        // Rekordbox's MP3 timeline starts before ours by the gapless trim.
+        let mut t = (*t).clone();
+        if offset_correction {
+            let info = engine_media::probe(&t.location)?;
+            t.shift(-engine_analysis::rekordbox::timeline_offset(&info));
+        }
         let truth = t.truth(audio.duration());
         audio_seconds += audio.duration();
         for (analyzer, a, secs) in run_audio(&audio, &only)? {

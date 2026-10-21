@@ -25,8 +25,8 @@ use rustfft::{Fft, FftPlanner};
 
 use crate::analyzer::{AnalysisError, Analyzer, CancelFlag};
 use crate::model::{
-    Analysed, Analysis, AnalyzerId, Beat, Beatgrid, Feature, FeatureSet, Provenance, Tempo,
-    TrackAudio,
+    Analysed, Analysis, AnalyzerId, Beat, Beatgrid, BpmRange, Feature, FeatureSet, Provenance,
+    Tempo, TrackAudio,
 };
 
 const RATE: u32 = 44_100;
@@ -78,6 +78,9 @@ pub struct GridFitConfig {
     /// the same track, instead of choosing the tempo itself: the search then stays within
     /// [`HINT_SPAN`] of it, so the hint decides octave and 3:2 questions.
     pub tempo_hint: Option<&'static str>,
+    /// The user's BPM range: without a hint it is the search range; a hint is folded into
+    /// it.
+    pub bpm_range: Option<BpmRange>,
 }
 
 /// How far (relative) gridfit searches around a hinted tempo. TempoCNN reports whole BPM,
@@ -96,6 +99,7 @@ impl Default for GridFitConfig {
             phase: PhaseSource::Bands,
             band_tempo: true,
             tempo_hint: None,
+            bpm_range: None,
         }
     }
 }
@@ -138,8 +142,14 @@ impl Analyzer for GridFit {
             },
             version: env!("CARGO_PKG_VERSION").into(),
             params: format!(
-                "{RATE}Hz,frame={FRAME},hop={HOP},range={}-{},prior={}/{},phase={:?},band_tempo={}",
-                c.min_bpm, c.max_bpm, c.prior_bpm, c.prior_octaves, c.phase, c.band_tempo
+                "{RATE}Hz,frame={FRAME},hop={HOP},range={}-{},prior={}/{},phase={:?},band_tempo={},bpm_range={}",
+                c.min_bpm,
+                c.max_bpm,
+                c.prior_bpm,
+                c.prior_octaves,
+                c.phase,
+                c.band_tempo,
+                c.bpm_range.map_or("auto".into(), |r| r.to_string())
             ),
         }
     }
@@ -161,7 +171,12 @@ impl Analyzer for GridFit {
             context.iter().find_map(|a| {
                 let t = a.tempo.as_ref()?;
                 match &t.provenance {
-                    Provenance::Analyzer(id) if id.name == from => Some((t.value.bpm, id.clone())),
+                    Provenance::Analyzer(id) if id.name == from => Some((
+                        self.config
+                            .bpm_range
+                            .map_or(t.value.bpm, |r| r.fold(t.value.bpm)),
+                        id.clone(),
+                    )),
                     _ => None,
                 }
             })
@@ -188,7 +203,14 @@ impl Analyzer for GridFit {
                 max_bpm: bpm * (1.0 + HINT_SPAN),
                 ..self.config
             },
-            None => self.config,
+            None => match self.config.bpm_range {
+                Some(r) => GridFitConfig {
+                    min_bpm: r.min,
+                    max_bpm: r.max,
+                    ..self.config
+                },
+                None => self.config,
+            },
         };
         let Some(coarse) = coarse_period(&[&env, &low, &linear], fps, &search) else {
             return Ok(Analysis::default());
