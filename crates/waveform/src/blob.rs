@@ -11,7 +11,7 @@
 //! | 12 | 1 | layout: 0 = detail (timed entries), 1 = overview (columns spread over the track) |
 //! | 13 | 1 | value curve: 0 = imported / unknown, 1 = `round(255·√peak)` |
 //! | 14 | 1 | filter: 0 = imported / unknown, 1 = Linkwitz-Riley 4th order per channel, peak of max(L, R) |
-//! | 15 | 1 | provenance: 0 own, 1 Rekordbox PWV7, 2 PWV6, 3 PWV5, 4 PWV3 |
+//! | 15 | 1 | provenance: 0 own, 1 Rekordbox PWV7, 2 PWV6, 3 PWV5, 4 PWV3, 255 unknown |
 //! | 16 | 4 | entry rate in millihertz (150 /s = 150 000); 0 for an overview |
 //! | 20 | 4 | entry count |
 //! | 24 | 8 | track duration, seconds (f64) |
@@ -34,6 +34,8 @@
 //! - a new header field goes after the existing fixed fields (the signal table offset grows),
 //! - a new per-signal field goes at the end of each descriptor (the descriptor size grows),
 //! - a new signal kind is a new row; readers skip kinds they do not know,
+//! - a new provenance or timeline-origin code; readers take codes they do not know as
+//!   unknown,
 //!
 //! and readers locate the signal table, each descriptor and the data through the recorded
 //! offsets and sizes, never through constants, so they read what they know and skip the
@@ -235,7 +237,7 @@ fn decode(blob: &[u8]) -> Result<(Header, Vec<Entry>), DecodeError> {
     let duration = f64::from_le_bytes(bytes(24, 8)?.try_into().unwrap());
     let low_smoothing = f32_at(32)?;
     let timeline = Timeline {
-        origin: origin_from_code(bytes(36, 1)?[0])?,
+        origin: origin_from_code(bytes(36, 1)?[0]),
         start_trim: u32_at(40)?,
         file_rate: u32_at(44)?,
     };
@@ -273,7 +275,7 @@ fn decode(blob: &[u8]) -> Result<(Header, Vec<Entry>), DecodeError> {
         layout,
         curve,
         filter,
-        provenance: provenance_from_code(provenance)?,
+        provenance: provenance_from_code(provenance),
         rate_mhz,
         duration,
         low_smoothing,
@@ -290,18 +292,20 @@ fn provenance_code(p: Provenance) -> u8 {
         Provenance::RekordboxPwv6 => 2,
         Provenance::RekordboxPwv5 => 3,
         Provenance::RekordboxPwv3 => 4,
+        Provenance::Unknown => 255,
     }
 }
 
-fn provenance_from_code(c: u8) -> Result<Provenance, DecodeError> {
-    Ok(match c {
+/// Codes this version does not know read as unknown: a later writer may add sources.
+fn provenance_from_code(c: u8) -> Provenance {
+    match c {
         0 => Provenance::Own,
         1 => Provenance::RekordboxPwv7,
         2 => Provenance::RekordboxPwv6,
         3 => Provenance::RekordboxPwv5,
         4 => Provenance::RekordboxPwv3,
-        _ => return Err(DecodeError::Unsupported("provenance")),
-    })
+        _ => Provenance::Unknown,
+    }
 }
 
 fn origin_code(o: Origin) -> u8 {
@@ -312,13 +316,13 @@ fn origin_code(o: Origin) -> u8 {
     }
 }
 
-fn origin_from_code(c: u8) -> Result<Origin, DecodeError> {
-    Ok(match c {
-        0 => Origin::Unknown,
+/// Codes this version does not know read as unknown, like provenance.
+fn origin_from_code(c: u8) -> Origin {
+    match c {
         1 => Origin::Trimmed,
         2 => Origin::Untrimmed,
-        _ => return Err(DecodeError::Unsupported("timeline origin")),
-    })
+        _ => Origin::Unknown,
+    }
 }
 
 impl Waveform {
@@ -466,6 +470,7 @@ mod tests {
             Provenance::RekordboxPwv6,
             Provenance::RekordboxPwv5,
             Provenance::RekordboxPwv3,
+            Provenance::Unknown,
         ] {
             let wf = Waveform {
                 provenance: p,
@@ -477,6 +482,13 @@ mod tests {
             let blob = wf.overview().to_blob(&wf.params, p);
             assert_eq!(blob[13..15], [UNKNOWN, UNKNOWN], "{p:?}");
         }
+        // Later codes for provenance and origin read as unknown.
+        let mut blob = sample().to_blob();
+        blob[15] = 77;
+        blob[36] = 9;
+        let wf = Waveform::from_blob(&blob).unwrap();
+        assert_eq!(wf.provenance, Provenance::Unknown);
+        assert_eq!(wf.timeline.origin, Origin::Unknown);
         let mut blob = sample().to_blob();
         blob[13] = 2;
         assert_eq!(

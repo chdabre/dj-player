@@ -2,13 +2,15 @@
 //! and write one PNG sheet per display mode: the overview on top, then a 20-beat zoom at each
 //! position. Prints the compute time and blob sizes.
 //!
-//! `waveform-preview [OPTIONS] --synth track|tones|sweep`: the same for a synthetic signal
-//! (the previews in `docs/waveforms/` come from these; no real music in the repo).
+//! `waveform-preview [OPTIONS] --synth track|quiet|tones|sweep`: the same for a synthetic
+//! signal (the previews in `docs/waveforms/` come from these; no real music in the repo).
+//! `quiet` is the track at −30 dB, to show the auto gain's clamp.
 //!
 //! Options: `--out DIR` (default `.`), `--at F,F,...` playhead positions as fractions of the
 //! track (default 0.15,0.42,0.65), `--bpm N` a constant grid from 0 s instead of gridfit,
 //! `--rate HZ` the synthetic signal's sample rate (default 44100), `--no-markers` to leave
-//! out the demo cue, hot cue and loop overlays.
+//! out the demo cue, hot cue and loop overlays, `--theme NAME` (default, findings, spectrum),
+//! `--gain auto|off|N` the per-track display gain (default auto).
 
 mod synth;
 
@@ -20,9 +22,9 @@ use std::time::Instant;
 
 use engine_analysis::{Analyzer, CancelFlag, Feature, FeatureSet, GridFit, TrackAudio, load};
 use waveform::compute::{Builder, Origin, Params, Timeline, Waveform};
+use waveform::display::{Theme, TrackGain};
 use waveform::render::{
     Canvas, GridBeat, HotCue, Loop, Markers, OverviewView, ZoomView, render_overview, render_zoom,
-    theme,
 };
 use waveform::{Mode, Style};
 
@@ -35,6 +37,8 @@ struct Options {
     bpm: Option<f64>,
     rate: u32,
     markers: bool,
+    theme: Theme,
+    gain: TrackGain,
 }
 
 enum Input {
@@ -50,6 +54,8 @@ fn parse(args: &[String]) -> Result<Options> {
         bpm: None,
         rate: 44_100,
         markers: true,
+        theme: Theme::DEFAULT,
+        gain: TrackGain::Auto,
     };
     let mut input = None;
     let mut it = args.iter();
@@ -67,6 +73,17 @@ fn parse(args: &[String]) -> Result<Options> {
             "--rate" => o.rate = value()?.parse()?,
             "--synth" => input = Some(Input::Synth(value()?.clone())),
             "--no-markers" => o.markers = false,
+            "--theme" => {
+                let name = value()?;
+                o.theme = Theme::by_name(name).ok_or_else(|| format!("unknown theme {name}"))?;
+            }
+            "--gain" => {
+                o.gain = match value()?.as_str() {
+                    "auto" => TrackGain::Auto,
+                    "off" => TrackGain::Off,
+                    g => TrackGain::Fixed(g.parse()?),
+                }
+            }
             f if !f.starts_with("--") => input = Some(Input::File(PathBuf::from(f))),
             _ => return Err(format!("unknown option {a}").into()),
         }
@@ -108,6 +125,11 @@ fn run(o: &Options) -> Result<()> {
         Input::Synth(kind) => {
             let (stereo, bpm) = match kind.as_str() {
                 "track" => (synth::track(o.rate), None),
+                // −30 dB: auto gain would want ~5.6x and stops at the clamp.
+                "quiet" => (
+                    synth::track(o.rate).iter().map(|x| x * 0.0316).collect(),
+                    None,
+                ),
                 "tones" => (synth::tones(o.rate), Some(120.0)),
                 "sweep" => (synth::sweep(o.rate), Some(120.0)),
                 _ => return Err(format!("unknown synthetic signal {kind}").into()),
@@ -174,18 +196,31 @@ fn run(o: &Options) -> Result<()> {
 
     let positions: Vec<f64> = o.at.iter().map(|f| f * wf.duration).collect();
     let markers = if o.markers {
-        demo_markers(&grid, &positions)
+        demo_markers(&grid, &positions, &o.theme)
     } else {
         Markers::default()
     };
-    let style = Style::default();
+    let style = Style {
+        theme: o.theme,
+        track_gain: o.gain.resolve(&wf.entries),
+        ..Style::default()
+    };
+    println!(
+        "  theme {}, track gain {:.2}",
+        o.theme.name, style.track_gain
+    );
+    let name = if o.theme == Theme::DEFAULT {
+        name
+    } else {
+        format!("{name}-{}", o.theme.name)
+    };
     let zoom = ZoomView::default();
     let overview = OverviewView::default();
     std::fs::create_dir_all(&o.out)?;
     for mode in Mode::ALL {
         let gap = 8;
         let height = overview.height + positions.len() * (zoom.height + gap);
-        let mut sheet = Canvas::new(zoom.width, height, theme::BORDER);
+        let mut sheet = Canvas::new(zoom.width, height, o.theme.border);
         let playhead = positions.first().copied().unwrap_or(0.0);
         let canvas = render_overview(&ov, &grid, playhead, &markers, mode, &style, &overview);
         sheet.blit(&canvas, 0, 0);
@@ -236,7 +271,7 @@ fn constant_grid(bpm: f64, duration: f64) -> Vec<GridBeat> {
 /// Overlays that show every marker style: a cue just behind the first position, a memory
 /// cue ahead of it; a hot cue behind the second and a 4-beat loop ahead of it; two hot cues
 /// ahead of the third.
-fn demo_markers(grid: &[GridBeat], positions: &[f64]) -> Markers {
+fn demo_markers(grid: &[GridBeat], positions: &[f64], theme: &Theme) -> Markers {
     // The downbeat at or after `t`, `beats` beats on (negative: back).
     let beat_from = |t: f64, beats: isize| {
         let i = grid.partition_point(|b| b.time < t);
@@ -253,7 +288,7 @@ fn demo_markers(grid: &[GridBeat], positions: &[f64]) -> Markers {
         m.hot_cues.push(HotCue {
             time: beat_from(p, -8),
             label: 'A',
-            color: theme::PADS[0],
+            color: theme.pads[0],
         });
         m.active_loop = Some(Loop {
             start: beat_from(p, 0),
@@ -266,7 +301,7 @@ fn demo_markers(grid: &[GridBeat], positions: &[f64]) -> Markers {
             m.hot_cues.push(HotCue {
                 time: beat_from(p, beats),
                 label,
-                color: theme::PADS[1 + i],
+                color: theme.pads[1 + i],
             });
         }
     }

@@ -22,29 +22,15 @@
 //!
 //! **Sizes:** the defaults are the main screen's (1024×600): zoom 703×211, overview 703×67.
 //!
+//! **Colours** all come from `style.theme` ([`crate::display::Theme`]); the renderer
+//! hard-codes none. A hot cue carries its own colour.
+//!
 //! **Overview** ([`render_overview`]): the whole track, 3-band stacked, played part
 //! dimmed, 16-bar ticks along the bottom, cue triangles along the top, hot cue tags along
 //! the bottom, the loop region and the playhead.
 
 use crate::compute::{Entry, Overview, Waveform};
 use crate::display::{Layout, Mode, Rgb, Style, column};
-
-/// UI colours (findings.md: black panels, #34373D borders, amber cues, pad colours).
-pub mod theme {
-    use crate::display::Rgb;
-
-    pub const BACKGROUND: Rgb = Rgb::hex(0x000000);
-    pub const BORDER: Rgb = Rgb::hex(0x34373D);
-    pub const BEAT_LINE: Rgb = Rgb::hex(0x26282D);
-    pub const BAR_LINE: Rgb = Rgb::hex(0x5A5E66);
-    pub const LABEL: Rgb = Rgb::hex(0x8A8F98);
-    pub const CUE: Rgb = Rgb::hex(0xE0A33A);
-    pub const LOOP: Rgb = Rgb::hex(0xF2C06A);
-    pub const MEMORY_CUE: Rgb = Rgb::hex(0x8A8F98);
-    pub const PLAYHEAD: Rgb = Rgb::hex(0xFFFFFF);
-    /// Hot cue pad colours: rose, amber, sky.
-    pub const PADS: [Rgb; 3] = [Rgb::hex(0xE8667A), Rgb::hex(0xE0A33A), Rgb::hex(0x5AB8EC)];
-}
 
 /// An RGB image, row-major.
 #[derive(Debug, Clone, PartialEq)]
@@ -289,7 +275,8 @@ pub fn render_zoom(
     view: &ZoomView,
 ) -> Canvas {
     let (w, h) = (view.width, view.height);
-    let mut canvas = Canvas::new(w, h, theme::BACKGROUND);
+    let theme = &style.theme;
+    let mut canvas = Canvas::new(w, h, theme.background);
     let spp = view.beats * beat_period(grid, playhead) / w as f64;
     let cx = (w / 2) as i64;
     let j0 = (playhead / spp).floor() as i64;
@@ -310,10 +297,10 @@ pub fn render_zoom(
         let x = x_of(beat.time);
         match bar {
             Some(n) => {
-                canvas.vline(x, 0, bottom as i64, theme::BAR_LINE, None);
-                canvas.text(x + 3, 4, &n.to_string(), 1, theme::LABEL);
+                canvas.vline(x, 0, bottom as i64, theme.bar_line, None);
+                canvas.text(x + 3, 4, &n.to_string(), 1, theme.label);
             }
-            None => canvas.vline(x, top as i64, bottom as i64, theme::BEAT_LINE, None),
+            None => canvas.vline(x, top as i64, bottom as i64, theme.beat_line, None),
         }
     }
 
@@ -341,12 +328,19 @@ pub fn render_zoom(
     // Overlays, in front.
     if let Some(l) = markers.active_loop {
         let (x0, x1) = (x_of(l.start), x_of(l.end));
-        canvas.fill(x0, top as i64, x1, bottom as i64, theme::LOOP, 0.18);
-        canvas.vline(x0, top as i64, bottom as i64, theme::LOOP, None);
-        canvas.vline(x1, top as i64, bottom as i64, theme::LOOP, None);
+        canvas.fill(
+            x0,
+            top as i64,
+            x1,
+            bottom as i64,
+            theme.loop_color,
+            theme.loop_shade[0],
+        );
+        canvas.vline(x0, top as i64, bottom as i64, theme.loop_color, None);
+        canvas.vline(x1, top as i64, bottom as i64, theme.loop_color, None);
         let label = l.beats.to_string();
         let lx = (x0 + x1) / 2 - 2 * label.len() as i64;
-        canvas.text(lx, bottom as i64 + 4, &label, 1, theme::LOOP);
+        canvas.text(lx, bottom as i64 + 4, &label, 1, theme.loop_color);
     }
     for hc in &markers.hot_cues {
         let x = x_of(hc.time);
@@ -357,18 +351,18 @@ pub fn render_zoom(
             bottom as i64 + 4,
             &hc.label.to_string(),
             1,
-            theme::BACKGROUND,
+            theme.tag_text,
         );
     }
     for &t in &markers.memory_cues {
-        canvas.triangle(x_of(t), top as i64 + 5, 6, true, theme::MEMORY_CUE);
+        canvas.triangle(x_of(t), top as i64 + 5, 6, true, theme.memory_cue);
     }
     if let Some(t) = markers.cue {
         let x = x_of(t);
-        canvas.vline(x, top as i64, bottom as i64, theme::CUE, Some((4, 3)));
-        canvas.triangle(x, top as i64 + 6, 7, true, theme::CUE);
+        canvas.vline(x, top as i64, bottom as i64, theme.cue, Some((4, 3)));
+        canvas.triangle(x, top as i64 + 6, 7, true, theme.cue);
     }
-    canvas.fill(cx - 1, 0, cx + 1, h as i64, theme::PLAYHEAD, 1.0);
+    canvas.fill(cx - 1, 0, cx + 1, h as i64, theme.playhead, 1.0);
     canvas
 }
 
@@ -383,7 +377,8 @@ pub fn render_overview(
     view: &OverviewView,
 ) -> Canvas {
     let (w, h) = (view.width, view.height);
-    let mut canvas = Canvas::new(w, h, theme::BACKGROUND);
+    let theme = &style.theme;
+    let mut canvas = Canvas::new(w, h, theme.background);
     let duration = ov.duration.max(f64::MIN_POSITIVE);
     let x_of = |t: f64| (t / duration * w as f64).floor() as i64;
     let (top, bottom) = (OVERVIEW_TOP, h - OVERVIEW_BOTTOM);
@@ -414,31 +409,38 @@ pub fn render_overview(
         bottom as i64,
         w as i64,
         bottom as i64 + 1,
-        theme::BORDER,
+        theme.border,
         1.0,
     );
     for (beat, bar) in bar_numbers(grid) {
         if bar.is_some_and(|n| (n - 1) % 16 == 0) {
             let x = x_of(beat.time);
-            canvas.vline(x, bottom as i64, bottom as i64 + 4, theme::LABEL, None);
+            canvas.vline(x, bottom as i64, bottom as i64 + 4, theme.label, None);
         }
     }
 
     if let Some(l) = markers.active_loop {
         let (x0, x1) = (x_of(l.start), x_of(l.end).max(x_of(l.start) + 1));
-        canvas.fill(x0, top as i64, x1, bottom as i64, theme::LOOP, 0.35);
+        canvas.fill(
+            x0,
+            top as i64,
+            x1,
+            bottom as i64,
+            theme.loop_color,
+            theme.loop_shade[1],
+        );
     }
     for hc in &markers.hot_cues {
         let x = x_of(hc.time);
         canvas.fill(x - 2, bottom as i64 + 5, x + 3, h as i64, hc.color, 1.0);
     }
     for &t in &markers.memory_cues {
-        canvas.triangle(x_of(t), 4, 4, true, theme::MEMORY_CUE);
+        canvas.triangle(x_of(t), 4, 4, true, theme.memory_cue);
     }
     if let Some(t) = markers.cue {
-        canvas.triangle(x_of(t), 5, 5, true, theme::CUE);
+        canvas.triangle(x_of(t), 5, 5, true, theme.cue);
     }
-    canvas.fill(played, 0, played + 1, h as i64, theme::PLAYHEAD, 1.0);
+    canvas.fill(played, 0, played + 1, h as i64, theme.playhead, 1.0);
     canvas
 }
 
@@ -446,6 +448,7 @@ pub fn render_overview(
 mod tests {
     use super::*;
     use crate::compute::{Params, Provenance, Timeline};
+    use crate::display::Theme;
 
     /// 10 s of constant entries, 120 BPM grid from 0 (bars every 2 s).
     fn fixture() -> (Waveform, Vec<GridBeat>) {
@@ -493,18 +496,18 @@ mod tests {
         assert_eq!((c.width, c.height), (200, 100));
         // Playhead, two pixels wide, full height.
         for y in [0, 50, 99] {
-            assert_eq!(c.get(100, y), theme::PLAYHEAD);
-            assert_eq!(c.get(99, y), theme::PLAYHEAD);
+            assert_eq!(c.get(100, y), Theme::DEFAULT.playhead);
+            assert_eq!(c.get(99, y), Theme::DEFAULT.playhead);
         }
         // The centre row is the highs' inner core; unplayed on the right, dimmed on the left.
-        assert_eq!(c.get(150, 50), style.bands[2]);
-        assert_eq!(c.get(50, 50), style.bands[2].scale(style.played));
+        assert_eq!(c.get(150, 50), style.theme.bands[2]);
+        assert_eq!(c.get(50, 50), style.theme.bands[2].scale(style.played));
         // Lows fill the band area's edge (gain 1, value 255).
-        assert_eq!(c.get(150, ZOOM_TOP), style.bands[0]);
+        assert_eq!(c.get(150, ZOOM_TOP), style.theme.bands[0]);
         // 20 beats over 200 px at 120 BPM: 10 s, so bar lines every 40 px. The bar at 4 s
         // is 1 s (20 px) left of the playhead; its line shows in the top margin.
-        assert_eq!(c.get(80, 2), theme::BAR_LINE);
-        assert_eq!(c.get(81, 2), theme::BACKGROUND);
+        assert_eq!(c.get(80, 2), Theme::DEFAULT.bar_line);
+        assert_eq!(c.get(81, 2), Theme::DEFAULT.background);
         // Nothing is drawn before the start of the track.
         let c = render_zoom(
             &wf,
@@ -515,8 +518,8 @@ mod tests {
             &style,
             &view,
         );
-        assert_eq!(c.get(50, 50), theme::BACKGROUND);
-        assert_eq!(c.get(150, 50), style.single);
+        assert_eq!(c.get(50, 50), Theme::DEFAULT.background);
+        assert_eq!(c.get(150, 50), style.theme.single);
     }
 
     #[test]
@@ -582,14 +585,14 @@ mod tests {
             &view,
         );
         let cy = (OVERVIEW_TOP + 40 - OVERVIEW_BOTTOM) / 2;
-        assert_eq!(c.get(300, 10), theme::PLAYHEAD);
+        assert_eq!(c.get(300, 10), Theme::DEFAULT.playhead);
         // Stacked: lows at the centre.
-        assert_eq!(c.get(400, cy), style.bands[0]);
-        assert_eq!(c.get(200, cy), style.bands[0].scale(style.played));
+        assert_eq!(c.get(400, cy), style.theme.bands[0]);
+        assert_eq!(c.get(200, cy), style.theme.bands[0].scale(style.played));
         let tick_y = 40 - OVERVIEW_BOTTOM + 2;
-        assert_eq!(c.get(320, tick_y), theme::LABEL);
-        assert_eq!(c.get(0, tick_y), theme::LABEL);
-        assert_eq!(c.get(160, tick_y), theme::BACKGROUND);
+        assert_eq!(c.get(320, tick_y), Theme::DEFAULT.label);
+        assert_eq!(c.get(0, tick_y), Theme::DEFAULT.label);
+        assert_eq!(c.get(160, tick_y), Theme::DEFAULT.background);
     }
 
     #[test]
@@ -606,7 +609,7 @@ mod tests {
             hot_cues: vec![HotCue {
                 time: 7.0,
                 label: 'A',
-                color: theme::PADS[0],
+                color: Theme::DEFAULT.pads[0],
             }],
             active_loop: Some(Loop {
                 start: 8.0,
@@ -623,9 +626,9 @@ mod tests {
             &Style::default(),
             &view,
         );
-        assert_eq!(c.get(120, 50), theme::CUE); // dashed line starts at the band's top
-        assert_eq!(c.get(140, 50), theme::PADS[0]);
-        assert_eq!(c.get(160, 50), theme::LOOP);
-        assert_ne!(c.get(170, 50), Style::default().bands[2]); // shaded
+        assert_eq!(c.get(120, 50), Theme::DEFAULT.cue); // dashed line starts at the band's top
+        assert_eq!(c.get(140, 50), Theme::DEFAULT.pads[0]);
+        assert_eq!(c.get(160, 50), Theme::DEFAULT.loop_color);
+        assert_ne!(c.get(170, 50), Style::default().theme.bands[2]); // shaded
     }
 }

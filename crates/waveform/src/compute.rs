@@ -114,6 +114,8 @@ pub enum Provenance {
     RekordboxPwv5,
     /// Rekordbox's mono blue detail (PWV3, `.EXT`), copied into all bands; placeholder only.
     RekordboxPwv3,
+    /// A source this version does not know (a later writer's code); treated as an import.
+    Unknown,
 }
 
 /// Where entry 0 of a waveform sits, so waveforms from different decoders line up.

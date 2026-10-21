@@ -22,4 +22,4 @@ pub use compute::{
     Builder, Entry, OVERVIEW_COLUMNS, Origin, Overview, Params, Provenance, Timeline, Waveform,
     compute, encode_level, level, overview,
 };
-pub use display::{Column, Layout, Mode, Rgb, Segment, Style};
+pub use display::{Column, Layout, Mode, Rgb, Segment, Style, Theme, TrackGain, auto_gain};

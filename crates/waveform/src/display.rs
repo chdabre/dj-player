@@ -5,14 +5,15 @@
 //! in order, later ones on top:
 //!
 //! - [`Mode::Single`]: one segment, the combined level ([`Entry::combined`]), one colour.
-//! - [`Mode::ThreeBand`]: one segment per band in the findings.md palette. In the zoom
+//! - [`Mode::ThreeBand`]: one segment per band in the theme's band colours. In the zoom
 //!   ([`Layout::Overlaid`]) each band starts at the centre, painted low → mid → high, so
 //!   the wide indigo body is behind and the cream highs are an inner core. In the overview
 //!   ([`Layout::Stacked`]) the bands stack outwards: low, then mid on it, then high.
 //! - [`Mode::Rgb`]: one segment at the combined level, coloured from the band ratios.
 //!
-//! Heights are `gain · value / 255`: the stored square-root curve is the display curve, and
-//! the per-band gains are display settings (uniforms in the shader), not stored data.
+//! Heights are `track gain · band gain · value / 255`: the stored square-root curve is the
+//! display curve. The gains (per band, and per track from [`auto_gain`]) are display
+//! settings, uniforms in the shader, not stored data. All colours come from a [`Theme`].
 
 use crate::compute::Entry;
 
@@ -72,19 +73,109 @@ pub enum Layout {
     Stacked,
 }
 
-/// Colours and gains. All of it is display settings; changing it never touches stored data.
+/// The default 3-band colours: low blue, mid red-leaning orange, high white.
+const BLUE_ORANGE_WHITE: [Rgb; 3] = [Rgb::hex(0x2F6FE8), Rgb::hex(0xF0762A), Rgb::hex(0xF5F5F2)];
+
+/// Every colour the waveform views draw, as plain values (shader uniforms): the waveform
+/// palettes and the UI around them. The renderer hard-codes none.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Style {
+pub struct Theme {
+    pub name: &'static str,
     /// Single colour mode.
     pub single: Rgb,
-    /// 3-band mode: low, mid, high (findings.md).
+    /// 3-band mode: low, mid, high.
     pub bands: [Rgb; 3],
-    /// RGB mode: the colour each band contributes (red low, green mid, blue high).
+    /// RGB mode: the colour each band contributes (low, mid, high) ...
     pub rgb: [Rgb; 3],
+    /// ... and how much: each band's value is weighted by this before mixing.
+    pub rgb_weights: [f32; 3],
+    pub background: Rgb,
+    /// Panel borders and the overview's scale line.
+    pub border: Rgb,
+    pub beat_line: Rgb,
+    pub bar_line: Rgb,
+    /// Bar numbers and 16-bar ticks.
+    pub label: Rgb,
+    pub cue: Rgb,
+    pub memory_cue: Rgb,
+    pub loop_color: Rgb,
+    /// Opacity of the loop region's shading in the zoom and in the overview.
+    pub loop_shade: [f32; 2],
+    pub playhead: Rgb,
+    /// Text on a hot cue tag.
+    pub tag_text: Rgb,
+    /// Hot cue pad colours (rose, amber, sky); a hot cue carries its own colour, these are
+    /// the theme's suggestions.
+    pub pads: [Rgb; 3],
+}
+
+impl Theme {
+    /// Blue / orange / white bands (owner decision 2026-10-21, replacing findings.md's
+    /// indigo / teal / cream); the orange leans to red so it stays apart from the amber cue
+    /// and loop overlays. Black panels, #34373D borders, amber cues (findings.md); RGB mode
+    /// red / green / blue weighted like the 3-band gains.
+    pub const DEFAULT: Theme = Theme {
+        name: "default",
+        single: Rgb::hex(0x7CB4FF),
+        bands: BLUE_ORANGE_WHITE,
+        rgb: [Rgb::hex(0xFF0000), Rgb::hex(0x00FF00), Rgb::hex(0x0000FF)],
+        rgb_weights: [1.0, 0.85, 0.7],
+        background: Rgb::hex(0x000000),
+        border: Rgb::hex(0x34373D),
+        beat_line: Rgb::hex(0x26282D),
+        bar_line: Rgb::hex(0x5A5E66),
+        label: Rgb::hex(0x8A8F98),
+        cue: Rgb::hex(0xE0A33A),
+        memory_cue: Rgb::hex(0x8A8F98),
+        loop_color: Rgb::hex(0xF2C06A),
+        loop_shade: [0.18, 0.35],
+        playhead: Rgb::hex(0xFFFFFF),
+        tag_text: Rgb::hex(0x000000),
+        pads: [Rgb::hex(0xE8667A), Rgb::hex(0xE0A33A), Rgb::hex(0x5AB8EC)],
+    };
+
+    /// The findings.md palette: indigo / teal / cream bands, otherwise the default.
+    pub const FINDINGS: Theme = Theme {
+        name: "findings",
+        bands: [Rgb::hex(0x4B4FC2), Rgb::hex(0x3FB8AE), Rgb::hex(0xF4EAD2)],
+        ..Theme::DEFAULT
+    };
+
+    /// RGB weighted towards the highs (low 0.45, mid 1.0, high 2.2), since on real music the
+    /// low band dominates and equal weights come out red almost everywhere; a white single
+    /// colour. Bands as the default.
+    pub const SPECTRUM: Theme = Theme {
+        name: "spectrum",
+        single: Rgb::hex(0xE6E6E6),
+        rgb: [Rgb::hex(0xFF2A2A), Rgb::hex(0x2AFF5A), Rgb::hex(0x3A6BFF)],
+        rgb_weights: [0.45, 1.0, 2.2],
+        ..Theme::DEFAULT
+    };
+
+    pub const ALL: [Theme; 3] = [Theme::DEFAULT, Theme::FINDINGS, Theme::SPECTRUM];
+
+    pub fn by_name(name: &str) -> Option<Theme> {
+        Theme::ALL.into_iter().find(|t| t.name == name)
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::DEFAULT
+    }
+}
+
+/// A theme plus the display settings next to it. None of it touches stored data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Style {
+    pub theme: Theme,
     /// Display gain per band (low, mid, high); heights clamp at 1.
     pub gains: [f32; 3],
     /// Display gain on the combined level (single colour and RGB).
     pub combined_gain: f32,
+    /// Per-track gain on every height (bands and combined), so loud and quiet masters both
+    /// use the view; one uniform. Set it from [`TrackGain::resolve`]; 1 = off.
+    pub track_gain: f32,
     /// In [`Layout::Stacked`], each band's height is scaled by this before stacking, so a
     /// full-scale column of all three bands does not simply clip.
     pub stack_scale: f32,
@@ -95,15 +186,68 @@ pub struct Style {
 impl Default for Style {
     fn default() -> Self {
         Style {
-            single: Rgb::hex(0x7CB4FF),
-            bands: [Rgb::hex(0x4B4FC2), Rgb::hex(0x3FB8AE), Rgb::hex(0xF4EAD2)],
-            rgb: [Rgb::hex(0xFF0000), Rgb::hex(0x00FF00), Rgb::hex(0x0000FF)],
+            theme: Theme::DEFAULT,
             gains: [1.0, 0.85, 0.7],
             combined_gain: 1.0,
+            track_gain: 1.0,
             stack_scale: 1.0 / 3f32.sqrt(),
             played: 0.4,
         }
     }
+}
+
+/// The per-track gain setting: automatic, off, or a fixed value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrackGain {
+    Auto,
+    Off,
+    Fixed(f32),
+}
+
+impl TrackGain {
+    /// The gain for a track, from its detail entries (see [`auto_gain`]).
+    pub fn resolve(self, entries: &[Entry]) -> f32 {
+        match self {
+            TrackGain::Auto => auto_gain(entries),
+            TrackGain::Off => 1.0,
+            TrackGain::Fixed(g) => g,
+        }
+    }
+}
+
+/// Where [`auto_gain`] puts the track's loud level, as a fraction of the half-height.
+pub const AUTO_GAIN_TARGET: f32 = 0.8;
+/// Percentile of the combined level that counts as the track's loud level.
+pub const AUTO_GAIN_PERCENTILE: f32 = 0.95;
+/// [`auto_gain`] stays in this range, so near-silent tracks and noise floors don't blow up.
+pub const AUTO_GAIN_RANGE: (f32, f32) = (0.5, 4.0);
+
+/// The track gain that puts the 95th percentile of the combined level of the non-silent
+/// entries at 0.8 of the half-height, clamped to 0.5–4. Silence gives 1.
+///
+/// Pass the detail entries, so zoom and overview use the same gain. Overview columns work
+/// too (a track list without the detail), but each column is a max over many entries, so
+/// they give a somewhat lower gain.
+pub fn auto_gain(entries: &[Entry]) -> f32 {
+    let mut histogram = [0usize; 256];
+    for e in entries {
+        histogram[usize::from(e.combined())] += 1;
+    }
+    let loud: usize = histogram[1..].iter().sum();
+    if loud == 0 {
+        return 1.0;
+    }
+    // The smallest value with at least 95 % of the non-silent entries at or below it.
+    let rank = (AUTO_GAIN_PERCENTILE * loud as f32).ceil() as usize;
+    let mut seen = 0;
+    let value = (1..256)
+        .find(|&v| {
+            seen += histogram[v];
+            seen >= rank
+        })
+        .unwrap_or(255);
+    let (lo, hi) = AUTO_GAIN_RANGE;
+    (AUTO_GAIN_TARGET * 255.0 / value as f32).clamp(lo, hi)
 }
 
 /// One mirrored segment: from `from` to `to` (0 = centre, 1 = edge) on both sides.
@@ -150,29 +294,29 @@ impl Column {
     }
 }
 
-fn height(value: u8, gain: f32) -> f32 {
-    (gain * f32::from(value) / 255.0).clamp(0.0, 1.0)
+fn height(value: u8, gain: f32, style: &Style) -> f32 {
+    (style.track_gain * gain * f32::from(value) / 255.0).clamp(0.0, 1.0)
 }
 
 /// The column for `e` in `mode`.
 pub fn column(e: Entry, mode: Mode, layout: Layout, style: &Style) -> Column {
     let mut c = Column::default();
-    let combined = || height(e.combined(), style.combined_gain);
+    let combined = || height(e.combined(), style.combined_gain, style);
     match mode {
         Mode::Single => c.push(Segment {
             from: 0.0,
             to: combined(),
-            color: style.single,
+            color: style.theme.single,
         }),
         Mode::Rgb => c.push(Segment {
             from: 0.0,
             to: combined(),
-            color: rgb_color(e, style),
+            color: rgb_color(e, &style.theme),
         }),
         Mode::ThreeBand => {
             let mut base = 0.0;
             for (i, v) in [e.low, e.mid, e.high].into_iter().enumerate() {
-                let h = height(v, style.gains[i]);
+                let h = height(v, style.gains[i], style);
                 let (from, to) = match layout {
                     Layout::Overlaid => (0.0, h),
                     Layout::Stacked => (base, (base + h * style.stack_scale).min(1.0)),
@@ -182,7 +326,7 @@ pub fn column(e: Entry, mode: Mode, layout: Layout, style: &Style) -> Column {
                     c.push(Segment {
                         from,
                         to,
-                        color: style.bands[i],
+                        color: style.theme.bands[i],
                     });
                 }
             }
@@ -191,15 +335,15 @@ pub fn column(e: Entry, mode: Mode, layout: Layout, style: &Style) -> Column {
     c
 }
 
-/// RGB mode's colour: each band's colour weighted by its gained value, then scaled so the
-/// brightest channel is full (the colour carries the band ratios, the height the level).
-/// Silence is black.
-pub fn rgb_color(e: Entry, style: &Style) -> Rgb {
+/// RGB mode's colour: each band's colour weighted by its value times the theme's weight,
+/// then scaled so the brightest channel is full (the colour carries the band ratios, the
+/// height the level). Silence is black.
+pub fn rgb_color(e: Entry, theme: &Theme) -> Rgb {
     let mut sum = [0.0f32; 3];
     for ((v, g), c) in [e.low, e.mid, e.high]
         .into_iter()
-        .zip(style.gains)
-        .zip(style.rgb)
+        .zip(theme.rgb_weights)
+        .zip(theme.rgb)
     {
         for (s, ch) in sum.iter_mut().zip([c.0, c.1, c.2]) {
             *s += f32::from(v) * g * f32::from(ch);
@@ -223,9 +367,17 @@ mod tests {
 
     fn flat() -> Style {
         Style {
+            theme: Theme {
+                rgb_weights: [1.0; 3],
+                ..Theme::DEFAULT
+            },
             gains: [1.0; 3],
             ..Style::default()
         }
+    }
+
+    fn rgb_color_flat(e: Entry, s: &Style) -> Rgb {
+        rgb_color(e, &s.theme)
     }
 
     #[test]
@@ -237,7 +389,7 @@ mod tests {
             [Segment {
                 from: 0.0,
                 to: 1.0,
-                color: s.single
+                color: s.theme.single
             }]
         );
         let c = column(e(128, 128, 0), Mode::Single, Layout::Stacked, &s);
@@ -252,7 +404,7 @@ mod tests {
         assert_eq!(seg.len(), 3);
         assert_eq!(
             seg.iter().map(|s| s.color).collect::<Vec<_>>(),
-            [Rgb::hex(0x4B4FC2), Rgb::hex(0x3FB8AE), Rgb::hex(0xF4EAD2)]
+            [Rgb::hex(0x2F6FE8), Rgb::hex(0xF0762A), Rgb::hex(0xF5F5F2)]
         );
         assert!(seg.iter().all(|s| s.from == 0.0));
         assert_eq!(
@@ -260,9 +412,9 @@ mod tests {
             [1.0, 0.4, 0.2]
         );
         // Highs are the inner core, mids around them, lows outside.
-        assert_eq!(c.color_at(0.1), Some(s.bands[2]));
-        assert_eq!(c.color_at(0.3), Some(s.bands[1]));
-        assert_eq!(c.color_at(0.9), Some(s.bands[0]));
+        assert_eq!(c.color_at(0.1), Some(s.theme.bands[2]));
+        assert_eq!(c.color_at(0.3), Some(s.theme.bands[1]));
+        assert_eq!(c.color_at(0.9), Some(s.theme.bands[0]));
         assert_eq!(c.color_at(1.0), None);
         // A silent band draws nothing.
         assert_eq!(
@@ -304,12 +456,12 @@ mod tests {
     #[test]
     fn rgb_colour_follows_the_band_ratios() {
         let s = flat();
-        assert_eq!(rgb_color(e(200, 0, 0), &s), Rgb(255, 0, 0));
-        assert_eq!(rgb_color(e(0, 50, 0), &s), Rgb(0, 255, 0));
-        assert_eq!(rgb_color(e(0, 0, 255), &s), Rgb(0, 0, 255));
-        assert_eq!(rgb_color(e(100, 50, 0), &s), Rgb(255, 128, 0));
-        assert_eq!(rgb_color(e(90, 90, 90), &s), Rgb(255, 255, 255));
-        assert_eq!(rgb_color(e(0, 0, 0), &s), Rgb::BLACK);
+        assert_eq!(rgb_color_flat(e(200, 0, 0), &s), Rgb(255, 0, 0));
+        assert_eq!(rgb_color_flat(e(0, 50, 0), &s), Rgb(0, 255, 0));
+        assert_eq!(rgb_color_flat(e(0, 0, 255), &s), Rgb(0, 0, 255));
+        assert_eq!(rgb_color_flat(e(100, 50, 0), &s), Rgb(255, 128, 0));
+        assert_eq!(rgb_color_flat(e(90, 90, 90), &s), Rgb(255, 255, 255));
+        assert_eq!(rgb_color_flat(e(0, 0, 0), &s), Rgb::BLACK);
         // The height is the combined level, the colour only the ratio.
         let c = column(e(100, 50, 0), Mode::Rgb, Layout::Overlaid, &s);
         assert_eq!(
@@ -323,8 +475,119 @@ mod tests {
     fn played_part_is_dimmed() {
         let s = Style::default();
         let c = column(e(255, 255, 255), Mode::ThreeBand, Layout::Overlaid, &s).dimmed(0.5);
-        assert_eq!(c.segments()[2].color, Rgb(122, 117, 105));
+        assert_eq!(c.segments()[2].color, Rgb(123, 123, 121));
         assert_eq!(c.segments()[0].to, 1.0);
         assert_eq!(Rgb(200, 100, 0).over(Rgb(0, 0, 100), 0.25), Rgb(50, 25, 75));
+    }
+
+    #[test]
+    fn themes_are_plain_values() {
+        assert_eq!(Theme::by_name("default"), Some(Theme::DEFAULT));
+        assert_eq!(
+            Theme::by_name("findings").unwrap().bands[0],
+            Rgb::hex(0x4B4FC2)
+        );
+        assert_eq!(
+            Theme::by_name("spectrum").unwrap().rgb_weights,
+            [0.45, 1.0, 2.2]
+        );
+        assert_eq!(Theme::by_name("nope"), None);
+        // A theme only changes colours, never heights.
+        let e = e(200, 120, 90);
+        for mode in Mode::ALL {
+            let heights = |t: Theme| {
+                let s = Style {
+                    theme: t,
+                    ..Style::default()
+                };
+                let c = column(e, mode, Layout::Overlaid, &s);
+                c.segments().iter().map(|s| s.to).collect::<Vec<_>>()
+            };
+            assert_eq!(heights(Theme::DEFAULT), heights(Theme::SPECTRUM));
+        }
+        // Spectrum weights pull a bass-heavy entry away from pure red.
+        let bassy = Entry {
+            low: 220,
+            mid: 120,
+            high: 80,
+        };
+        let d = rgb_color(bassy, &Theme::DEFAULT);
+        let sp = rgb_color(bassy, &Theme::SPECTRUM);
+        assert!(sp.1 > d.1 && sp.2 > d.2, "{d:?} vs {sp:?}");
+    }
+
+    /// Entries of a synthetic track at `scale` (linear amplitude), on the stored curve.
+    fn track(scale: f32) -> Vec<Entry> {
+        (0..3000u32)
+            .map(|i| {
+                let beat = (i % 70) as f32 / 70.0;
+                let amp = |a: f32| crate::compute::encode_level(scale * a);
+                Entry {
+                    low: amp(0.9 * (1.0 - beat).powi(3) + 0.05),
+                    mid: amp(0.3 + 0.1 * ((i % 13) as f32 / 13.0)),
+                    high: amp(0.15 * (1.0 - (i % 35) as f32 / 35.0)),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn auto_gain_evens_out_levels() {
+        let loud = track(1.0);
+        let quiet = track(0.25); // −12 dB
+        let (gl, gq) = (auto_gain(&loud), auto_gain(&quiet));
+        assert!((gq / gl - 2.0).abs() < 0.05, "{gl} {gq}"); // √ curve: −12 dB halves values
+        for mode in Mode::ALL {
+            for (a, b) in loud.iter().zip(&quiet) {
+                let h = |e: Entry, g: f32| {
+                    let s = Style {
+                        track_gain: g,
+                        ..Style::default()
+                    };
+                    column(e, mode, Layout::Overlaid, &s)
+                        .segments()
+                        .iter()
+                        .map(|s| s.to)
+                        .collect::<Vec<_>>()
+                };
+                let (ha, hb) = (h(*a, gl), h(*b, gq));
+                assert_eq!(ha.len(), hb.len());
+                for (x, y) in ha.iter().zip(&hb) {
+                    assert!((x - y).abs() < 0.03, "{mode:?}: {x} vs {y}");
+                }
+            }
+        }
+        // The loud level lands at the target.
+        let s = Style {
+            track_gain: gl,
+            ..Style::default()
+        };
+        let mut combined: Vec<f32> = loud
+            .iter()
+            .map(|&e| column(e, Mode::Single, Layout::Overlaid, &s).segments()[0].to)
+            .collect();
+        combined.sort_by(f32::total_cmp);
+        let p95 = combined[combined.len() * 95 / 100];
+        assert!((p95 - AUTO_GAIN_TARGET).abs() < 0.02, "{p95}");
+    }
+
+    #[test]
+    fn auto_gain_is_clamped_and_safe() {
+        assert_eq!(auto_gain(&[]), 1.0);
+        assert_eq!(auto_gain(&[Entry::SILENT; 500]), 1.0);
+        assert_eq!(auto_gain(&track(0.001)), AUTO_GAIN_RANGE.1); // −60 dB
+        assert_eq!(
+            auto_gain(
+                &[Entry {
+                    low: 255,
+                    mid: 255,
+                    high: 255
+                }; 10]
+            ),
+            0.8
+        );
+        assert_eq!(TrackGain::Off.resolve(&track(0.01)), 1.0);
+        assert_eq!(TrackGain::Fixed(2.5).resolve(&track(1.0)), 2.5);
+        assert_eq!(TrackGain::Auto.resolve(&track(1.0)), auto_gain(&track(1.0)));
     }
 }
