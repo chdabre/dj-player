@@ -74,7 +74,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64
+      # The keylock shootout spike is left out: Bungee's CMake build is not set up for cross
+      # compiling. It is built and run natively on the Pi instead.
       - name: Build (release, all targets)
-        run: cargo build --workspace --all-targets --release --target aarch64-unknown-linux-gnu
+        run: cargo build --workspace --exclude keylock-shootout --all-targets --release --target aarch64-unknown-linux-gnu
       - name: Test engine-core and engine-media under qemu
         run: cargo test -p engine-core -p engine-media -p engine-stretch --target aarch64-unknown-linux-gnu

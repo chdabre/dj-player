@@ -1,0 +1,20 @@
+[package]
+name = "keylock-shootout"
+description = "Keylock spike: CPU, latency, alignment and listening renders for Signalsmith, Bungee and Rubber Band."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+engine-stretch.workspace = true
+engine-media.workspace = true
+hound.workspace = true
+bungee-rs = "0.1.1"
+rubberband-sys = "0.1.4"
+
+# Not the workspace lints: the Rubber Band FFI and the macOS malloc counter need `unsafe`.
+# It is denied everywhere else and allowed only in those two modules.
+[lints.rust]
+unsafe_code = "deny"

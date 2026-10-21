@@ -34,6 +34,20 @@ impl SignalsmithStretcher {
         Self::with_block(channels, (sr * 0.12) as usize, (sr * 0.03) as usize)
     }
 
+    /// Signalsmith's `presetCheaper`: 100 ms blocks, 40 ms interval, and split computation,
+    /// which spreads the work evenly at the cost of one more interval of output latency.
+    /// Allocates.
+    pub fn cheaper(channels: usize, sample_rate: u32) -> Self {
+        assert!(channels > 0, "need at least one channel");
+        let sr = f64::from(sample_rate);
+        Self {
+            inner: Stretch::preset_cheaper(channels as u32, sample_rate),
+            channels,
+            block: (sr * 0.1) as usize,
+            interval: (sr * 0.04) as usize,
+        }
+    }
+
     /// Explicit FFT block and interval, in frames. Allocates.
     pub fn with_block(channels: usize, block: usize, interval: usize) -> Self {
         assert!(channels > 0, "need at least one channel");
@@ -140,5 +154,11 @@ mod tests {
         assert_eq!(s.input_latency(), 2880);
         assert_eq!(s.output_latency(), 2880);
         assert_eq!(s.preroll_frames(), 5760 + 1440);
+        let c = SignalsmithStretcher::cheaper(2, SR);
+        assert_eq!(c.preroll_frames(), 4800 + 1920);
+        assert!(
+            c.output_latency() > c.input_latency(),
+            "split adds an interval"
+        );
     }
 }
