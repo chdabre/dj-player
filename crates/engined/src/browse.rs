@@ -16,7 +16,9 @@ use std::thread::JoinHandle;
 
 pub use engine_media::{Tags, tags as read_tags};
 
-use crate::persist::{LIBRARY_DIR, Listing, stored_path};
+use library::{EntryId, PlaylistId, PlaylistKind, TrackId};
+
+use crate::persist::{LIBRARY_DIR, Listing, Playlists, stored_path};
 
 /// File extensions the browser lists as tracks (lower case).
 pub const AUDIO_EXTENSIONS: &[&str] = &[
@@ -30,13 +32,18 @@ const HIDDEN_AT_ROOT: &[&str] = &[LIBRARY_DIR, "PIONEER", "System Volume Informa
 pub enum Kind {
     Folder,
     Track,
+    /// A playlist or a folder of playlists.
+    Playlist(PlaylistId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
+    /// The file (empty for a playlist entry whose track has no known file).
     pub path: PathBuf,
     pub kind: Kind,
+    /// In a playlist: the entry, for removing and moving it.
+    pub entry: Option<EntryId>,
 }
 
 /// The folders and tracks in `dir`: folders first, then tracks, each sorted by name without
@@ -62,7 +69,12 @@ pub fn list(dir: &Path, root: bool) -> std::io::Result<Vec<Entry>> {
         } else {
             continue;
         };
-        out.push(Entry { name, path, kind });
+        out.push(Entry {
+            name,
+            path,
+            kind,
+            entry: None,
+        });
     }
     out.sort_by(|a, b| {
         (a.kind == Kind::Track)
@@ -95,6 +107,7 @@ pub fn walk(root: &Path) -> Vec<PathBuf> {
                         sub.push((e.path, false));
                     }
                 }
+                Kind::Playlist(_) => {}
             }
         }
         dirs.extend(sub.into_iter().rev());
@@ -112,8 +125,10 @@ fn is_audio(path: &Path) -> bool {
 /// How tracks are ordered. Folders always come first, by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Sort {
-    /// By file name.
+    /// As the level lists them: a playlist in its own order, a folder by name.
     #[default]
+    Order,
+    /// By file name.
     Name,
     Title,
     Artist,
@@ -123,7 +138,8 @@ pub enum Sort {
 }
 
 impl Sort {
-    pub const ALL: [Sort; 6] = [
+    pub const ALL: [Sort; 7] = [
+        Sort::Order,
         Sort::Name,
         Sort::Title,
         Sort::Artist,
@@ -134,6 +150,7 @@ impl Sort {
 
     pub fn label(self) -> &'static str {
         match self {
+            Sort::Order => "#",
             Sort::Name => "NAME",
             Sort::Title => "TITLE",
             Sort::Artist => "ARTIST",
@@ -157,6 +174,8 @@ pub enum Source {
     Folders,
     /// Every track the library knows, in one list.
     Library,
+    /// The tag list on its own (the TAG LIST tab).
+    TagList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,11 +189,16 @@ pub enum LevelKind {
     /// The library's tracks under the folder `prefix` of their stored paths (`""` for the
     /// stick's root, else ending in `/`): its subfolders, then its tracks.
     LibraryFolder { prefix: String },
+    /// The playlists and folders in playlist folder `parent` (`None`: the top).
+    Playlists { parent: Option<PlaylistId> },
+    /// A playlist's (or the tag list's) tracks, in its order.
+    Playlist { id: PlaylistId },
     /// The tracks under the level below whose name or tags hold every word of `query`.
     Search { query: String },
 }
 
 /// The library menu's entries.
+const MENU_PLAYLISTS: &str = "PLAYLISTS";
 const MENU_FOLDERS: &str = "FOLDERS";
 const MENU_TRACKS: &str = "TRACKS";
 
@@ -274,6 +298,9 @@ pub struct Browser {
     /// Rows shown at once: the cursor is kept among them.
     rows: usize,
     listing: Option<Arc<Listing>>,
+    playlists: Option<Arc<Playlists>>,
+    /// The tracks on the tag list.
+    tagged: std::collections::HashSet<TrackId>,
     /// The tag generation the shown level was last ordered with, if it is up to date.
     ordered: Option<u64>,
 }
@@ -288,9 +315,11 @@ impl Browser {
             source: Source::Folders,
             levels: Vec::new(),
             tags: TagReader::start(),
-            sort: Sort::Name,
+            sort: Sort::Order,
             rows: rows.max(1),
             listing: None,
+            playlists: None,
+            tagged: Default::default(),
             ordered: None,
         };
         b.set_source(Source::Folders);
@@ -311,6 +340,13 @@ impl Browser {
         let level = match source {
             Source::Folders => Level::folder(self.root.clone(), true),
             Source::Library => self.library_level(),
+            Source::TagList => {
+                let kind = LevelKind::Playlist {
+                    id: PlaylistId::TAG_LIST,
+                };
+                let all = self.library_entries(&kind);
+                Level::new(kind, "TAG LIST".into(), self.root.clone(), all, None)
+            }
         };
         self.tags.want(&level.all);
         self.levels = vec![level];
@@ -334,6 +370,7 @@ impl Browser {
             name,
             path,
             kind: Kind::Track,
+            entry: None,
         }
     }
 
@@ -345,14 +382,47 @@ impl Browser {
             k
         };
         match kind {
-            LevelKind::LibraryMenu => [MENU_FOLDERS, MENU_TRACKS]
+            LevelKind::LibraryMenu => [MENU_PLAYLISTS, MENU_FOLDERS, MENU_TRACKS]
                 .into_iter()
                 .map(|name| Entry {
                     name: name.into(),
                     path: PathBuf::from(format!("library:{name}")),
                     kind: Kind::Folder,
+                    entry: None,
                 })
                 .collect(),
+            LevelKind::Playlists { parent } => self
+                .playlists
+                .iter()
+                .flat_map(|p| &p.lists)
+                .filter(|p| p.parent == *parent)
+                .map(|p| Entry {
+                    name: p.name.clone(),
+                    path: PathBuf::from(format!("playlist:{}", p.id)),
+                    kind: Kind::Playlist(p.id),
+                    entry: None,
+                })
+                .collect(),
+            LevelKind::Playlist { id } => {
+                let files = self.files_by_track();
+                self.playlists
+                    .iter()
+                    .flat_map(|p| p.entries.get(id))
+                    .flatten()
+                    .map(|e| match files.get(&e.track) {
+                        Some(p) => Entry {
+                            entry: Some(e.id),
+                            ..self.library_track(p)
+                        },
+                        None => Entry {
+                            name: "Missing track".into(),
+                            path: PathBuf::new(),
+                            kind: Kind::Track,
+                            entry: Some(e.id),
+                        },
+                    })
+                    .collect()
+            }
             LevelKind::LibraryTracks => keys().into_iter().map(|p| self.library_track(p)).collect(),
             LevelKind::LibraryFolder { prefix } => {
                 let mut folders = std::collections::BTreeSet::new();
@@ -374,6 +444,7 @@ impl Browser {
                         path: self.root.join(format!("{prefix}{name}")),
                         name,
                         kind: Kind::Folder,
+                        entry: None,
                     })
                     .collect();
                 v.extend(out);
@@ -395,8 +466,10 @@ impl Browser {
                         .unwrap_or_default(),
                     path,
                     kind: Kind::Track,
+                    entry: None,
                 })
                 .collect(),
+            LevelKind::Playlist { .. } => self.library_entries(&level.kind),
             LevelKind::LibraryFolder { prefix } => {
                 let mut k: Vec<&String> = self
                     .listing
@@ -407,7 +480,7 @@ impl Browser {
                 k.sort();
                 k.into_iter().map(|p| self.library_track(p)).collect()
             }
-            LevelKind::LibraryMenu | LevelKind::LibraryTracks => {
+            LevelKind::LibraryMenu | LevelKind::LibraryTracks | LevelKind::Playlists { .. } => {
                 self.library_entries(&LevelKind::LibraryTracks)
             }
             LevelKind::Search { .. } => level.all.clone(),
@@ -425,7 +498,40 @@ impl Browser {
             return;
         }
         self.listing = Some(listing);
-        if self.source == Source::Library {
+        self.rebuild();
+        self.ordered = None;
+    }
+
+    /// What the library's playlists are, as it last said.
+    pub fn set_playlists(&mut self, playlists: Arc<Playlists>) {
+        if self
+            .playlists
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(p, &playlists))
+        {
+            return;
+        }
+        self.tagged = playlists.tagged().collect();
+        self.playlists = Some(playlists);
+        self.rebuild();
+        self.ordered = None;
+    }
+
+    /// The library's files by track (a track's first location).
+    fn files_by_track(&self) -> HashMap<TrackId, &str> {
+        let mut out: HashMap<TrackId, &str> = HashMap::new();
+        for l in self.listing.iter().flat_map(|l| l.values()) {
+            let e = out.entry(l.track).or_insert(&l.path);
+            if l.path.as_str() < *e {
+                *e = &l.path;
+            }
+        }
+        out
+    }
+
+    /// Rebuild the library's levels from the listing and the playlists.
+    fn rebuild(&mut self) {
+        if self.source != Source::Folders {
             // Every library level (and a search over one) takes the new listing.
             for i in 0..self.levels.len() {
                 let all = match &self.levels[i].kind {
@@ -438,7 +544,6 @@ impl Browser {
             let all = self.level().all.clone();
             self.tags.want(&all);
         }
-        self.ordered = None;
     }
 
     /// Re-sort (and re-filter) the shown level if tags arrived since; call once per frame.
@@ -466,15 +571,31 @@ impl Browser {
             .map(|e| (e.clone(), self.info(&e.path)))
             .filter(|(e, info)| words.is_empty() || matches(&words, e, info.as_ref()))
             .collect();
-        keyed.sort_by(|(a, ia), (b, ib)| order(sort, a, ia.as_ref(), b, ib.as_ref()));
+        // Playlists (and their folders) keep their own order under `#`, and the library menu
+        // always does;
+        // anything else lists by name.
+        let fixed = match level.kind {
+            LevelKind::LibraryMenu => true,
+            LevelKind::Playlist { .. } | LevelKind::Playlists { .. } => sort == Sort::Order,
+            _ => false,
+        };
+        if !fixed {
+            keyed.sort_by(|(a, ia), (b, ib)| order(sort, a, ia.as_ref(), b, ib.as_ref()));
+        }
         let level = self.levels.last_mut().expect("checked above");
+        // By file and playlist entry: a list may hold the same track twice.
         let keep = level
             .selected()
             .filter(|_| level.touched)
-            .map(|e| e.path.clone());
+            .map(|e| (e.path.clone(), e.entry));
         level.entries = keyed.into_iter().map(|(e, _)| e).collect();
         level.cursor = keep
-            .and_then(|p| level.entries.iter().position(|e| e.path == p))
+            .and_then(|(p, entry)| {
+                level
+                    .entries
+                    .iter()
+                    .position(|e| e.path == p && e.entry == entry)
+            })
             .unwrap_or(0)
             .min(level.entries.len().saturating_sub(1));
         level.top = level.top.min(level.entries.len().saturating_sub(rows));
@@ -483,6 +604,18 @@ impl Browser {
 
     pub fn sort(&self) -> Sort {
         self.sort
+    }
+
+    /// The sort order's name for the shown level: `#` means the playlist's own order, and
+    /// reads as NAME where the level has none.
+    pub fn sort_label(&self) -> &'static str {
+        match (self.sort, &self.level().kind) {
+            (Sort::Order, LevelKind::Playlist { .. } | LevelKind::Playlists { .. }) => {
+                Sort::Order.label()
+            }
+            (Sort::Order, _) => Sort::Name.label(),
+            (s, _) => s.label(),
+        }
     }
 
     pub fn set_sort(&mut self, sort: Sort) {
@@ -566,9 +699,37 @@ impl Browser {
             return Entered::Nothing;
         };
         match e.kind {
+            Kind::Track if e.path.as_os_str().is_empty() => Entered::Nothing,
             Kind::Track => Entered::Track(e.path),
+            Kind::Playlist(id) => {
+                let folder = self
+                    .playlists
+                    .as_ref()
+                    .and_then(|p| p.get(id))
+                    .is_some_and(|p| p.kind == PlaylistKind::Folder);
+                let kind = if folder {
+                    LevelKind::Playlists { parent: Some(id) }
+                } else {
+                    LevelKind::Playlist { id }
+                };
+                let all = self.library_entries(&kind);
+                self.tags.want(&all);
+                self.levels.push(Level::new(
+                    kind,
+                    e.name.clone(),
+                    self.root.clone(),
+                    all,
+                    None,
+                ));
+                self.ordered = None;
+                self.refresh();
+                Entered::Folder
+            }
             Kind::Folder => {
                 let kind = match &self.level().kind {
+                    LevelKind::LibraryMenu if e.name == MENU_PLAYLISTS => {
+                        Some(LevelKind::Playlists { parent: None })
+                    }
                     LevelKind::LibraryMenu if e.name == MENU_FOLDERS => {
                         Some(LevelKind::LibraryFolder {
                             prefix: String::new(),
@@ -659,6 +820,52 @@ impl Browser {
         }
     }
 
+    /// The library's track for `path`, if it has one.
+    pub fn track_of(&self, path: &Path) -> Option<TrackId> {
+        self.listed(path).map(|l| l.track)
+    }
+
+    /// `path`'s track is on the tag list.
+    pub fn is_tagged(&self, path: &Path) -> bool {
+        self.track_of(path)
+            .is_some_and(|t| self.tagged.contains(&t))
+    }
+
+    /// The tag list's entries of `path`'s track (to remove it).
+    pub fn tag_entries(&self, path: &Path) -> Vec<EntryId> {
+        let Some(t) = self.track_of(path) else {
+            return Vec::new();
+        };
+        self.playlists
+            .iter()
+            .flat_map(|p| p.entries.get(&PlaylistId::TAG_LIST))
+            .flatten()
+            .filter(|e| e.track == t)
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// The playlists, as the library last said.
+    pub fn playlists(&self) -> Option<&Arc<Playlists>> {
+        self.playlists.as_ref()
+    }
+
+    /// The playlist shown (a list or the tag list), if the level is one.
+    pub fn shown_playlist(&self) -> Option<PlaylistId> {
+        match self.level().kind {
+            LevelKind::Playlist { id } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The playlist folder shown (`Some(None)`: the top of PLAYLISTS), if the level is one.
+    pub fn shown_playlist_folder(&self) -> Option<Option<PlaylistId>> {
+        match self.level().kind {
+            LevelKind::Playlists { parent } => Some(parent),
+            _ => None,
+        }
+    }
+
     /// What is known of `path`: the library's tag cache and the file's own tags, the
     /// library's BPM and key first (they are ours once analysed). `None` until either is
     /// known.
@@ -743,7 +950,7 @@ fn order(
             .then_with(|| a.name.cmp(&b.name))
     };
     let folders = (a.kind == Kind::Track).cmp(&(b.kind == Kind::Track));
-    if folders != Ordering::Equal || a.kind == Kind::Folder {
+    if folders != Ordering::Equal || a.kind != Kind::Track {
         return folders.then_with(by_name);
     }
     // Some before None, so the unknown come last.
@@ -763,7 +970,7 @@ fn order(
     };
     let num = |t: Option<&Tags>, f: fn(&Tags) -> Option<f64>| t.and_then(f);
     let ord = match sort {
-        Sort::Name => Ordering::Equal,
+        Sort::Order | Sort::Name => Ordering::Equal,
         Sort::Title => title(ia, a).cmp(&title(ib, b)),
         Sort::Artist => known(text(ia, |t| &t.artist), text(ib, |t| &t.artist), |x, y| {
             x.cmp(&y)
@@ -1131,7 +1338,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(b.large_art(&d.join("a.mp3")).unwrap().is_none());
-        assert_eq!(Sort::Length.next(), Sort::Name);
+        assert_eq!(Sort::Length.next(), Sort::Order);
     }
 
     #[test]
@@ -1171,9 +1378,10 @@ mod tests {
         ]));
         b.set_source(Source::Library);
         assert_eq!(b.level().kind, LevelKind::LibraryMenu);
-        assert_eq!(names(&b), ["FOLDERS", "TRACKS"]);
+        assert_eq!(names(&b), ["PLAYLISTS", "FOLDERS", "TRACKS"]);
 
         // FOLDERS: the stick's structure, from the stored paths.
+        b.select(1);
         assert_eq!(b.enter(), Entered::Folder);
         assert_eq!(names(&b), ["UKG", "b.mp3"]);
         assert_eq!(b.trail(), ["FOLDERS"]);
@@ -1189,7 +1397,7 @@ mod tests {
         assert!(b.back() && b.back());
 
         // TRACKS: one flat list.
-        b.select(1);
+        b.select(2);
         assert_eq!(b.enter(), Entered::Folder);
         assert_eq!(b.level().kind, LevelKind::LibraryTracks);
         assert_eq!(names(&b), ["a.mp3", "b.mp3", "c.mp3"]);
@@ -1216,6 +1424,99 @@ mod tests {
         assert_eq!(b.level().selected().unwrap().name, "b.mp3");
         b.set_source(Source::Folders);
         assert_eq!(b.level().kind, LevelKind::Folder);
+    }
+
+    #[test]
+    fn playlists_list_in_their_own_order_and_the_tag_list_marks_tracks() {
+        use library::{Playlist, PlaylistEntry};
+        let d = temp_dir("lists");
+        for f in ["a.mp3", "b.mp3", "c.mp3"] {
+            touch(&d.join(f));
+        }
+        let mut b = Browser::new(d.clone(), 7);
+        let listing = listing(&[
+            ("a.mp3", "A", "x", 1.0),
+            ("b.mp3", "B", "y", 2.0),
+            ("c.mp3", "C", "z", 3.0),
+        ]);
+        // Each listed track needs its own id here.
+        let mut l = (*listing).clone();
+        for (i, v) in l.values_mut().enumerate() {
+            v.track = TrackId([i as u8 + 1; 16]);
+        }
+        let id_of = |name: &str| l[name].track;
+        let (ta, tb, tc) = (id_of("a.mp3"), id_of("b.mp3"), id_of("c.mp3"));
+        b.set_listing(Arc::new(l.clone()));
+        let crate_ = PlaylistId::random();
+        let set = PlaylistId::random();
+        let pl = |id, parent, kind, name: &str, position: &str, entries| Playlist {
+            id,
+            parent,
+            kind,
+            name: name.into(),
+            position: position.into(),
+            entries,
+        };
+        let entry = |t: TrackId, p: &str| PlaylistEntry {
+            id: EntryId::random(),
+            track: t,
+            position: p.into(),
+        };
+        let gone = TrackId([99; 16]);
+        b.set_playlists(Arc::new(Playlists {
+            lists: vec![
+                pl(
+                    PlaylistId::TAG_LIST,
+                    None,
+                    PlaylistKind::Tag,
+                    "TAG LIST",
+                    "0i",
+                    1,
+                ),
+                pl(crate_, None, PlaylistKind::Folder, "Saturday", "i", 0),
+                pl(set, Some(crate_), PlaylistKind::List, "Peak", "i", 4),
+            ],
+            entries: [
+                (PlaylistId::TAG_LIST, vec![entry(tb, "i")]),
+                (
+                    set,
+                    vec![
+                        entry(tc, "i"),
+                        entry(ta, "j"),
+                        entry(gone, "k"),
+                        entry(tc, "l"),
+                    ],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }));
+        b.set_source(Source::Library);
+        assert_eq!(b.enter(), Entered::Folder, "PLAYLISTS");
+        assert_eq!(b.shown_playlist_folder(), Some(None));
+        assert_eq!(names(&b), ["TAG LIST", "Saturday"]);
+        b.select(1);
+        b.enter();
+        assert_eq!(names(&b), ["Peak"]);
+        b.enter();
+        assert_eq!(b.shown_playlist(), Some(set));
+        assert_eq!(b.sort_label(), "#");
+        assert_eq!(
+            names(&b),
+            ["c.mp3", "a.mp3", "Missing track", "c.mp3"],
+            "the playlist's order, a missing track kept, a track twice"
+        );
+        assert!(b.level().entries.iter().all(|e| e.entry.is_some()));
+        b.select(2);
+        assert_eq!(b.enter(), Entered::Nothing, "a missing track can't load");
+        b.set_sort(Sort::Name);
+        assert_eq!(names(&b)[0], "a.mp3");
+        b.set_sort(Sort::Order);
+        assert!(b.is_tagged(&d.join("b.mp3")) && !b.is_tagged(&d.join("a.mp3")));
+        assert_eq!(b.tag_entries(&d.join("b.mp3")).len(), 1);
+        b.set_source(Source::TagList);
+        assert_eq!(b.shown_playlist(), Some(PlaylistId::TAG_LIST));
+        assert_eq!(names(&b), ["b.mp3"]);
     }
 
     #[test]

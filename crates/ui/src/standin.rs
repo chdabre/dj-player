@@ -156,12 +156,19 @@ enum Held {
         angle: f32,
         base: f64,
     },
+    /// TAG TRACK, held this long (seconds): a long press removes.
+    Tag {
+        held: f64,
+    },
     /// The browse knob, grabbed at `y`; `turned` once a drag stepped it.
     Knob {
         y: f32,
         turned: bool,
     },
 }
+
+/// TAG TRACK held this long removes the track from the tag list.
+const TAG_HOLD_S: f64 = 0.6;
 
 /// Vertical drag on the knob per step.
 const KNOB_STEP: f32 = 18.0;
@@ -353,11 +360,10 @@ impl Standin {
             }
             Control::Browse => Held::Knob { y, turned: false },
             // Present but not wired yet: no time mode, tags or shortcuts.
-            Control::TimeMode
-            | Control::TrackNext
-            | Control::TagTrack
-            | Control::F1
-            | Control::F2 => Held::Button(control),
+            Control::TagTrack => Held::Tag { held: 0.0 },
+            Control::TimeMode | Control::TrackNext | Control::F1 | Control::F2 => {
+                Held::Button(control)
+            }
         };
         self.held = Some(held);
         out
@@ -411,6 +417,14 @@ impl Standin {
                 self.nav.push(Nav::Push);
                 Vec::new()
             }
+            Some(Held::Tag { held }) => {
+                self.nav.push(if held >= TAG_HOLD_S {
+                    Nav::Untag
+                } else {
+                    Nav::Tag
+                });
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -419,6 +433,9 @@ impl Standin {
     /// the jog's speed and relaxes when it stops.
     pub fn tick(&mut self, dt: f64) -> Vec<DeckCommand> {
         let dt = dt.clamp(0.0, 0.1);
+        if let Some(Held::Tag { held }) = &mut self.held {
+            *held += dt;
+        }
         match self.held {
             Some(Held::Search(dir)) => {
                 vec![DeckCommand::ScratchBy(
@@ -451,6 +468,7 @@ impl Standin {
             Some(Held::Fader) => control == Control::Fader,
             Some(Held::Scratch { .. } | Held::Bend { .. }) => control == Control::Jog,
             Some(Held::Knob { .. }) => control == Control::Browse,
+            Some(Held::Tag { .. }) => control == Control::TagTrack,
             None => false,
         }
     }
@@ -592,6 +610,7 @@ impl Standin {
             self.is_down(Control::TagTrack),
         );
         d.key("esc", 1290.0, 88.0);
+        d.key("x  ⇧x", 1396.0, 88.0);
         d.scene
             .rounded(1312.0, 110.0, 152.0, 186.0, 14.0, BUTTON_BOTTOM, 1.0, EDGE);
         d.label("▲", 1388.0, 116.0, SUB, 12.0, Align::Center);
@@ -1011,6 +1030,21 @@ mod tests {
             s.take_nav(),
             [Nav::Up, Nav::Down, Nav::Up, Nav::Up, Nav::Back]
         );
+    }
+
+    #[test]
+    fn tag_track_tags_and_a_long_press_removes() {
+        let mut s = shell();
+        let v = ShellView::default();
+        s.press(1440.0, 60.0, false, &v);
+        s.tick(0.1);
+        s.release();
+        s.press(1440.0, 60.0, false, &v);
+        for _ in 0..8 {
+            s.tick(0.1);
+        }
+        s.release();
+        assert_eq!(s.take_nav(), [Nav::Tag, Nav::Untag]);
     }
 
     #[test]

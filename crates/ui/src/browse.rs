@@ -51,71 +51,135 @@ pub enum Nav {
     /// The knob pushed: open the browser, or load / open the selection.
     Push,
     Back,
+    /// TAG TRACK: onto the tag list; a long press takes it off.
+    Tag,
+    Untag,
 }
 
 /// The on-screen keyboard's special keys, as characters.
 pub const BACKSPACE: char = '\u{8}';
 pub const CLEAR: char = '\u{18}';
 pub const DONE: char = '\n';
+pub const SHIFT: char = '\u{f}';
 
-/// The on-screen keyboard: rows of (label, character, width in key units); 11 units a row.
-pub const KEYS: [&[(&str, char, u8)]; 4] = [
+/// The on-screen keyboard's shift: off, for the next letter, or locked (tap again to cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shift {
+    #[default]
+    Off,
+    Once,
+    Lock,
+}
+
+impl Shift {
+    /// The next state on a tap of SHIFT.
+    pub fn tap(self) -> Shift {
+        match self {
+            Shift::Off => Shift::Once,
+            Shift::Once => Shift::Lock,
+            Shift::Lock => Shift::Off,
+        }
+    }
+
+    /// `c` as typed with this shift, and the shift after it (a letter uses up `Once`).
+    pub fn apply(self, c: char) -> (char, Shift) {
+        if self == Shift::Off || !c.is_alphabetic() {
+            return (c, self);
+        }
+        let up = c.to_uppercase().next().unwrap_or(c);
+        (
+            up,
+            if self == Shift::Once {
+                Shift::Off
+            } else {
+                self
+            },
+        )
+    }
+}
+
+/// No key: a gap in a row (the stagger of a real keyboard).
+const GAP: char = '\0';
+
+/// The on-screen keyboard, laid out as a computer's: rows of (label, character, width in
+/// key units), 11 units a row. Digits with backspace on top, the letter rows staggered,
+/// SHIFT bottom left, and a bottom row of CLEAR, the space bar and DONE (as on a phone).
+pub const KEYS: [&[(&str, char, f32)]; 5] = [
     &[
-        ("1", '1', 1),
-        ("2", '2', 1),
-        ("3", '3', 1),
-        ("4", '4', 1),
-        ("5", '5', 1),
-        ("6", '6', 1),
-        ("7", '7', 1),
-        ("8", '8', 1),
-        ("9", '9', 1),
-        ("0", '0', 1),
-        ("⌫", BACKSPACE, 1),
+        ("1", '1', 1.0),
+        ("2", '2', 1.0),
+        ("3", '3', 1.0),
+        ("4", '4', 1.0),
+        ("5", '5', 1.0),
+        ("6", '6', 1.0),
+        ("7", '7', 1.0),
+        ("8", '8', 1.0),
+        ("9", '9', 1.0),
+        ("0", '0', 1.0),
+        ("⌫", BACKSPACE, 1.0),
     ],
     &[
-        ("Q", 'q', 1),
-        ("W", 'w', 1),
-        ("E", 'e', 1),
-        ("R", 'r', 1),
-        ("T", 't', 1),
-        ("Y", 'y', 1),
-        ("U", 'u', 1),
-        ("I", 'i', 1),
-        ("O", 'o', 1),
-        ("P", 'p', 1),
-        ("CLEAR", CLEAR, 1),
+        ("", GAP, 0.5),
+        ("Q", 'q', 1.0),
+        ("W", 'w', 1.0),
+        ("E", 'e', 1.0),
+        ("R", 'r', 1.0),
+        ("T", 't', 1.0),
+        ("Y", 'y', 1.0),
+        ("U", 'u', 1.0),
+        ("I", 'i', 1.0),
+        ("O", 'o', 1.0),
+        ("P", 'p', 1.0),
+        ("", GAP, 0.5),
     ],
     &[
-        ("A", 'a', 1),
-        ("S", 's', 1),
-        ("D", 'd', 1),
-        ("F", 'f', 1),
-        ("G", 'g', 1),
-        ("H", 'h', 1),
-        ("J", 'j', 1),
-        ("K", 'k', 1),
-        ("L", 'l', 1),
-        ("DONE", DONE, 2),
+        ("", GAP, 1.0),
+        ("A", 'a', 1.0),
+        ("S", 's', 1.0),
+        ("D", 'd', 1.0),
+        ("F", 'f', 1.0),
+        ("G", 'g', 1.0),
+        ("H", 'h', 1.0),
+        ("J", 'j', 1.0),
+        ("K", 'k', 1.0),
+        ("L", 'l', 1.0),
+        ("", GAP, 1.0),
     ],
     &[
-        ("Z", 'z', 1),
-        ("X", 'x', 1),
-        ("C", 'c', 1),
-        ("V", 'v', 1),
-        ("B", 'b', 1),
-        ("N", 'n', 1),
-        ("M", 'm', 1),
-        ("SPACE", ' ', 4),
+        ("SHIFT", SHIFT, 1.0),
+        ("Z", 'z', 1.0),
+        ("X", 'x', 1.0),
+        ("C", 'c', 1.0),
+        ("V", 'v', 1.0),
+        ("B", 'b', 1.0),
+        ("N", 'n', 1.0),
+        ("M", 'm', 1.0),
+        ("-", '-', 1.0),
+        (".", '.', 1.0),
+        ("'", '\'', 1.0),
+    ],
+    &[
+        ("CLEAR", CLEAR, 2.0),
+        ("&", '&', 1.0),
+        ("SPACE", ' ', 6.0),
+        ("DONE", DONE, 2.0),
     ],
 ];
 
+/// Every key, in order, without the gaps.
+fn keys() -> impl Iterator<Item = &'static (&'static str, char, f32)> {
+    KEYS.iter().flat_map(|r| r.iter()).filter(|k| k.1 != GAP)
+}
+
+/// How many keys the keyboard has.
+#[cfg(test)]
+pub fn key_count() -> usize {
+    keys().count()
+}
+
 /// The character of keyboard key `i` (counted across the rows).
 pub fn key_char(i: u8) -> Option<char> {
-    KEYS.iter()
-        .flat_map(|r| r.iter())
-        .nth(usize::from(i))
-        .map(|k| k.1)
+    keys().nth(usize::from(i)).map(|k| k.1)
 }
 
 /// What a row is.
@@ -123,6 +187,8 @@ pub fn key_char(i: u8) -> Option<char> {
 pub enum RowKind {
     Folder,
     Track,
+    /// A playlist (or the tag list).
+    List,
 }
 
 /// One shown row.
@@ -136,7 +202,24 @@ pub struct Row {
     /// The track on the deck.
     pub loaded: bool,
     pub art: Option<Arc<Thumb>>,
+    /// On the tag list.
+    pub tagged: bool,
+    /// A playlist entry whose file isn't known: shown dimmed, can't load.
+    pub missing: bool,
 }
+
+/// A list modal over the browse list (MENU, ADD TO PLAYLIST, a confirmation).
+#[derive(Debug, Clone, Default)]
+pub struct ModalView {
+    pub title: String,
+    pub rows: Vec<String>,
+    pub selected: usize,
+    /// The first row: a confirmation, its YES drawn as a destructive action.
+    pub danger_first: bool,
+}
+
+/// Rows a modal shows at once.
+pub const MODAL_ROWS: usize = 5;
 
 /// The info panel: what is known of the selected track, in place of the list.
 #[derive(Debug, Clone, Default)]
@@ -170,6 +253,8 @@ pub struct BrowseView {
     /// Searching; the keyboard is up.
     pub searching: bool,
     pub keyboard: bool,
+    /// The keyboard's shift: letters show (and type) in capitals while it is on.
+    pub shift: Shift,
     /// A scan under way: files done, total.
     pub scan: Option<(usize, usize)>,
     /// The library can be scanned (offered in LIBRARY).
@@ -196,6 +281,12 @@ pub struct BrowseView {
     pub info: Option<InfoView>,
     /// INFO in the browser: the selected track's details beside the list.
     pub side: Option<InfoView>,
+    /// The tag list is shown (the TAG LIST tab lit).
+    pub tag_list: bool,
+    /// A modal over the list.
+    pub modal: Option<ModalView>,
+    /// Shown in the header instead of `header` (naming, moving).
+    pub header_override: Option<String>,
 }
 
 pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut OverviewCache) {
@@ -204,8 +295,11 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
     ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
     ui.section(106.0, 2.0, 915.0, 64.0);
     ui.section(106.0, 66.0, 915.0, 325.0);
+    // The tag list belongs to no source on the rail.
     let lit = if b.library {
         Target::Library
+    } else if b.tag_list {
+        Target::TagList
     } else {
         Target::Usb
     };
@@ -216,16 +310,26 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
             info_panel(ui, info);
         }
         None => {
-            tabs(ui, Some(Target::Browse));
+            tabs(
+                ui,
+                Some(if b.tag_list {
+                    Target::TagList
+                } else {
+                    Target::Browse
+                }),
+            );
             header(ui, b);
             list(ui, b);
             if let Some(side) = &b.side {
                 side_panel(ui, side);
             }
+            if let Some(m) = &b.modal {
+                modal(ui, m);
+            }
         }
     }
     if b.keyboard {
-        keyboard(ui);
+        keyboard(ui, b.shift);
     } else {
         ui.section(106.0, 395.0, 915.0, 99.0);
         ui.section(106.0, 498.0, 915.0, 99.0);
@@ -312,10 +416,10 @@ fn header(ui: &mut Ui, b: &BrowseView) {
         );
         chips_left = SORT_CHIP.0 - 150.0;
     }
-    let label = if b.at_root {
-        b.header.clone()
-    } else {
-        format!("‹  {}", b.header)
+    let label = match &b.header_override {
+        Some(h) => h.clone(),
+        None if b.at_root => b.header.clone(),
+        None => format!("‹  {}", b.header),
     };
     ui.scene.text(crate::scene::Text {
         text: label,
@@ -372,7 +476,11 @@ fn list(ui: &mut Ui, b: &BrowseView) {
         );
     }
     // Text and pictures draw above every rectangle, so under the question the rows go.
-    let shown = if b.ask_scan { 0 } else { ROWS };
+    let shown = if b.ask_scan || b.modal.is_some() {
+        0
+    } else {
+        ROWS
+    };
     for (i, row) in b.rows.iter().enumerate().take(shown) {
         let y = LIST_Y + i as f32 * ROW_H;
         let selected = b.selected == Some(i);
@@ -394,11 +502,27 @@ fn list(ui: &mut Ui, b: &BrowseView) {
             Weight::Regular
         };
         let text_y = y + (ROW_H - t.font.row * t.font.line_height) * 0.5;
-        let title_color = if row.loaded {
+        let title_color = if row.missing {
+            t.color.dim
+        } else if row.loaded {
             t.color.accent_text
         } else {
             t.color.text
         };
+        if row.tagged {
+            // The tag mark, in the title's left padding.
+            let d = 6.0;
+            ui.scene.rounded(
+                TITLE_X + 2.0,
+                y + (ROW_H - d) * 0.5,
+                d,
+                d,
+                d * 0.5,
+                t.color.cue,
+                0.0,
+                t.color.cue,
+            );
+        }
         cell(
             ui,
             &row.title,
@@ -491,6 +615,22 @@ fn jacket(ui: &mut Ui, row: &Row, y: f32) {
             t.shape.border,
             t.color.chip_edge,
         ),
+        (RowKind::List, _) => {
+            // Three lines: a list.
+            let (lx, lw) = (x - 2.0, side + 4.0);
+            for k in 0..3 {
+                ui.scene.rounded(
+                    lx,
+                    top + 7.0 + k as f32 * 8.0,
+                    lw,
+                    4.0,
+                    2.0,
+                    t.color.folder,
+                    0.0,
+                    t.color.folder,
+                );
+            }
+        }
         (RowKind::Folder, _) => {
             // A tab and a body.
             let (fx, fy, fw, fh) = (x - 3.0, top + 8.0, side + 6.0, side - 14.0);
@@ -533,28 +673,47 @@ fn scroll_bar(ui: &mut Ui, b: &BrowseView, list_h: f32) {
 }
 
 /// The search keyboard, over the status band and the bottom strip.
-fn keyboard(ui: &mut Ui) {
+fn keyboard(ui: &mut Ui, shift: Shift) {
     let t = ui.t;
     let (x0, y0, w, h) = KEYBOARD;
     ui.section(x0, y0, w, h);
-    let gap = 6.0;
+    let gap = 3.0;
     let (inner_x, inner_w) = (x0 + 7.0, w - 14.0);
-    let unit = (inner_w - 10.0 * gap) / 11.0;
-    let row_h = (h - 2.0 * gap - 3.0 * gap) / 4.0;
+    // A key of `u` units is `u * unit - gap` wide, so a row of 11 units fills the width.
+    let unit = (inner_w + gap) / 11.0;
+    let rows = KEYS.len() as f32;
+    let row_h = (h - 2.0 * gap - (rows - 1.0) * gap) / rows;
     let mut index = 0u8;
     for (r, keys) in KEYS.iter().enumerate() {
         let y = y0 + gap + r as f32 * (row_h + gap);
-        let mut x = inner_x;
+        let mut u = 0.0;
         for &(label, ch, units) in keys.iter() {
-            let kw = unit * f32::from(units) + gap * f32::from(units - 1);
-            let on = ch == DONE;
+            let x = inner_x + u * unit;
+            u += units;
+            if ch == GAP {
+                continue;
+            }
+            let kw = units * unit - gap;
+            let on = ch == DONE || (ch == SHIFT && shift != Shift::Off);
+            // Letters show the case they type.
+            let shown = match (ch, shift) {
+                (SHIFT, Shift::Lock) => "CAPS".to_string(),
+                (c, Shift::Off) if c.is_alphabetic() => label.to_lowercase(),
+                _ => label.to_string(),
+            };
             let size = if label.chars().count() > 1 {
                 t.font.small
             } else {
                 t.font.button
             };
-            ui.button_sized(Target::Key(index), (x, y, kw, row_h), label, None, on, size);
-            x += kw + gap;
+            ui.button_sized(
+                Target::Key(index),
+                (x, y, kw, row_h),
+                &shown,
+                None,
+                on,
+                size,
+            );
             index += 1;
         }
     }
@@ -943,6 +1102,92 @@ fn wrap(text: &str, width: f32, size: f32, max: usize) -> Vec<String> {
     lines
 }
 
+/// A list modal over the list (MENU, ADD TO PLAYLIST, a confirmation): a panel with its
+/// title and up to [`MODAL_ROWS`] rows, scrolled to keep the cursor in view.
+fn modal(ui: &mut Ui, m: &ModalView) {
+    let t = ui.t;
+    // Five rows fit between the header and the list's bottom edge (y 386).
+    let (x, y, w) = (263.0, 108.0, 603.0);
+    let (row_h, top) = (40.0, 46.0);
+    let shown = m.rows.len().min(MODAL_ROWS);
+    let h = top + shown as f32 * (row_h + 4.0) + 6.0;
+    ui.scene.rounded(
+        x,
+        y,
+        w,
+        h,
+        t.shape.section_radius,
+        t.color.title_bar,
+        t.shape.border_active,
+        t.color.accent,
+    );
+    ui.scene.text(crate::scene::Text {
+        text: m.title.clone(),
+        x: x + 20.0,
+        y: y + 10.0,
+        size: t.font.row,
+        line_height: t.font.line_height,
+        weight: Weight::SemiBold,
+        color: t.color.text,
+        align: Align::Left,
+        max_width: Some(w - 40.0),
+    });
+    let first = m
+        .selected
+        .saturating_sub(MODAL_ROWS - 1)
+        .min(m.rows.len().saturating_sub(shown));
+    for (k, label) in m.rows.iter().enumerate().skip(first).take(shown) {
+        let ry = y + top + (k - first) as f32 * (row_h + 4.0);
+        let rect = (x + 16.0, ry, w - 32.0, row_h);
+        let danger = m.danger_first && k == 0;
+        if danger {
+            let (fill, edge) = if m.selected == k {
+                (t.color.danger_fill, t.color.danger)
+            } else {
+                (t.color.button, t.color.danger)
+            };
+            ui.scene.rounded(
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                t.shape.button_radius,
+                fill,
+                t.shape.border,
+                edge,
+            );
+            ui.text(
+                label.clone(),
+                rect.0 + rect.2 * 0.5,
+                ry + (row_h - t.font.button * t.font.line_height) * 0.5,
+                t.font.button,
+                Weight::SemiBold,
+                t.color.danger_text,
+                Align::Center,
+            );
+            ui.hit(Target::ModalRow(k as u16), rect);
+        } else {
+            ui.button(
+                Target::ModalRow(k as u16),
+                rect,
+                label,
+                None,
+                m.selected == k,
+            );
+        }
+    }
+    if m.rows.len() > shown {
+        // Where the rows are, at the right edge.
+        let list_h = shown as f32 * (row_h + 4.0) - 4.0;
+        let thumb = list_h * shown as f32 / m.rows.len() as f32;
+        let max_first = (m.rows.len() - shown) as f32;
+        let ty = y + top + (list_h - thumb) * (first as f32 / max_first);
+        ui.scene
+            .fill(x + w - 10.0, y + top, 2.0, list_h, t.color.row_rule);
+        ui.scene.fill(x + w - 10.0, ty, 2.0, thumb, t.color.label);
+    }
+}
+
 /// "Scan this stick?": over the list, until answered.
 fn ask_scan(ui: &mut Ui) {
     let t = ui.t;
@@ -1014,14 +1259,35 @@ mod tests {
     #[test]
     fn keyboard_rows_are_eleven_units_and_keys_map_to_characters() {
         for row in KEYS {
-            assert_eq!(row.iter().map(|k| u32::from(k.2)).sum::<u32>(), 11);
+            let units: f32 = row.iter().map(|k| k.2).sum();
+            assert!((units - 11.0).abs() < 1e-6, "{units}");
         }
         assert_eq!(key_char(0), Some('1'));
         assert_eq!(key_char(10), Some(BACKSPACE));
-        assert_eq!(key_char(11), Some('q'));
-        let n: usize = KEYS.iter().map(|r| r.len()).sum();
-        assert_eq!(key_char(n as u8 - 1), Some(' '));
+        assert_eq!(key_char(11), Some('q'), "the row's gap is no key");
+        assert_eq!(key_char(20), Some('p'));
+        assert_eq!(key_char(30), Some(SHIFT));
+        let n = key_count();
+        assert_eq!(key_char(n as u8 - 1), Some(DONE), "DONE bottom right");
         assert_eq!(key_char(n as u8), None);
+        assert!(keys().any(|k| k.1 == ' ' && k.2 >= 5.0), "a wide space bar");
+    }
+
+    #[test]
+    fn shift_capitalises_one_letter_or_locks() {
+        let s = Shift::Off.tap();
+        assert_eq!(s, Shift::Once);
+        let (c, s) = s.apply('p');
+        assert_eq!((c, s), ('P', Shift::Off), "once: one letter");
+        assert_eq!(
+            Shift::Once.apply('1'),
+            ('1', Shift::Once),
+            "digits don't use it up"
+        );
+        let lock = Shift::Once.tap();
+        assert_eq!(lock.apply('e'), ('E', Shift::Lock));
+        assert_eq!(lock.tap(), Shift::Off);
+        assert_eq!(Shift::Off.apply('k'), ('k', Shift::Off));
     }
 
     #[test]

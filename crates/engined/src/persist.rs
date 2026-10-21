@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use library::{
     AnalysisRef, AudioHash, ContentHasher, DeviceId, Edit, FileHash, FileIdentity, Library, Listed,
-    MountOptions, Persistence, Track, TrackRef, TrackTags, WaveformRef,
+    MountOptions, Persistence, Playlist, PlaylistEntry, PlaylistId, Track, TrackRef, TrackTags,
+    WaveformRef,
 };
 use waveform::compute::Waveform;
 
@@ -54,6 +55,30 @@ pub struct Loaded {
 /// The library's tracks by path (relative to the stick's root, as stored).
 pub type Listing = HashMap<String, Listed>;
 
+/// The playlists of a library, as the browser shows them.
+#[derive(Debug, Clone, Default)]
+pub struct Playlists {
+    /// The tag list first, then the tree depth first (see [`library::Library::playlists`]).
+    pub lists: Vec<Playlist>,
+    /// Each list's entries, in order.
+    pub entries: HashMap<PlaylistId, Vec<PlaylistEntry>>,
+}
+
+impl Playlists {
+    pub fn get(&self, id: PlaylistId) -> Option<&Playlist> {
+        self.lists.iter().find(|p| p.id == id)
+    }
+
+    /// The tracks on the tag list.
+    pub fn tagged(&self) -> impl Iterator<Item = library::TrackId> + '_ {
+        self.entries
+            .get(&PlaylistId::TAG_LIST)
+            .into_iter()
+            .flatten()
+            .map(|e| e.track)
+    }
+}
+
 /// What the batch job computed for one file, to store with its record (made if missing).
 #[derive(Debug, Clone)]
 pub struct BatchResult {
@@ -80,6 +105,18 @@ enum Request {
         file: PathBuf,
     },
     Store(Box<BatchResult>),
+    /// Files into a playlist, in order, records made where missing.
+    AddFiles {
+        playlist: PlaylistId,
+        files: Vec<PathBuf>,
+    },
+    /// A new list made of files (MAKE PLAYLIST on a folder).
+    NewPlaylist {
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        name: String,
+        files: Vec<PathBuf>,
+    },
     Scan,
     Analysed {
         bpm: Option<f64>,
@@ -108,6 +145,8 @@ pub enum Reply {
     Listing(Arc<Listing>),
     /// A scan's progress, files done of `total`.
     Scan { done: usize, total: usize },
+    /// The playlists and their entries: after the mount and after every playlist change.
+    Playlists(Arc<Playlists>),
 }
 
 /// The library worker: one mounted library, and the track the deck has loaded in it.
@@ -182,6 +221,29 @@ impl LibraryWorker {
     /// between other requests, reported as [`Reply::Scan`].
     pub fn scan(&self) {
         self.send(Request::Scan);
+    }
+
+    /// Add `files` at the end of `playlist`, in order, between other requests (a folder of
+    /// hundreds of files doesn't hold up a load); files without a record get one. Playlist
+    /// edits go through [`LibraryWorker::edit`]; the playlists are published after either.
+    pub fn add_files(&self, playlist: PlaylistId, files: Vec<PathBuf>) {
+        self.send(Request::AddFiles { playlist, files });
+    }
+
+    /// MAKE PLAYLIST: a new list `id` at the end of folder `parent`, of `files` in order.
+    pub fn new_playlist(
+        &self,
+        id: PlaylistId,
+        parent: Option<PlaylistId>,
+        name: String,
+        files: Vec<PathBuf>,
+    ) {
+        self.send(Request::NewPlaylist {
+            id,
+            parent,
+            name,
+            files,
+        });
     }
 
     /// Store a batch result with its file's record; the loaded track stays the one requests
@@ -276,12 +338,16 @@ fn run(
     }
     let mut current: Option<Current> = None;
     let mut scan: Option<Scan> = None;
+    // Files still to add to playlists, in order, and when the playlists were last sent.
+    let mut adding: std::collections::VecDeque<(PlaylistId, PathBuf)> = Default::default();
+    let mut adding_sent = Instant::now();
     // The listing changed since it was last published.
     let mut listing_stale = false;
     let mut deadline: Option<Instant> = None;
     loop {
         // While scanning, look for requests without waiting; a request always comes first.
         let wait = match (&scan, deadline) {
+            _ if !adding.is_empty() => Some(Duration::ZERO),
             (Some(_), _) => Some(Duration::ZERO),
             (None, Some(d)) => Some(d.saturating_duration_since(Instant::now())),
             (None, None) => None,
@@ -299,6 +365,29 @@ fn run(
         };
         let Some(req) = req else {
             if let Some(l) = loc.as_mut() {
+                if let Some((playlist, file)) = adding.pop_front() {
+                    match open(l, &file, &|_| {}) {
+                        Ok((track, _, _)) => {
+                            refresh_tags(&mut l.lib, track, &file, &say);
+                            let add = Edit::AddEntries {
+                                playlist,
+                                tracks: vec![track],
+                                before: None,
+                            };
+                            if let Err(e) = l.lib.apply(add) {
+                                say(format!("library: {e}"));
+                            }
+                        }
+                        Err(e) => say(format!("library: {e}")),
+                    }
+                    listing_stale = true;
+                    deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+                    if adding.is_empty() || adding_sent.elapsed() >= SCAN_REPORT {
+                        adding_sent = Instant::now();
+                        publish_playlists(&l.lib, replies);
+                    }
+                    continue;
+                }
                 if let Some(sc) = scan.as_mut() {
                     scan_one(l, sc, &say);
                     listing_stale = true;
@@ -425,8 +514,38 @@ fn run(
                 Err(e) => say(format!("library: {e}")),
             },
             Request::Edit(e) => {
+                let playlist = is_playlist_edit(&e);
                 if let Err(e) = loc.lib.apply(e) {
                     say(format!("library: {e}"));
+                }
+                if playlist {
+                    publish_playlists(&loc.lib, replies);
+                }
+                deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
+            }
+            Request::AddFiles { playlist, files } => {
+                adding.extend(files.into_iter().map(|f| (playlist, f)));
+                adding_sent = Instant::now();
+            }
+            Request::NewPlaylist {
+                id,
+                parent,
+                name,
+                files,
+            } => {
+                let make = Edit::CreatePlaylist {
+                    id,
+                    parent,
+                    kind: library::PlaylistKind::List,
+                    name,
+                };
+                match loc.lib.apply(make) {
+                    Ok(_) => {
+                        publish_playlists(&loc.lib, replies);
+                        adding.extend(files.into_iter().map(|f| (id, f)));
+                        adding_sent = Instant::now();
+                    }
+                    Err(e) => say(format!("library: {e}")),
                 }
                 deadline.get_or_insert_with(|| Instant::now() + FLUSH_AFTER);
             }
@@ -599,6 +718,35 @@ fn publish(lib: &Library, replies: &Sender<Reply>) {
         let listing: Listing = rows.into_iter().map(|l| (l.path.clone(), l)).collect();
         let _ = replies.send(Reply::Listing(Arc::new(listing)));
     }
+    publish_playlists(lib, replies);
+}
+
+/// Send the playlists and their entries to the player.
+fn publish_playlists(lib: &Library, replies: &Sender<Reply>) {
+    let Ok(lists) = lib.playlists() else {
+        return;
+    };
+    let entries = lists
+        .iter()
+        .filter(|p| p.kind != library::PlaylistKind::Folder)
+        .filter_map(|p| Some((p.id, lib.entries(p.id).ok()?)))
+        .collect();
+    let _ = replies.send(Reply::Playlists(Arc::new(Playlists { lists, entries })));
+}
+
+fn is_playlist_edit(e: &Edit) -> bool {
+    matches!(
+        e,
+        Edit::CreatePlaylist { .. }
+            | Edit::RenamePlaylist(..)
+            | Edit::MovePlaylist { .. }
+            | Edit::DeletePlaylist(_)
+            | Edit::AddEntries { .. }
+            | Edit::MoveEntry { .. }
+            | Edit::RemoveEntries(_)
+            | Edit::ClearPlaylist(_)
+            | Edit::ConvertTagList { .. }
+    )
 }
 
 /// Mount the chosen library (the automatic choice: on `file`'s stick) and say what it is.

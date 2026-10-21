@@ -4137,6 +4137,7 @@ dependencies = [
  "engine-io",
  "engined",
  "glyphon",
+ "library",
  "png",
  "pollster",
  "waveform",

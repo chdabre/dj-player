@@ -100,6 +100,8 @@ pub struct Player {
     cue_serial: u64,
     /// The library's tracks, as last published.
     listing: Option<Arc<persist::Listing>>,
+    /// The library's playlists, as last published.
+    playlists: Option<Arc<persist::Playlists>>,
     /// The last scan's progress (done, total).
     scan: Option<(usize, usize)>,
     /// ANALYZE ALL under way, and how far it is.
@@ -247,6 +249,7 @@ impl Player {
             loads: 0,
             cue_serial: 0,
             listing: None,
+            playlists: None,
             scan: None,
             batch: None,
             batch_progress: None,
@@ -297,6 +300,50 @@ impl Player {
     /// The library's tracks by stored path ([`persist::stored_path`]), once it has said.
     pub fn listing(&self) -> Option<&Arc<persist::Listing>> {
         self.listing.as_ref()
+    }
+
+    /// The library's playlists, once it has said.
+    pub fn playlists(&self) -> Option<&Arc<persist::Playlists>> {
+        self.playlists.as_ref()
+    }
+
+    /// A playlist edit (or any library edit). False without a library.
+    pub fn library_edit(&mut self, edit: Edit) -> bool {
+        match &self.library {
+            Some(lib) => {
+                lib.edit(edit);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Add `files` at the end of `playlist` (records made where missing), in the background.
+    pub fn add_files(&mut self, playlist: library::PlaylistId, files: Vec<PathBuf>) -> bool {
+        match &self.library {
+            Some(lib) if !files.is_empty() => {
+                lib.add_files(playlist, files);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// MAKE PLAYLIST from `files`: a new list at the end of folder `parent`.
+    pub fn new_playlist(
+        &mut self,
+        id: library::PlaylistId,
+        parent: Option<library::PlaylistId>,
+        name: String,
+        files: Vec<PathBuf>,
+    ) -> bool {
+        match &self.library {
+            Some(lib) => {
+                lib.new_playlist(id, parent, name, files);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Scan the stick: give every audio file under its root a record, with its tags.
@@ -694,6 +741,7 @@ impl Player {
                 }
                 Reply::Status(p) => self.persistence = Some(p),
                 Reply::Listing(l) => self.listing = Some(l),
+                Reply::Playlists(p) => self.playlists = Some(p),
                 Reply::Scan { done, total } => self.scan = Some((done, total)),
             }
         }

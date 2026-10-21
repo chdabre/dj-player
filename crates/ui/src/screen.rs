@@ -64,6 +64,8 @@ pub enum Target {
     ScanNo,
     /// A key of the on-screen keyboard ([`crate::browse::KEYS`] index).
     Key(u8),
+    /// A row of a modal over the browse list (its index among all the modal's rows).
+    ModalRow(u16),
 }
 
 /// Which screen is up.
@@ -1323,14 +1325,16 @@ mod tests {
 
     #[test]
     fn browse_screen_fits_and_targets_do_not_overlap() {
-        use crate::browse::{BrowseView, InfoView, KEYS, ROWS, Row, RowKind};
+        use crate::browse::{BrowseView, InfoView, MODAL_ROWS, ModalView, ROWS, Row, RowKind};
         let rows: Vec<Row> = (0..ROWS)
             .map(|i| Row {
-                kind: if i < 2 {
-                    RowKind::Folder
-                } else {
-                    RowKind::Track
+                kind: match i {
+                    0 => RowKind::Folder,
+                    1 => RowKind::List,
+                    _ => RowKind::Track,
                 },
+                tagged: i == 4,
+                missing: i == 5,
                 title: "A title far too long for its column ".repeat(4),
                 artist: "Artist".into(),
                 detail: "128.0   8A   5:12".into(),
@@ -1382,6 +1386,30 @@ mod tests {
             },
             BrowseView {
                 has_tracks: false,
+                ..base.clone()
+            },
+            BrowseView {
+                tag_list: true,
+                modal: Some(ModalView {
+                    title: "MENU".into(),
+                    rows: (0..7).map(|i| format!("ACTION {i}")).collect(),
+                    selected: 6,
+                    danger_first: false,
+                }),
+                ..base.clone()
+            },
+            BrowseView {
+                modal: Some(ModalView {
+                    title: "DELETE PEAK?".into(),
+                    rows: vec!["YES".into(), "CANCEL".into()],
+                    selected: 1,
+                    danger_first: true,
+                }),
+                ..base.clone()
+            },
+            BrowseView {
+                keyboard: true,
+                header_override: Some("NEW PLAYLIST:  PEAK▏".into()),
                 ..base.clone()
             },
             BrowseView {
@@ -1462,7 +1490,27 @@ mod tests {
                 .filter(|h| matches!(h.target, Target::Row(_)))
                 .count();
             let listing = b.info.is_none();
-            assert_eq!(rows, if b.ask_scan || !listing { 0 } else { ROWS });
+            let covered = b.ask_scan || b.modal.is_some() || !listing;
+            assert_eq!(rows, if covered { 0 } else { ROWS });
+            if let Some(m) = &b.modal {
+                // Inside the list area, clear of the status band.
+                for h in hits
+                    .iter()
+                    .filter(|h| matches!(h.target, Target::ModalRow(_)))
+                {
+                    assert!(h.y + h.h <= 386.0, "{h:?}");
+                }
+                let shown = hits
+                    .iter()
+                    .filter(|h| matches!(h.target, Target::ModalRow(_)));
+                assert_eq!(shown.count(), m.rows.len().min(MODAL_ROWS));
+                // Scrolled to keep the cursor in view.
+                let sel = Target::ModalRow(m.selected as u16);
+                assert!(hits.iter().any(|h| h.target == sel));
+            }
+            if let Some(h) = &b.header_override {
+                assert!(scene.texts.iter().any(|t| &t.text == h));
+            }
             assert_eq!(has(Target::BrowseBack), !b.at_root && listing);
             assert_eq!(has(Target::Scan), b.library && b.scan.is_none() && listing);
             assert_eq!(has(Target::ScanYes), b.ask_scan);
@@ -1478,13 +1526,19 @@ mod tests {
                 .iter()
                 .filter(|h| matches!(h.target, Target::Key(_)))
                 .count();
-            let all_keys: usize = KEYS.iter().map(|r| r.len()).sum();
+            let all_keys = crate::browse::key_count();
             assert_eq!(keys, if b.keyboard { all_keys } else { 0 });
             assert_eq!(
                 has(Target::Overview),
                 !b.keyboard,
                 "the keyboard covers the overview"
             );
+            let tab = if b.tag_list {
+                Target::TagList
+            } else {
+                Target::Browse
+            };
+            assert!(hits.iter().any(|h| h.target == tab));
             // The title column's divider: only with tracks (or beside the info panel).
             let divider = scene
                 .rects

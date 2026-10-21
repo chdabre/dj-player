@@ -313,3 +313,56 @@ fn analyze_all_stores_waveform_analysis_and_tags_for_every_file() {
         }
     }
 }
+
+#[test]
+fn files_go_into_playlists_and_the_playlists_come_back() {
+    use library::PlaylistId;
+    let dir = temp_dir("playlists");
+    let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+    write_wav(&a, 440.0);
+    write_wav(&b, 660.0);
+    let w = LibraryWorker::start(
+        Some(DeviceId::random()),
+        LibraryChoice::Folder(dir.join("DJPLAYER")),
+    )
+    .unwrap();
+    // Neither file has a record yet: adding makes them.
+    w.add_files(PlaylistId::TAG_LIST, vec![b.clone(), a.clone()]);
+    let set = PlaylistId::random();
+    w.new_playlist(set, None, "Set".into(), vec![a.clone(), a.clone()]);
+    let until = Instant::now() + Duration::from_secs(10);
+    let lists = loop {
+        assert!(Instant::now() < until, "playlists never came back");
+        match w.try_recv() {
+            Some(Reply::Playlists(p))
+                if p.entries.get(&PlaylistId::TAG_LIST).map(Vec::len) == Some(2)
+                    && p.entries.get(&set).map(Vec::len) == Some(2) =>
+            {
+                break p;
+            }
+            Some(Reply::Failed(e)) => panic!("{e}"),
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let names: Vec<&str> = lists.lists.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["TAG LIST", "Set"]);
+    let tag = &lists.entries[&PlaylistId::TAG_LIST];
+    assert_ne!(tag[0].track, tag[1].track, "b then a");
+    let s = &lists.entries[&set];
+    assert_eq!(s[0].track, s[1].track, "a twice");
+    assert_eq!(s[0].track, tag[1].track);
+    assert_eq!(lists.tagged().count(), 2);
+
+    // Edits go through as library edits; the playlists come back after each.
+    w.edit(Edit::RemoveEntries(vec![tag[0].id]));
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < until);
+        match w.try_recv() {
+            Some(Reply::Playlists(p)) if p.entries[&PlaylistId::TAG_LIST].len() == 1 => break,
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}

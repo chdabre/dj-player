@@ -22,6 +22,7 @@ engine-core.workspace = true
 engine-io.workspace = true
 engine-analysis.workspace = true
 engined = { path = "../engined" }
+library.workspace = true
 waveform = { workspace = true, default-features = false }
 assert_no_alloc.workspace = true
 wgpu = "30"

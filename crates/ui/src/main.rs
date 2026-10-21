@@ -27,6 +27,7 @@ mod browse;
 mod clock;
 mod gfx;
 mod perform;
+mod playlists;
 mod scene;
 mod screen;
 #[cfg(feature = "standin")]
@@ -54,14 +55,16 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::browse::{BrowseView, InfoView, Nav, ROW_H, ROWS, Row, RowKind};
+use crate::browse::{BrowseView, InfoView, ModalView, Nav, ROW_H, ROWS, Row, RowKind};
 use crate::clock::PlayheadClock;
 use crate::gfx::Gfx;
+use crate::playlists::{Action, Modal, Naming};
 use crate::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveSettings};
+use library::{Edit, PlaylistId, PlaylistKind};
 use waveform::compute::Entry;
 use waveform::display::{Mode, TrackGain};
 
@@ -74,7 +77,8 @@ const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [
                      [--hot-cues <s,s,…>] [--at <seconds>] [--play] [--run-for <seconds>] \
                      [--screenshot <out.png>] [--library <dir> | --no-library] [--auto-cue off|<dB>] \
                      [--browse] [--source usb|library] [--sort name|title|artist|bpm|key|time] \
-                     [--search <query>] [--scan] [--info] [--info-screen] [--analyze-all]\n\
+                     [--search <query>] [--scan] [--info] [--info-screen] [--analyze-all] \
+                     [--source usb|library|taglist] [--open <a/b>] [--menu]\n\
                      LIBRARY_DIR=<dir> browses <dir> as a USB stick's root; the file is then optional.";
 const SEEK_SECONDS: f64 = 5.0;
 const RATE_STEP: f64 = 0.01;
@@ -111,6 +115,9 @@ struct Args {
     info_screen: bool,
     /// Start ANALYZE ALL once the library has said what it has.
     analyze_all: bool,
+    /// Open these levels by name (`PLAYLISTS/Peak`), then the MENU if asked.
+    open: Option<String>,
+    menu: bool,
     /// Hot cues to set at start (seconds), for screenshots and demos.
     hot_cues: Vec<f64>,
 }
@@ -128,6 +135,7 @@ fn parse_args() -> Result<Args, String> {
     let mut browse = false;
     let (mut source, mut sort, mut search, mut scan) = (None, None, None, false);
     let (mut info, mut info_screen, mut analyze_all) = (false, false, false);
+    let (mut open, mut menu) = (None, false);
     let mut auto_cue = AutoCue::default();
     let mut perform: Option<PerfState> = None;
     let mut hot_cues: Vec<f64> = Vec::new();
@@ -212,6 +220,7 @@ fn parse_args() -> Result<Args, String> {
                 source = Some(match args.next().as_deref() {
                     Some("usb") => Source::Folders,
                     Some("library") => Source::Library,
+                    Some("taglist") => Source::TagList,
                     other => return Err(format!("bad source {other:?} (usb, library)")),
                 });
                 browse = true;
@@ -231,6 +240,15 @@ fn parse_args() -> Result<Args, String> {
                 browse = true;
             }
             "--info-screen" => info_screen = true,
+            "--open" => {
+                open = Some(args.next().ok_or("--open needs names, /-separated")?);
+                browse = true;
+            }
+            "--menu" => {
+                menu = true;
+                open.get_or_insert_with(String::new);
+                browse = true;
+            }
             "--analyze-all" => {
                 analyze_all = true;
                 source = Some(Source::Library);
@@ -291,6 +309,8 @@ fn parse_args() -> Result<Args, String> {
         info,
         info_screen,
         analyze_all,
+        open,
+        menu,
         hot_cues,
     })
 }
@@ -413,7 +433,12 @@ fn main() -> ExitCode {
         pending_search: args.search.clone(),
         keyboard: args.search.is_some(),
         side: args.info,
+        modal: None,
+        moving: None,
+        shift: browse::Shift::Off,
         pending_analyze_all: args.analyze_all,
+        pending_open: args.open.clone(),
+        pending_menu: args.menu,
         unanalysed_cache: std::cell::RefCell::new(None),
         loaded_tags: args.file.as_deref().map(LoadedTags::read),
         ask_scan: ask_scan && !args.scan,
@@ -505,8 +530,17 @@ struct App {
     keyboard: bool,
     /// The browser's info panel is up beside the list.
     side: bool,
+    /// A modal over the browse list (MENU, ADD TO PLAYLIST, naming, a confirmation).
+    modal: Option<Modal>,
+    /// The playlist entry the knob is moving.
+    moving: Option<library::EntryId>,
+    /// The on-screen keyboard's shift.
+    shift: browse::Shift,
     /// `--analyze-all` still to start.
     pending_analyze_all: bool,
+    /// `--open` levels still to open, and `--menu` still to show.
+    pending_open: Option<String>,
+    pending_menu: bool,
     /// The unanalysed track count, and the listing it was counted from.
     unanalysed_cache: std::cell::RefCell<Option<(Arc<engined::persist::Listing>, usize)>>,
     /// The loaded track's tags and large artwork, for the INFO screen.
@@ -680,6 +714,22 @@ impl App {
                 }
             }
             Target::Search => self.search(),
+            Target::TagList if self.browser.is_some() => {
+                if let Some(b) = self.browser.as_mut() {
+                    b.set_source(Source::TagList);
+                }
+                self.keyboard = false;
+                self.modal = None;
+                self.screen = ScreenKind::Browse;
+            }
+            Target::Menu if self.screen == ScreenKind::Browse => self.open_menu(),
+            Target::ModalRow(i) => {
+                if let Some(m) = self.modal.as_mut() {
+                    m.select(usize::from(i));
+                }
+                self.modal_push();
+                self.naming_started();
+            }
             Target::Info => self.toggle_info(),
             Target::Scan => self.player.scan(),
             Target::AnalyzeAll => self.analyze_all(),
@@ -687,7 +737,17 @@ impl App {
             Target::ScanNo => self.answer_scan(false),
             Target::Key(i) => {
                 if let Some(c) = browse::key_char(i) {
-                    self.type_char(c);
+                    if c == browse::SHIFT {
+                        self.shift = self.shift.tap();
+                        return;
+                    }
+                    let (c, shift) = self.shift.apply(c);
+                    self.shift = shift;
+                    if matches!(self.modal, Some(Modal::Name { .. })) {
+                        self.type_name(c);
+                    } else {
+                        self.type_char(c);
+                    }
                 }
             }
             Target::Row(row) => {
@@ -822,7 +882,7 @@ impl App {
         let Some(entry) = b.level().entries.get(i) else {
             return;
         };
-        let open = entry.kind == Kind::Folder || b.level().cursor == i;
+        let open = entry.kind != Kind::Track || b.level().cursor == i;
         b.select(i);
         if open {
             self.enter();
@@ -845,9 +905,12 @@ impl App {
             self.screen = ScreenKind::Main;
             return;
         }
-        let Some(b) = self.browser.as_mut() else {
+        if n == Nav::Tag || n == Nav::Untag {
+            return self.tag_track(n == Nav::Untag);
+        }
+        if self.browser.is_none() {
             return;
-        };
+        }
         if self.screen != ScreenKind::Browse {
             // Pushing the knob (or BROWSE) elsewhere opens the browser.
             if n == Nav::Push {
@@ -855,7 +918,32 @@ impl App {
             }
             return;
         }
+        if let Some(m) = self.modal.as_mut() {
+            match n {
+                Nav::Up => m.move_by(-1),
+                Nav::Down => m.move_by(1),
+                Nav::Push => {
+                    self.modal_push();
+                    self.naming_started();
+                }
+                Nav::Back => self.modal = None,
+                Nav::Tag | Nav::Untag => {}
+            }
+            return;
+        }
+        if self.moving.is_some() {
+            match n {
+                Nav::Up => self.move_entry(-1),
+                Nav::Down => self.move_entry(1),
+                _ => self.moving = None,
+            }
+            return;
+        }
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
         match n {
+            Nav::Tag | Nav::Untag => {}
             Nav::Up => b.move_by(-1),
             Nav::Down => b.move_by(1),
             Nav::Push => self.enter(),
@@ -1009,6 +1097,247 @@ impl App {
         }
     }
 
+    /// TAG TRACK: the selected track (on the browse screen) or the loaded one onto the tag
+    /// list; `remove` (a long press) takes it off.
+    fn tag_track(&mut self, remove: bool) {
+        let loaded = self.player.loaded().map(|d| d.file().to_path_buf());
+        let browsing = self.screen == ScreenKind::Browse;
+        let Some(path) = playlists::tag_target(self.browser.as_ref(), browsing, loaded) else {
+            return;
+        };
+        let tagged = self
+            .browser
+            .as_ref()
+            .map(|b| b.tag_entries(&path))
+            .unwrap_or_default();
+        match (remove, tagged.is_empty()) {
+            (true, false) => self.act(Action::Untag(tagged)),
+            (false, true) => self.act(Action::Tag(vec![path])),
+            // Already tagged, or nothing to remove.
+            _ => {}
+        }
+    }
+
+    /// MENU: the actions on the selection, as a modal.
+    fn open_menu(&mut self) {
+        let Some(b) = self.browser.as_ref() else {
+            return;
+        };
+        let actions = playlists::menu(b);
+        if actions.is_empty() {
+            eprintln!("menu: nothing to do here");
+            return;
+        }
+        self.keyboard = false;
+        self.modal = Some(Modal::Menu { actions, cursor: 0 });
+    }
+
+    /// The modal's push (or a touch on one of its rows).
+    fn modal_push(&mut self) {
+        match self.modal.take() {
+            Some(Modal::Menu { actions, cursor }) => {
+                if let Some(a) = actions.get(cursor).cloned() {
+                    self.act(a);
+                }
+            }
+            Some(Modal::Pick {
+                files,
+                lists,
+                cursor,
+            }) => match lists.get(cursor).map(|l| l.1) {
+                Some(Some(id)) => {
+                    self.player.add_files(id, files);
+                }
+                Some(None) => {
+                    self.modal = Some(Modal::Name {
+                        naming: Naming::NewPlaylist {
+                            parent: None,
+                            files,
+                        },
+                        text: String::new(),
+                    });
+                }
+                None => {}
+            },
+            Some(Modal::Confirm { action, cursor, .. }) => {
+                if cursor == 0 {
+                    match action {
+                        Action::Delete(id, _) => {
+                            self.player.library_edit(Edit::DeletePlaylist(id));
+                        }
+                        Action::ClearTagList => {
+                            self.player
+                                .library_edit(Edit::ClearPlaylist(PlaylistId::TAG_LIST));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(name @ Modal::Name { .. }) => self.modal = Some(name),
+            None => {}
+        }
+    }
+
+    /// Carry out a MENU action (or TAG TRACK's).
+    fn act(&mut self, a: Action) {
+        let name = |naming, text: &str| Modal::Name {
+            naming,
+            text: text.to_string(),
+        };
+        match a {
+            Action::Tag(files) => {
+                self.player.add_files(PlaylistId::TAG_LIST, files);
+            }
+            Action::Untag(entries) => {
+                self.player.library_edit(Edit::RemoveEntries(entries));
+            }
+            Action::Remove(entry) => {
+                self.player.library_edit(Edit::RemoveEntries(vec![entry]));
+            }
+            Action::AddTo(files) => {
+                let lists = self
+                    .browser
+                    .as_ref()
+                    .map(playlists::pick_lists)
+                    .unwrap_or_default();
+                self.modal = Some(Modal::Pick {
+                    files,
+                    lists,
+                    cursor: 0,
+                });
+            }
+            Action::Move(entry) => {
+                // Moves follow the list's own order.
+                if let Some(b) = self.browser.as_mut() {
+                    b.set_sort(engined::browse::Sort::Order);
+                }
+                self.moving = Some(entry);
+            }
+            Action::MakePlaylist { files, name: n } => {
+                self.modal = Some(name(
+                    Naming::NewPlaylist {
+                        parent: None,
+                        files,
+                    },
+                    &n,
+                ));
+            }
+            Action::NewPlaylist(parent) => {
+                self.modal = Some(name(
+                    Naming::NewPlaylist {
+                        parent,
+                        files: Vec::new(),
+                    },
+                    "",
+                ));
+            }
+            Action::NewFolder(parent) => self.modal = Some(name(Naming::NewFolder(parent), "")),
+            Action::Rename(id, n) => self.modal = Some(name(Naming::Rename(id), &n)),
+            Action::ConvertTagList => {
+                self.modal = Some(name(Naming::ConvertTagList, "Tagged tracks"));
+            }
+            a @ Action::Delete(..) | a @ Action::ClearTagList => {
+                let question = match &a {
+                    Action::Delete(_, n) => format!("DELETE {n}?"),
+                    _ => "REMOVE ALL FROM THE TAG LIST?".into(),
+                };
+                self.modal = Some(Modal::Confirm {
+                    question,
+                    action: a,
+                    cursor: 1,
+                });
+            }
+        }
+    }
+
+    /// A name to type: the keyboard starts with a capital for an empty one.
+    fn naming_started(&mut self) {
+        self.shift = match &self.modal {
+            Some(Modal::Name { text, .. }) if text.is_empty() => browse::Shift::Once,
+            _ => browse::Shift::Off,
+        };
+    }
+
+    /// A key typed into a name (on-screen keyboard or a real one); DONE names it.
+    fn type_name(&mut self, c: char) {
+        let Some(Modal::Name { naming, text }) = self.modal.as_mut() else {
+            return;
+        };
+        match c {
+            browse::BACKSPACE => {
+                text.pop();
+            }
+            browse::CLEAR => text.clear(),
+            browse::DONE => {
+                let (naming, name) = (naming.clone(), text.trim().to_string());
+                self.modal = None;
+                if !name.is_empty() {
+                    self.named(naming, name);
+                }
+            }
+            c if !c.is_control() => text.push(c),
+            _ => {}
+        }
+    }
+
+    /// What a typed name was for.
+    fn named(&mut self, naming: Naming, name: String) {
+        match naming {
+            Naming::NewPlaylist { parent, files } if files.is_empty() => {
+                self.player.library_edit(Edit::CreatePlaylist {
+                    id: PlaylistId::random(),
+                    parent,
+                    kind: PlaylistKind::List,
+                    name,
+                });
+            }
+            Naming::NewPlaylist { parent, files } => {
+                self.player
+                    .new_playlist(PlaylistId::random(), parent, name, files);
+            }
+            Naming::NewFolder(parent) => {
+                self.player.library_edit(Edit::CreatePlaylist {
+                    id: PlaylistId::random(),
+                    parent,
+                    kind: PlaylistKind::Folder,
+                    name,
+                });
+            }
+            Naming::Rename(id) => {
+                self.player.library_edit(Edit::RenamePlaylist(id, name));
+            }
+            Naming::ConvertTagList => {
+                self.player.library_edit(Edit::ConvertTagList {
+                    id: PlaylistId::random(),
+                    parent: None,
+                    name,
+                });
+            }
+        }
+    }
+
+    /// MOVE: the moving entry one place up (`-1`) or down, the cursor with it.
+    fn move_entry(&mut self, delta: isize) {
+        let (Some(entry), Some(b)) = (self.moving, self.browser.as_mut()) else {
+            return;
+        };
+        let l = b.level();
+        let Some(i) = l.entries.iter().position(|e| e.entry == Some(entry)) else {
+            self.moving = None;
+            return;
+        };
+        let before = match delta {
+            -1 if i > 0 => Some(l.entries[i - 1].entry),
+            1 if i + 1 < l.entries.len() => Some(l.entries.get(i + 2).and_then(|e| e.entry)),
+            _ => None,
+        };
+        let Some(before) = before else {
+            return;
+        };
+        self.player.library_edit(Edit::MoveEntry { entry, before });
+        b.move_by(delta);
+    }
+
     /// A key typed into the search (on-screen keyboard or a real one).
     fn type_char(&mut self, c: char) {
         let Some(b) = self.browser.as_mut() else {
@@ -1041,13 +1370,21 @@ impl App {
             .skip(l.top)
             .take(ROWS)
             .map(|e| match e.kind {
-                Kind::Folder => Row {
-                    kind: RowKind::Folder,
+                Kind::Folder | Kind::Playlist(_) => Row {
+                    kind: match e.kind {
+                        Kind::Playlist(id) => match b.playlists().and_then(|p| p.get(id)) {
+                            Some(p) if p.kind == PlaylistKind::Folder => RowKind::Folder,
+                            _ => RowKind::List,
+                        },
+                        _ => RowKind::Folder,
+                    },
                     title: e.name.clone(),
                     artist: String::new(),
                     detail: String::new(),
                     loaded: false,
                     art: None,
+                    tagged: false,
+                    missing: false,
                 },
                 Kind::Track => {
                     let tags = b.info(&e.path);
@@ -1064,6 +1401,8 @@ impl App {
                         detail: detail.into_iter().flatten().collect::<Vec<_>>().join("   "),
                         loaded: loaded == Some(e.path.as_path()),
                         art: b.art(&e.path),
+                        tagged: b.is_tagged(&e.path),
+                        missing: e.path.as_os_str().is_empty(),
                     }
                 }
             })
@@ -1071,6 +1410,8 @@ impl App {
         let library = b.source() == Source::Library;
         let top = if library {
             "LIBRARY".to_string()
+        } else if b.source() == Source::TagList {
+            "TAG LIST".to_string()
         } else {
             b.root()
                 .file_name()
@@ -1105,9 +1446,27 @@ impl App {
             header,
             at_root: b.at_root(),
             library,
-            sort: b.sort().label(),
+            sort: b.sort_label(),
             searching: query.is_some(),
-            keyboard: self.keyboard && query.is_some(),
+            keyboard: (self.keyboard && query.is_some())
+                || matches!(self.modal, Some(Modal::Name { .. })),
+            shift: self.shift,
+            tag_list: b.source() == Source::TagList,
+            modal: self.modal.as_ref().and_then(|m| {
+                m.rows().map(|(title, rows, selected)| ModalView {
+                    title,
+                    rows,
+                    selected,
+                    danger_first: matches!(m, Modal::Confirm { .. }),
+                })
+            }),
+            header_override: match (&self.modal, self.moving) {
+                (Some(Modal::Name { naming, text }), _) => {
+                    Some(format!("{}:  {text}▏", naming.prompt()))
+                }
+                (_, Some(_)) => Some("MOVING  ·  TURN TO MOVE, PUSH TO DROP".into()),
+                _ => None,
+            },
             scan,
             can_scan: self.player.listing().is_some(),
             unanalysed: if library { self.unanalysed_count() } else { 0 },
@@ -1131,7 +1490,7 @@ impl App {
         let e = l.selected()?;
         let source = if library { "LIBRARY" } else { "USB" };
         let position = format!("TRACK {:03}/{:03}", l.cursor + 1, l.entries.len());
-        if e.kind == Kind::Folder {
+        if e.kind != Kind::Track {
             return Some(InfoView {
                 source,
                 position,
@@ -1203,7 +1562,9 @@ impl App {
             return true;
         };
         if self.pending_search.is_some()
-            || (b.source() == Source::Library && self.player.listing().is_none())
+            || (b.source() != Source::Folders
+                && (self.player.listing().is_none() || self.player.playlists().is_none()))
+            || self.pending_open.is_some()
             || self
                 .player
                 .scan_progress()
@@ -1257,6 +1618,26 @@ impl App {
                 _ => {}
             }
             return;
+        }
+        // While naming, the keyboard types the name: Enter names it, Esc gives up.
+        if browsing && matches!(self.modal, Some(Modal::Name { .. })) {
+            match &key.logical_key {
+                Key::Named(NamedKey::Backspace) => self.type_name(browse::BACKSPACE),
+                Key::Named(NamedKey::Space) => self.type_name(' '),
+                Key::Named(NamedKey::Enter) => self.type_name(browse::DONE),
+                Key::Named(NamedKey::Escape) => self.modal = None,
+                Key::Character(c) => c.chars().for_each(|ch| self.type_name(ch)),
+                _ => {}
+            }
+            return;
+        }
+        // TAG TRACK: x (shift: remove).
+        if let Key::Character(c) = &key.logical_key
+            && c.eq_ignore_ascii_case("x")
+            && self.modal.is_none()
+            && !(browsing && self.keyboard)
+        {
+            return self.tag_track(self.modifiers.shift_key());
         }
         // While the search keyboard is up, the keyboard types.
         if browsing && self.keyboard {
@@ -1434,9 +1815,28 @@ impl App {
         let mut wave_style = self.theme.waveform.style;
         wave_style.track_gain = self.track_gain.0;
         let mut pending_analyze = false;
+        let mut pending_menu = false;
         if let Some(b) = self.browser.as_mut() {
+            if let Some(p) = self.player.playlists() {
+                b.set_playlists(Arc::clone(p));
+            }
             if let Some(l) = self.player.listing() {
                 b.set_listing(Arc::clone(l));
+                // `--open` once the library has said what it has (playlists included).
+                if self.player.playlists().is_some()
+                    && let Some(path) = self.pending_open.take()
+                {
+                    for name in path.split('/').filter(|n| !n.is_empty()) {
+                        match b.level().entries.iter().position(|e| e.name == name) {
+                            Some(i) => {
+                                b.select(i);
+                                b.enter();
+                            }
+                            None => eprintln!("--open: no {name:?} here"),
+                        }
+                    }
+                    pending_menu = std::mem::take(&mut self.pending_menu);
+                }
                 if std::mem::take(&mut self.pending_analyze_all) {
                     pending_analyze = true;
                 }
@@ -1450,6 +1850,9 @@ impl App {
         }
         if pending_analyze {
             self.analyze_all();
+        }
+        if pending_menu {
+            self.open_menu();
         }
         // Judged before the scene is built, so a screenshot shows everything it waited for.
         let ready =
