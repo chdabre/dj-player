@@ -2,7 +2,7 @@
 
 How `crates/ui` is laid out so that new screens, dialogs and controls can be added without growing one file. It keeps what already works: immediate-mode drawing into a `Scene` once per frame, layouts that are pure functions of a view (tested for fit and overlap, screenshotted with `--screenshot`), and colours and sizes taken from the theme. What changes is where state lives, how input finds its handler, and how the drawing code is split up.
 
-**Status:** proposal. Nothing below is built yet. The migration steps at the end are each small enough for one commit and keep the app working.
+**Status:** step 1 done (`kit/` with `Ui`, `HitBox`, `Rect` and the shared widgets; text styles in the theme). The rest is a proposal. The migration steps at the end are each small enough for one commit and keep the app working.
 
 ## What hurts today
 
@@ -213,7 +213,7 @@ pub enum Effect {
 
 Each step is one commit and passes `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on its own. The app behaves the same after each step.
 
-1. **`Rect` and text styles.** Add `kit/rect.rs` and the theme's `TextStyle`s; move the `Ui` helpers from `screen.rs` into `kit/`. Change call sites mechanically.
+1. **`Rect` and text styles.** *(Done.)* Add `kit/rect.rs` and the theme's `TextStyle`s; move the `Ui` helpers from `screen.rs` into `kit/`. Change call sites mechanically. `Ui` and `HitBox` are generic over the target type; `screen.rs` aliases them to `Target` until step 5. The scene's own primitive is now `Quad`. `scene.fill` / `rounded` still take loose coordinates (they move with the renderer in step 2), and the stand-in keeps its tuples until step 8.
 2. **Split the renderer.** `gfx.rs` + `scene.rs` → `render/`, with no change in behaviour.
 3. **`DeckSnapshot` and `LoadedTrack`.** Read the atomics once in `app/engine.rs`. `View` takes the snapshot, and `load()` replaces the track in one step. The duplicate `loop_beats` goes.
 4. **`Effect`.** Handlers push effects; `App` executes them. Then move `act`, `modal_push`, `named` and `type_name` out of `App` into `playlists.rs` as functions that return effects.

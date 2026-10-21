@@ -26,7 +26,7 @@ impl Rgba {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rect {
+pub struct Quad {
     pub x: f32,
     pub y: f32,
     pub w: f32,
@@ -81,7 +81,7 @@ pub struct Text {
 pub struct Scene {
     /// What the frame is cleared to before drawing.
     pub background: Rgba,
-    pub rects: Vec<Rect>,
+    pub rects: Vec<Quad>,
     /// Waveforms, each drawn after the first `.0` rectangles and before the rest, so a
     /// waveform sits on its panel and grid and under its overlays.
     pub waves: Vec<(usize, WaveDraw)>,
@@ -110,7 +110,7 @@ impl Scene {
     }
 
     pub fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
-        self.rects.push(Rect {
+        self.rects.push(Quad {
             x,
             y,
             w,
@@ -135,7 +135,7 @@ impl Scene {
         border: f32,
         stroke: Rgba,
     ) {
-        self.rects.push(Rect {
+        self.rects.push(Quad {
             x,
             y,
             w,
@@ -162,7 +162,7 @@ impl Scene {
         to: Rgba,
         kind: Gradient,
     ) {
-        self.rects.push(Rect {
+        self.rects.push(Quad {
             x,
             y,
             w,

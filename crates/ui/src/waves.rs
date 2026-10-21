@@ -13,6 +13,8 @@
 //! grows during decode.
 
 use waveform::compute::Entry;
+
+use crate::kit::Rect;
 use waveform::display::{Column, Layout, Mode, Style, column};
 pub use waveform::render::Align;
 
@@ -80,7 +82,7 @@ pub fn zoom(
     entries_per_second: f64,
     playhead: f64,
     seconds_per_px: f64,
-    (x, y, w, h): (f32, f32, f32, f32),
+    Rect { x, y, w, h }: Rect,
     settings: &WaveSettings,
     style: &Style,
 ) -> WaveDraw {
@@ -138,7 +140,7 @@ impl OverviewCache {
         entries_per_second: f64,
         duration: f64,
         playhead: f64,
-        (x, y, w, h): (f32, f32, f32, f32),
+        Rect { x, y, w, h }: Rect,
         settings: &WaveSettings,
         style: &Style,
     ) -> WaveDraw {
@@ -205,8 +207,8 @@ mod tests {
             .collect()
     }
 
-    fn area() -> (f32, f32, f32, f32) {
-        (113.0, 172.0, 703.0, 211.0)
+    fn area() -> Rect {
+        Rect::new(113.0, 172.0, 703.0, 211.0)
     }
 
     /// Timeline column `j`: where `d` draws it, and what it draws.
@@ -279,7 +281,15 @@ mod tests {
         let e = ramp(45_000); // 300 s
         let (s, st) = (WaveSettings::default(), Style::default());
         let mut cache = OverviewCache::default();
-        let a = cache.draw(&e, EPS, 300.0, 150.0, (113.0, 502.0, 703.0, 67.0), &s, &st);
+        let a = cache.draw(
+            &e,
+            EPS,
+            300.0,
+            150.0,
+            Rect::new(113.0, 502.0, 703.0, 67.0),
+            &s,
+            &st,
+        );
         assert_eq!(a.columns.len(), 703);
         assert!((a.column_width - 1.0).abs() < 1e-6);
         assert!(a.columns.iter().all(|c| !c.segments().is_empty()));
@@ -290,7 +300,7 @@ mod tests {
             EPS,
             300.0,
             0.0,
-            (113.0, 502.0, 703.0, 67.0),
+            Rect::new(113.0, 502.0, 703.0, 67.0),
             &s,
             &st,
         );

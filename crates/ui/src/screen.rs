@@ -9,7 +9,8 @@
 
 use engine_core::DeckGrid;
 
-use crate::scene::{Align, Gradient, Rgba, Scene, Text, Weight};
+use crate::kit::{self, Rect};
+use crate::scene::{Gradient, Rgba, Scene};
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveDraw, WaveSettings};
 
@@ -99,24 +100,12 @@ pub struct PerfState {
     pub delete_armed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HitBox {
-    pub target: Target,
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
-
-impl HitBox {
-    pub fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
-    }
-}
+/// A touch target on the device screen.
+pub type HitBox = kit::HitBox<Target>;
 
 /// The overview's bounds, for turning a touch into a track position.
-pub const OVERVIEW: (f32, f32, f32, f32) = (113.0, 502.0, 703.0, 67.0);
-const ZOOM: (f32, f32, f32, f32) = (113.0, 172.0, 703.0, 211.0);
+pub const OVERVIEW: Rect = Rect::new(113.0, 502.0, 703.0, 67.0);
+const ZOOM: Rect = Rect::new(113.0, 172.0, 703.0, 211.0);
 
 /// Everything the screen shows, read from the deck once per frame.
 pub struct View<'a> {
@@ -189,200 +178,8 @@ pub struct Wave<'a> {
     pub style: waveform::display::Style,
 }
 
-pub(crate) struct Ui<'s> {
-    pub(crate) t: &'s Theme,
-    pub(crate) scene: &'s mut Scene,
-    pub(crate) hits: Vec<HitBox>,
-    pub(crate) pressed: Option<Target>,
-}
-
-#[allow(clippy::too_many_arguments)]
-impl Ui<'_> {
-    pub(crate) fn text(
-        &mut self,
-        s: impl Into<String>,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: Weight,
-        color: Rgba,
-        align: Align,
-    ) {
-        self.scene.text(Text {
-            text: s.into(),
-            x,
-            y,
-            size,
-            line_height: self.t.font.line_height,
-            weight,
-            color,
-            align,
-            max_width: None,
-        });
-    }
-
-    /// A number readout: CSS `line-height: 1`.
-    pub(crate) fn digits(
-        &mut self,
-        s: impl Into<String>,
-        x: f32,
-        y: f32,
-        size: f32,
-        color: Rgba,
-        align: Align,
-    ) {
-        self.scene.text(Text {
-            text: s.into(),
-            x,
-            y,
-            size,
-            line_height: 1.0,
-            weight: Weight::SemiBold,
-            color,
-            align,
-            max_width: None,
-        });
-    }
-
-    pub(crate) fn label(&mut self, s: &str, x: f32, y: f32, color: Rgba) {
-        self.text(
-            s,
-            x,
-            y,
-            self.t.font.label,
-            Weight::Regular,
-            color,
-            Align::Left,
-        );
-    }
-
-    pub(crate) fn section(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        let t = self.t;
-        self.scene.rounded(
-            x,
-            y,
-            w,
-            h,
-            t.shape.section_radius,
-            t.color.background,
-            t.shape.border,
-            t.color.section_edge,
-        );
-    }
-
-    /// `.b`: a touch button with an optional second line.
-    pub(crate) fn button(
-        &mut self,
-        target: Target,
-        rect: (f32, f32, f32, f32),
-        label: &str,
-        sub: Option<&str>,
-        on: bool,
-    ) {
-        self.button_sized(target, rect, label, sub, on, self.t.font.button);
-    }
-
-    /// [`Ui::button`] with its label at `size`.
-    pub(crate) fn button_sized(
-        &mut self,
-        target: Target,
-        (x, y, w, h): (f32, f32, f32, f32),
-        label: &str,
-        sub: Option<&str>,
-        on: bool,
-        size: f32,
-    ) {
-        let t = self.t;
-        let pressed = self.pressed == Some(target);
-        let (fill, edge) = match (on, pressed) {
-            (_, true) => (t.color.button_pressed, t.color.button_pressed_edge),
-            (true, false) => (t.color.button_on, t.color.button_on_edge),
-            (false, false) => (t.color.button, t.color.button_edge),
-        };
-        self.scene.rounded(
-            x,
-            y,
-            w,
-            h,
-            t.shape.button_radius,
-            fill,
-            t.shape.border,
-            edge,
-        );
-        let lh = t.font.line_height;
-        let block = size * lh + sub.map_or(0.0, |_| t.font.small * lh);
-        let top = y + (h - block) * 0.5;
-        self.text(
-            label,
-            x + w * 0.5,
-            top,
-            size,
-            Weight::SemiBold,
-            t.color.text,
-            Align::Center,
-        );
-        if let Some(sub) = sub {
-            self.text(
-                sub,
-                x + w * 0.5,
-                top + size * lh,
-                t.font.small,
-                Weight::Regular,
-                t.color.label,
-                Align::Center,
-            );
-        }
-        self.hits.push(HitBox { target, x, y, w, h });
-    }
-
-    /// `.f`: an outlined chip (indicator, sometimes touchable).
-    pub(crate) fn chip(
-        &mut self,
-        (x, y, w, h): (f32, f32, f32, f32),
-        label: &str,
-        size: f32,
-        edge: Rgba,
-        color: Rgba,
-        fill: Rgba,
-    ) {
-        let t = self.t;
-        self.scene
-            .rounded(x, y, w, h, t.shape.chip_radius, fill, t.shape.border, edge);
-        self.text(
-            label,
-            x + w * 0.5,
-            y + (h - size * t.font.line_height) * 0.5,
-            size,
-            Weight::SemiBold,
-            color,
-            Align::Center,
-        );
-    }
-
-    pub(crate) fn hit(&mut self, target: Target, (x, y, w, h): (f32, f32, f32, f32)) {
-        self.hits.push(HitBox { target, x, y, w, h });
-    }
-
-    /// A label centred in a horizontal rule (`CUE/LOOP`, `CALL`).
-    pub(crate) fn rule_label(&mut self, label: &str, x: f32, y: f32, w: f32) {
-        let t = self.t;
-        // Barlow Condensed caps at the label size are ~7/15 em wide; close enough to leave a gap.
-        let text_w = label.len() as f32 * t.font.label * (7.0 / 15.0) + 12.0;
-        let side = (w - text_w) * 0.5;
-        let mid = y + 8.0;
-        self.scene.fill(x, mid, side, 1.0, t.color.rule);
-        self.scene.fill(x + w - side, mid, side, 1.0, t.color.rule);
-        self.text(
-            label,
-            x + w * 0.5,
-            y - 1.0,
-            t.font.label,
-            Weight::Regular,
-            t.color.label,
-            Align::Center,
-        );
-    }
-}
+/// The toolkit, drawing for the device screen's targets.
+pub(crate) type Ui<'s> = kit::Ui<'s, Target>;
 
 /// Lay out the screen into `scene`; returns the touch targets.
 pub fn build(
@@ -416,10 +213,10 @@ pub fn build(
     // Frame: rail, tab row, info, status band, bottom strip, column dividers.
     ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
     ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
-    ui.section(106.0, 2.0, 915.0, 64.0);
-    ui.section(106.0, 66.0, 915.0, 325.0);
-    ui.section(106.0, 395.0, 915.0, 99.0);
-    ui.section(106.0, 498.0, 915.0, 99.0);
+    ui.section(Rect::new(106.0, 2.0, 915.0, 64.0));
+    ui.section(Rect::new(106.0, 66.0, 915.0, 325.0));
+    ui.section(Rect::new(106.0, 395.0, 915.0, 99.0));
+    ui.section(Rect::new(106.0, 498.0, 915.0, 99.0));
     ui.scene
         .fill(822.0, 117.0, 1.0, 269.0, t.color.section_edge);
     ui.scene.fill(822.0, 400.0, 1.0, 89.0, t.color.section_edge);
@@ -466,15 +263,7 @@ fn debug_line(ui: &mut Ui, view: &View) {
             0.0,
             t.color.background,
         );
-        ui.text(
-            line,
-            119.0,
-            178.0,
-            t.font.label,
-            Weight::Regular,
-            t.color.cue_text,
-            Align::Left,
-        );
+        ui.text(line, 119.0, 178.0, t.text.label.color(t.color.cue_text));
     }
 }
 
@@ -482,15 +271,21 @@ fn debug_line(ui: &mut Ui, view: &View) {
 pub(crate) fn rail(ui: &mut Ui, v: &View, lit: Target) {
     ui.button(
         Target::Library,
-        (6.0, 16.0, 88.0, 117.0),
+        Rect::new(6.0, 16.0, 88.0, 117.0),
         "LIBRARY",
         None,
         lit == Target::Library,
     );
-    ui.button(Target::Link, (6.0, 138.0, 88.0, 124.0), "LINK", None, false);
+    ui.button(
+        Target::Link,
+        Rect::new(6.0, 138.0, 88.0, 124.0),
+        "LINK",
+        None,
+        false,
+    );
     ui.button(
         Target::Usb,
-        (6.0, 267.0, 88.0, 117.0),
+        Rect::new(6.0, 267.0, 88.0, 117.0),
         "USB",
         None,
         lit == Target::Usb,
@@ -511,19 +306,11 @@ pub(crate) fn rail_bottom(ui: &mut Ui, v: &View) {
         t.shape.border,
         t.color.button_edge,
     );
-    ui.text(
-        "PLAYER",
-        50.0,
-        418.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.label,
-        Align::Center,
-    );
-    ui.digits("1", 50.0, 438.0, t.font.player, t.color.text, Align::Center);
+    ui.text("PLAYER", 50.0, 418.0, t.text.small.center());
+    ui.text("1", 50.0, 438.0, t.text.player.center());
     ui.button(
         Target::Slip,
-        (6.0, 505.0, 88.0, 76.0),
+        Rect::new(6.0, 505.0, 88.0, 76.0),
         "SLIP",
         None,
         v.slip_enabled,
@@ -549,35 +336,35 @@ pub(crate) fn tabs(ui: &mut Ui, active: Option<Target>) {
     let h = 54.0;
     ui.button(
         Target::Browse,
-        (113.0, y, 171.0, h),
+        Rect::new(113.0, y, 171.0, h),
         "BROWSE",
         Some("– SEARCH"),
         active == Some(Target::Browse),
     );
     ui.button(
         Target::TagList,
-        (289.0, y, 171.0, h),
+        Rect::new(289.0, y, 171.0, h),
         "TAG LIST",
         None,
         active == Some(Target::TagList),
     );
     ui.button(
         Target::Info,
-        (464.0, y, 171.0, h),
+        Rect::new(464.0, y, 171.0, h),
         "INFO",
         Some("– LINK INFO"),
         active == Some(Target::Info),
     );
     ui.button(
         Target::Menu,
-        (640.0, y, 171.0, h),
+        Rect::new(640.0, y, 171.0, h),
         "MENU",
         Some("– UTILITY"),
         active == Some(Target::Menu),
     );
     ui.button(
         Target::Perform,
-        (841.0, y, 175.0, h),
+        Rect::new(841.0, y, 175.0, h),
         "PERFORM",
         None,
         active == Some(Target::Perform),
@@ -607,15 +394,7 @@ fn info(ui: &mut Ui, v: &View) {
         0.0,
         t.color.background,
     );
-    ui.text(
-        v.title,
-        132.0,
-        76.0,
-        t.font.title,
-        Weight::SemiBold,
-        t.color.text,
-        Align::Left,
-    );
+    ui.text(v.title, 132.0, 76.0, t.text.title);
     let key = v.key.map_or_else(
         || {
             if v.analysing {
@@ -626,15 +405,7 @@ fn info(ui: &mut Ui, v: &View) {
         },
         |k| format!("KEY {k}"),
     );
-    ui.text(
-        key,
-        1003.0,
-        77.0,
-        t.font.title_aside,
-        Weight::SemiBold,
-        t.color.key,
-        Align::Right,
-    );
+    ui.text(key, 1003.0, 77.0, t.text.title_aside.right());
 
     phase(ui, v, 289.0, 338.0, 123.0);
 
@@ -644,23 +415,21 @@ fn info(ui: &mut Ui, v: &View) {
     cue_column(ui, v, 159.0, 58.0, 62.0);
     let zoom_label = format!("ZOOM {}", v.zoom_beats);
     ui.chip(
-        (828.0, 344.0, 88.0, 36.0),
+        Rect::new(828.0, 344.0, 88.0, 36.0),
         &zoom_label,
-        t.font.chip,
+        t.text.chip,
         t.color.chip_edge,
-        t.color.text,
         t.color.chip_selected,
     );
-    ui.hit(Target::Zoom, (828.0, 344.0, 88.0, 36.0));
+    ui.hit(Target::Zoom, Rect::new(828.0, 344.0, 88.0, 36.0));
     ui.chip(
-        (923.0, 344.0, 93.0, 36.0),
+        Rect::new(923.0, 344.0, 93.0, 36.0),
         "GRID",
-        t.font.chip,
+        t.text.chip,
         t.color.chip_edge,
-        t.color.text,
         Rgba::TRANSPARENT,
     );
-    ui.hit(Target::Grid, (923.0, 344.0, 93.0, 36.0));
+    ui.hit(Target::Grid, Rect::new(923.0, 344.0, 93.0, 36.0));
 }
 
 /// The master badge, the two phase meters (bar in the 4-bar phrase, beat in the bar) and the
@@ -672,19 +441,13 @@ pub(crate) fn phase(ui: &mut Ui, v: &View, mx: f32, mw: f32, y: f32) {
         "MASTER",
         lx,
         y - 6.0,
-        t.font.caption,
-        Weight::Regular,
-        t.color.cue_text,
-        Align::Right,
+        t.text.caption.color(t.color.cue_text).right(),
     );
     ui.text(
         "PLAYER",
         lx,
         y + 8.0,
-        t.font.caption,
-        Weight::Regular,
-        t.color.cue_text,
-        Align::Right,
+        t.text.caption.color(t.color.cue_text).right(),
     );
     ui.scene.rounded(
         bx,
@@ -696,13 +459,11 @@ pub(crate) fn phase(ui: &mut Ui, v: &View, mx: f32, mw: f32, y: f32) {
         0.0,
         t.color.background,
     );
-    ui.digits(
+    ui.text(
         "1",
         bx + 8.5,
         y + 1.0,
-        t.font.badge,
-        t.color.on_badge,
-        Align::Center,
+        t.text.badge.color(t.color.on_badge).center(),
     );
     let (beat_in_bar, bar_in_phrase, bar, bars_left) = match v.grid {
         Some(g) => {
@@ -733,39 +494,24 @@ pub(crate) fn phase(ui: &mut Ui, v: &View, mx: f32, mw: f32, y: f32) {
         ),
         _ => ("--.-".into(), "--.-".into()),
     };
-    ui.digits(
-        amber,
-        cx,
-        y - 5.0,
-        t.font.counter,
-        t.color.cue_text,
-        Align::Left,
-    );
+    ui.text(amber, cx, y - 5.0, t.text.counter.color(t.color.cue_text));
     ui.text(
         "BARS",
         cx + 50.0,
         y + 3.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.cue_text,
-        Align::Left,
+        t.text.small.color(t.color.cue_text),
     );
-    ui.digits(
+    ui.text(
         blue,
         cx,
         y + 21.0,
-        t.font.counter,
-        t.color.accent_text,
-        Align::Left,
+        t.text.counter.color(t.color.accent_text),
     );
     ui.text(
         "BARS LEFT",
         cx + 50.0,
         y + 29.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.accent_text,
-        Align::Left,
+        t.text.small.color(t.color.accent_text),
     );
 }
 
@@ -777,14 +523,14 @@ pub(crate) fn cue_column(ui: &mut Ui, v: &View, rule: f32, button_h: f32, call_h
     ui.rule_label("CUE/LOOP", 828.0, rule, 188.0);
     ui.button(
         Target::Delete,
-        (828.0, button_y, 88.0, button_h),
+        Rect::new(828.0, button_y, 88.0, button_h),
         "DELETE",
         None,
         false,
     );
     ui.button(
         Target::Memory,
-        (923.0, button_y, 93.0, button_h),
+        Rect::new(923.0, button_y, 93.0, button_h),
         "MEMORY",
         None,
         false,
@@ -797,14 +543,14 @@ pub(crate) fn cue_column(ui: &mut Ui, v: &View, rule: f32, button_h: f32, call_h
     };
     ui.button(
         Target::CallPrev,
-        (828.0, call_y, 88.0, call_h),
+        Rect::new(828.0, call_y, 88.0, call_h),
         prev,
         None,
         false,
     );
     ui.button(
         Target::CallNext,
-        (923.0, call_y, 93.0, call_h),
+        Rect::new(923.0, call_y, 93.0, call_h),
         next,
         None,
         false,
@@ -840,11 +586,7 @@ pub(crate) fn meter(ui: &mut Ui, x: f32, y: f32, w: f32, active: Option<u8>, fil
 
 /// The panel behind a waveform: a gradient towards the waveform's baseline (the centre line
 /// for a mirrored view, the bottom for a bottom-aligned one).
-pub(crate) fn panel(
-    ui: &mut Ui,
-    (x, y, w, h): (f32, f32, f32, f32),
-    align: Option<crate::waves::Align>,
-) {
+pub(crate) fn panel(ui: &mut Ui, Rect { x, y, w, h }: Rect, align: Option<crate::waves::Align>) {
     let t = ui.t;
     let wf = &t.waveform;
     let kind = match align {
@@ -864,10 +606,10 @@ pub(crate) fn panel(
 }
 
 /// Zoomed view around the playhead: beat grid, loop, cue, hot cue strip, playhead.
-pub(crate) fn zoom(ui: &mut Ui, v: &View, area: (f32, f32, f32, f32)) {
+pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
     let t = ui.t;
     let wf = &t.waveform;
-    let (x0, y0, w, h) = area;
+    let Rect { x: x0, y: y0, w, h } = area;
     panel(ui, area, v.wave.map(|w| w.settings.zoom_align));
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
     ui.hit(Target::Waveform, area);
@@ -953,10 +695,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: (f32, f32, f32, f32)) {
             hot_cue_letter(i).to_string(),
             x - 1.0 + tag * 0.5,
             y0 + h - tag + 1.0,
-            t.font.caption,
-            Weight::SemiBold,
-            t.color.on_badge,
-            Align::Center,
+            t.text.caption.semibold().color(t.color.on_badge).center(),
         );
     }
     let cue = to_x(v.cue);
@@ -988,10 +727,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: (f32, f32, f32, f32)) {
         label,
         x0 + 8.0,
         y0 + h - 24.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.dim,
-        Align::Left,
+        t.text.small.color(t.color.dim),
     );
     // Playhead, centred.
     let px = x0 + w * 0.5;
@@ -1012,23 +748,16 @@ fn clock(seconds: f64) -> (String, String) {
 
 pub(crate) fn status(ui: &mut Ui, v: &View) {
     let t = ui.t;
-    ui.label("TRACK", 113.0, 398.0, t.color.label);
+    ui.text("TRACK", 113.0, 398.0, t.text.label);
     if let Some(save) = v.save {
         let color = match save {
             SaveState::Saved => t.color.dim,
             SaveState::Saving => t.color.label,
             SaveState::Unsaved => t.color.danger_text,
         };
-        ui.label(save.label(), 160.0, 398.0, color);
+        ui.text(save.label(), 160.0, 398.0, t.text.label.color(color));
     }
-    ui.digits(
-        "01",
-        113.0,
-        422.0,
-        t.font.readout,
-        t.color.text,
-        Align::Left,
-    );
+    ui.text("01", 113.0, 422.0, t.text.readout);
     let hot = v.hot_cues;
     let pads: String = (0..8u8)
         .map(|i| {
@@ -1040,73 +769,56 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
         })
         .collect();
     ui.chip(
-        (226.0, 422.0, 113.0, 25.0),
+        Rect::new(226.0, 422.0, 113.0, 25.0),
         &pads,
-        t.font.chip,
+        t.text.chip,
         if hot != 0 {
             t.color.hot_cue
         } else {
             t.color.chip_edge
         },
-        t.color.text,
         Rgba::TRANSPARENT,
     );
     ui.chip(
-        (226.0, 453.0, 113.0, 25.0),
+        Rect::new(226.0, 453.0, 113.0, 25.0),
         "A.CUE",
-        t.font.chip,
+        t.text.chip.color(t.color.cue_text),
         t.color.cue,
-        t.color.cue_text,
         Rgba::TRANSPARENT,
     );
 
-    ui.label("REMAIN", 351.0, 398.0, t.color.label);
+    ui.text("REMAIN", 351.0, 398.0, t.text.label);
     let quantize = match v.quantize {
         q if q <= 0.0 => "QUANTIZE : OFF".to_string(),
         q if q >= 1.0 => format!("QUANTIZE : {q}"),
         q => format!("QUANTIZE : 1/{}", (1.0 / q).round()),
     };
-    ui.label(
+    ui.text(
         &quantize,
         424.0,
         398.0,
-        if v.quantize > 0.0 {
+        t.text.label.color(if v.quantize > 0.0 {
             t.color.cue_text
         } else {
             t.color.dim
-        },
+        }),
     );
     let (mmss, ms) = clock((v.length - v.position) / v.sample_rate);
     // Tabular digits: "00:00" at 56 px ends ~118 px in.
-    ui.digits(
-        mmss,
-        469.0,
-        422.0,
-        t.font.readout,
-        t.color.text,
-        Align::Right,
-    );
-    ui.digits(
-        ms,
-        470.0,
-        437.0,
-        t.font.readout_fraction,
-        t.color.text,
-        Align::Left,
-    );
+    ui.text(mmss, 469.0, 422.0, t.text.readout.right());
+    ui.text(ms, 470.0, 437.0, t.text.readout_fraction);
 
-    ui.label("TEMPO", 653.0, 398.0, t.color.label);
+    ui.text("TEMPO", 653.0, 398.0, t.text.label);
     let (edge, color) = if v.keylock {
         (t.color.cue, t.color.cue_text)
     } else {
         (t.color.chip_edge, t.color.dim)
     };
     ui.chip(
-        (705.0, 397.0, 64.0, 23.0),
+        Rect::new(705.0, 397.0, 64.0, 23.0),
         "KEYLOCK",
-        t.font.label,
+        t.text.label.semibold().color(color),
         edge,
-        color,
         Rgba::TRANSPARENT,
     );
     let pct = (v.rate - 1.0) * 100.0;
@@ -1117,26 +829,19 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
     } else {
         format!("−{:.2}", -pct)
     };
-    ui.digits(
-        tempo,
-        790.0,
-        422.0,
-        t.font.readout,
-        t.color.text,
-        Align::Right,
-    );
-    ui.digits("%", 792.0, 448.0, t.font.unit, t.color.text, Align::Left);
+    ui.text(tempo, 790.0, 422.0, t.text.readout.right());
+    ui.text("%", 792.0, 448.0, t.text.unit);
 
     ui.button(
         Target::Sync,
-        (828.0, 408.0, 88.0, 78.0),
+        Rect::new(828.0, 408.0, 88.0, 78.0),
         "SYNC",
         Some("– INST.D."),
         false,
     );
     ui.button(
         Target::Master,
-        (923.0, 408.0, 93.0, 78.0),
+        Rect::new(923.0, 408.0, 93.0, 78.0),
         "MASTER",
         None,
         true,
@@ -1146,7 +851,7 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
 pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let t = ui.t;
     let wf = &t.waveform;
-    let (x0, y0, w, h) = OVERVIEW;
+    let Rect { x: x0, y: y0, w, h } = OVERVIEW;
     panel(ui, OVERVIEW, v.wave.map(|w| w.settings.overview_align));
     if v.length > 0.0 {
         let to_x = |pos: f64| x0 + (pos / v.length).clamp(0.0, 1.0) as f32 * w;
@@ -1219,41 +924,28 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
         },
         x0 + 8.0,
         y0 + 4.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.dim,
-        Align::Left,
+        t.text.small.color(t.color.dim),
     );
     ui.hit(Target::Overview, OVERVIEW);
     ui.scene.fill(x0, 572.0, w, 1.0, t.color.button_edge);
-    ui.text(
-        "NEEDLE SEARCH",
-        x0 + w * 0.5,
-        574.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.label,
-        Align::Center,
-    );
+    ui.text("NEEDLE SEARCH", x0 + w * 0.5, 574.0, t.text.small.center());
 
     ui.chip(
-        (828.0, 502.0, 62.0, 39.0),
+        Rect::new(828.0, 502.0, 62.0, 39.0),
         "±10",
-        t.font.chip_large,
+        t.text.chip_large.color(t.color.cue_text),
         t.color.cue,
-        t.color.cue_text,
         Rgba::TRANSPARENT,
     );
-    ui.hit(Target::TempoRange, (828.0, 502.0, 62.0, 39.0));
+    ui.hit(Target::TempoRange, Rect::new(828.0, 502.0, 62.0, 39.0));
     ui.chip(
-        (828.0, 545.0, 62.0, 43.0),
+        Rect::new(828.0, 545.0, 62.0, 43.0),
         "[4]",
-        t.font.chip_large,
+        t.text.chip_large,
         t.color.chip_edge,
-        t.color.text,
         Rgba::TRANSPARENT,
     );
-    ui.hit(Target::JumpSize, (828.0, 545.0, 62.0, 43.0));
+    ui.hit(Target::JumpSize, Rect::new(828.0, 545.0, 62.0, 43.0));
     ui.scene.rounded(
         898.0,
         502.0,
@@ -1267,23 +959,13 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let bpm = v
         .grid
         .map_or("--.-".to_string(), |g| format!("{:.1}", g.bpm() * v.rate));
-    ui.digits(
+    ui.text(
         bpm,
         1006.0,
         514.0,
-        t.font.bpm,
-        t.color.accent_text,
-        Align::Right,
+        t.text.bpm.color(t.color.accent_text).right(),
     );
-    ui.text(
-        "BPM",
-        1006.0,
-        558.0,
-        t.font.small,
-        Weight::Regular,
-        t.color.label,
-        Align::Right,
-    );
+    ui.text("BPM", 1006.0, 558.0, t.text.small.right());
 }
 
 #[cfg(test)]
@@ -1470,18 +1152,17 @@ mod tests {
             }
             for (i, a) in hits.iter().enumerate() {
                 for c in &hits[i + 1..] {
-                    let overlap =
-                        a.x < c.x + c.w && c.x < a.x + a.w && a.y < c.y + c.h && c.y < a.y + a.h;
+                    let overlap = a.rect.overlaps(c.rect);
                     assert!(!overlap, "{:?} overlaps {:?}", a.target, c.target);
                 }
             }
             for h in hits.iter().filter(|h| h.target != Target::Overview) {
                 assert!(
-                    h.w >= 36.0 && h.h >= 36.0,
+                    h.rect.w >= 36.0 && h.rect.h >= 36.0,
                     "{:?} is {}×{}",
                     h.target,
-                    h.w,
-                    h.h
+                    h.rect.w,
+                    h.rect.h
                 );
             }
             let has = |t: Target| hits.iter().any(|h| h.target == t);
@@ -1498,7 +1179,7 @@ mod tests {
                     .iter()
                     .filter(|h| matches!(h.target, Target::ModalRow(_)))
                 {
-                    assert!(h.y + h.h <= 386.0, "{h:?}");
+                    assert!(h.rect.bottom() <= 386.0, "{h:?}");
                 }
                 let shown = hits
                     .iter()
@@ -1550,7 +1231,7 @@ mod tests {
             if b.side.is_some() {
                 // The list keeps its jacket and title columns; the panel is beside it.
                 for h in hits.iter().filter(|h| matches!(h.target, Target::Row(_))) {
-                    assert!(h.x + h.w <= 560.0, "{h:?}");
+                    assert!(h.rect.right() <= 560.0, "{h:?}");
                 }
                 assert!(!scene.texts.iter().any(|t| t.text == "128.0   8A   5:12"));
                 assert!(scene.texts.iter().any(|t| t.text == "★★★☆☆"));
@@ -1596,19 +1277,18 @@ mod tests {
         }
         for (i, a) in hits.iter().enumerate() {
             for b in &hits[i + 1..] {
-                let overlap =
-                    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+                let overlap = a.rect.overlaps(b.rect);
                 assert!(!overlap, "{:?} overlaps {:?}", a.target, b.target);
             }
         }
         // Touch targets the design pass sized for a 7" panel: at least 36 px on each side.
         for h in hits.iter().filter(|h| h.target != Target::Overview) {
             assert!(
-                h.w >= 36.0 && h.h >= 36.0,
+                h.rect.w >= 36.0 && h.rect.h >= 36.0,
                 "{:?} is {}×{}",
                 h.target,
-                h.w,
-                h.h
+                h.rect.w,
+                h.rect.h
             );
         }
     }
@@ -1649,18 +1329,17 @@ mod tests {
             }
             for (i, a) in hits.iter().enumerate() {
                 for b in &hits[i + 1..] {
-                    let overlap =
-                        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+                    let overlap = a.rect.overlaps(b.rect);
                     assert!(!overlap, "{perf:?}: {:?} overlaps {:?}", a.target, b.target);
                 }
             }
             for h in hits.iter().filter(|h| h.target != Target::Overview) {
                 assert!(
-                    h.w >= 36.0 && h.h >= 36.0,
+                    h.rect.w >= 36.0 && h.rect.h >= 36.0,
                     "{:?} is {}×{}",
                     h.target,
-                    h.w,
-                    h.h
+                    h.rect.w,
+                    h.rect.h
                 );
             }
             let pads = hits

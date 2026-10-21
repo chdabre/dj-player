@@ -26,6 +26,7 @@
 mod browse;
 mod clock;
 mod gfx;
+mod kit;
 mod perform;
 mod playlists;
 mod scene;
@@ -58,6 +59,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::browse::{BrowseView, InfoView, ModalView, Nav, ROW_H, ROWS, Row, RowKind};
 use crate::clock::PlayheadClock;
 use crate::gfx::Gfx;
+use crate::kit::Rect;
 use crate::playlists::{Action, Modal, Naming};
 use crate::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
@@ -789,7 +791,7 @@ impl App {
                 let shown = self.last_shown.map_or(st.position.load(), |(_, p)| p);
                 self.scrub = Some(Scrub {
                     last_x: dx,
-                    frames_per_px: span / f64::from(hit.w),
+                    frames_per_px: span / f64::from(hit.rect.w),
                     shown,
                 });
                 self.send(DeckCommand::ScratchBegin);
@@ -1585,7 +1587,7 @@ impl App {
     }
 
     fn seek_overview(&mut self, x: f32) {
-        let (x0, _, w, _) = OVERVIEW;
+        let Rect { x: x0, w, .. } = OVERVIEW;
         let f = f64::from(((x - x0) / w).clamp(0.0, 1.0));
         let length = self.player.state().length.load();
         self.send(DeckCommand::Seek(f * length));

@@ -13,8 +13,10 @@ use std::sync::Arc;
 
 use engined::browse::Thumb;
 
-use crate::scene::{Align, Image, Rgba, Weight};
+use crate::kit::Rect;
+use crate::scene::{Image, Rgba, Weight};
 use crate::screen::{Target, Ui, View, bottom, rail, status, tabs};
+use crate::theme::TextStyle;
 use crate::waves::OverviewCache;
 
 /// Rows shown at once.
@@ -22,7 +24,7 @@ pub const ROWS: usize = 7;
 /// Row height, design pixels.
 pub const ROW_H: f32 = 40.0;
 
-const HEADER: (f32, f32, f32, f32) = (113.0, 69.0, 903.0, 31.0);
+const HEADER: Rect = Rect::new(113.0, 69.0, 903.0, 31.0);
 const LIST_Y: f32 = 103.0;
 const JACKET_X: f32 = 113.0;
 const JACKET_W: f32 = 95.0;
@@ -41,7 +43,7 @@ const SORT_CHIP: (f32, f32) = (796.0, 114.0);
 const SCAN_CHIP: (f32, f32) = (706.0, 84.0);
 const ANALYZE_CHIP: (f32, f32) = (576.0, 124.0);
 /// Where the keyboard goes: over the status band and the bottom strip.
-const KEYBOARD: (f32, f32, f32, f32) = (106.0, 395.0, 915.0, 202.0);
+const KEYBOARD: Rect = Rect::new(106.0, 395.0, 915.0, 202.0);
 
 /// What the browse controls (knob, BACK, keys) ask of the browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,8 +295,8 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
     let t = ui.t;
     ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
     ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
-    ui.section(106.0, 2.0, 915.0, 64.0);
-    ui.section(106.0, 66.0, 915.0, 325.0);
+    ui.section(Rect::new(106.0, 2.0, 915.0, 64.0));
+    ui.section(Rect::new(106.0, 66.0, 915.0, 325.0));
     // The tag list belongs to no source on the rail.
     let lit = if b.library {
         Target::Library
@@ -331,8 +333,8 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
     if b.keyboard {
         keyboard(ui, b.shift);
     } else {
-        ui.section(106.0, 395.0, 915.0, 99.0);
-        ui.section(106.0, 498.0, 915.0, 99.0);
+        ui.section(Rect::new(106.0, 395.0, 915.0, 99.0));
+        ui.section(Rect::new(106.0, 498.0, 915.0, 99.0));
         ui.scene.fill(822.0, 400.0, 1.0, 89.0, t.color.section_edge);
         ui.scene.fill(822.0, 502.0, 1.0, 90.0, t.color.section_edge);
         status(ui, v);
@@ -345,23 +347,23 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
 
 fn header(ui: &mut Ui, b: &BrowseView) {
     let t = ui.t;
-    let (x, y, w, h) = HEADER;
+    let Rect { x, y, w, h } = HEADER;
     // The chips' touch targets run from the section's top to the first row.
     let (hit_y, hit_h) = (66.0, LIST_Y - 66.0);
     let mut chips_left = SORT_CHIP.0;
     let chip = |ui: &mut Ui, target: Target, (cx, cw): (f32, f32), label: &str, on: bool| {
-        ui.button_sized(
+        ui.button_styled(
             target,
-            (cx, y + 1.0, cw, h - 3.0),
+            Rect::new(cx, y + 1.0, cw, h - 3.0),
             label,
             None,
             on,
-            t.font.small,
+            t.text.small.semibold().color(t.color.text),
         );
         // Taller than drawn, for a finger.
         if let Some(last) = ui.hits.last_mut() {
-            last.y = hit_y;
-            last.h = hit_h;
+            last.rect.y = hit_y;
+            last.rect.h = hit_h;
         }
     };
     let pressed_back = ui.pressed == Some(Target::BrowseBack);
@@ -390,10 +392,7 @@ fn header(ui: &mut Ui, b: &BrowseView) {
                     format!("ANALYZING {done} / {total}"),
                     ANALYZE_CHIP.0 - 10.0,
                     y + (h - t.font.small * t.font.line_height) * 0.5,
-                    t.font.small,
-                    Weight::SemiBold,
-                    t.color.cue_text,
-                    Align::Right,
+                    t.text.small.semibold().color(t.color.cue_text).right(),
                 );
                 chips_left = ANALYZE_CHIP.0 - 150.0;
             }
@@ -409,10 +408,7 @@ fn header(ui: &mut Ui, b: &BrowseView) {
             format!("SCANNING {done} / {total}"),
             SORT_CHIP.0 - 10.0,
             y + (h - t.font.small * t.font.line_height) * 0.5,
-            t.font.small,
-            Weight::SemiBold,
-            t.color.cue_text,
-            Align::Right,
+            t.text.small.semibold().color(t.color.cue_text).right(),
         );
         chips_left = SORT_CHIP.0 - 150.0;
     }
@@ -421,24 +417,19 @@ fn header(ui: &mut Ui, b: &BrowseView) {
         None if b.at_root => b.header.clone(),
         None => format!("‹  {}", b.header),
     };
-    ui.scene.text(crate::scene::Text {
-        text: label,
-        x: x + PAD,
-        y: y + (h - t.font.row * t.font.line_height) * 0.5,
-        size: t.font.row,
-        line_height: t.font.line_height,
-        weight: Weight::SemiBold,
-        color: t.color.text,
-        align: Align::Left,
-        max_width: Some(chips_left - x - 2.0 * PAD),
-    });
+    ui.text(
+        label,
+        x + PAD,
+        y + (h - t.font.row * t.font.line_height) * 0.5,
+        t.text.row.semibold().max_width(chips_left - x - 2.0 * PAD),
+    );
     if !b.at_root {
         // Up to the chips (or the progress text left of them).
         let back_w = chips_left - x - 6.0;
         if pressed_back {
             ui.scene.fill(x, y, back_w, h - 1.0, t.color.button_pressed);
         }
-        ui.hit(Target::BrowseBack, (x, hit_y, back_w, hit_h));
+        ui.hit(Target::BrowseBack, Rect::new(x, hit_y, back_w, hit_h));
     }
 }
 
@@ -469,10 +460,7 @@ fn list(ui: &mut Ui, b: &BrowseView) {
             msg.clone(),
             TITLE_X + PAD,
             LIST_Y + (ROW_H - t.font.row * t.font.line_height) * 0.5,
-            t.font.row,
-            Weight::Regular,
-            t.color.label,
-            Align::Left,
+            t.text.row.color(t.color.label),
         );
     }
     // Text and pictures draw above every rectangle, so under the question the rows go.
@@ -533,7 +521,10 @@ fn list(ui: &mut Ui, b: &BrowseView) {
             title_color,
         );
         if b.side.is_some() {
-            ui.hit(Target::Row(i as u8), (JACKET_X, y, right - JACKET_X, ROW_H));
+            ui.hit(
+                Target::Row(i as u8),
+                Rect::new(JACKET_X, y, right - JACKET_X, ROW_H),
+            );
             continue;
         }
         let detail_w = if row.detail.is_empty() { 0.0 } else { DETAIL_W };
@@ -552,15 +543,12 @@ fn list(ui: &mut Ui, b: &BrowseView) {
                 row.detail.clone(),
                 ARTIST_X + ARTIST_W - PAD,
                 text_y,
-                t.font.row,
-                weight,
-                t.color.text,
-                Align::Right,
+                t.text.row.weight(weight).right(),
             );
         }
         ui.hit(
             Target::Row(i as u8),
-            (JACKET_X, y, ARTIST_X + ARTIST_W - JACKET_X, ROW_H),
+            Rect::new(JACKET_X, y, ARTIST_X + ARTIST_W - JACKET_X, ROW_H),
         );
     }
     scroll_bar(ui, b, list_h);
@@ -578,17 +566,12 @@ fn list_right(b: &BrowseView) -> f32 {
 /// A row's cell text, ellipsized to `w`.
 fn cell(ui: &mut Ui, s: &str, x: f32, y: f32, w: f32, weight: Weight, color: Rgba) {
     let t = ui.t;
-    ui.scene.text(crate::scene::Text {
-        text: s.to_string(),
+    ui.text(
+        s.to_string(),
         x,
         y,
-        size: t.font.row,
-        line_height: t.font.line_height,
-        weight,
-        color,
-        align: Align::Left,
-        max_width: Some(w),
-    });
+        t.text.row.weight(weight).color(color).max_width(w),
+    );
 }
 
 /// The jacket column: the artwork, a frame where there is none (yet), or a folder.
@@ -675,8 +658,8 @@ fn scroll_bar(ui: &mut Ui, b: &BrowseView, list_h: f32) {
 /// The search keyboard, over the status band and the bottom strip.
 fn keyboard(ui: &mut Ui, shift: Shift) {
     let t = ui.t;
-    let (x0, y0, w, h) = KEYBOARD;
-    ui.section(x0, y0, w, h);
+    let Rect { x: x0, y: y0, w, h } = KEYBOARD;
+    ui.section(Rect::new(x0, y0, w, h));
     let gap = 3.0;
     let (inner_x, inner_w) = (x0 + 7.0, w - 14.0);
     // A key of `u` units is `u * unit - gap` wide, so a row of 11 units fills the width.
@@ -701,18 +684,18 @@ fn keyboard(ui: &mut Ui, shift: Shift) {
                 (c, Shift::Off) if c.is_alphabetic() => label.to_lowercase(),
                 _ => label.to_string(),
             };
-            let size = if label.chars().count() > 1 {
-                t.font.small
+            let style = if label.chars().count() > 1 {
+                t.text.small.semibold().color(t.color.text)
             } else {
-                t.font.button
+                t.text.button
             };
-            ui.button_sized(
+            ui.button_styled(
                 Target::Key(index),
-                (x, y, kw, row_h),
+                Rect::new(x, y, kw, row_h),
                 &shown,
                 None,
                 on,
-                size,
+                style,
             );
             index += 1;
         }
@@ -742,19 +725,13 @@ fn info_panel(ui: &mut Ui, i: &InfoView) {
         format!("{}  @  PLAYER 1", i.source),
         hx + PAD,
         line_y(hy, hh, t.font.row),
-        t.font.row,
-        Weight::SemiBold,
-        t.color.text,
-        Align::Left,
+        t.text.row.semibold(),
     );
     ui.text(
         i.position.clone(),
         hx + hw - PAD,
         line_y(hy, hh, t.font.row),
-        t.font.row,
-        Weight::SemiBold,
-        t.color.text,
-        Align::Right,
+        t.text.row.semibold().right(),
     );
 
     // Artwork: the panel's full height.
@@ -784,10 +761,7 @@ fn info_panel(ui: &mut Ui, i: &InfoView) {
                 if i.folder { "FOLDER" } else { "NO ARTWORK" },
                 ax + side * 0.5,
                 line_y(ay, side, t.font.label),
-                t.font.label,
-                Weight::Regular,
-                t.color.dim,
-                Align::Center,
+                t.text.label.color(t.color.dim).center(),
             );
         }
     }
@@ -809,32 +783,15 @@ fn info_panel(ui: &mut Ui, i: &InfoView) {
     let names = [
         (
             i.field(title_label).to_string(),
-            t.font.title,
-            Weight::SemiBold,
-            title_color,
+            t.text.title.color(title_color),
         ),
-        (
-            i.field("ARTIST").to_string(),
-            t.font.row,
-            Weight::Regular,
-            t.color.text,
-        ),
-        (album, t.font.label, Weight::Regular, t.color.label),
+        (i.field("ARTIST").to_string(), t.text.row),
+        (album, t.text.label),
     ];
     let mut y = ay - 3.0;
-    for (text, size, weight, color) in names {
-        ui.scene.text(crate::scene::Text {
-            text,
-            x: x0,
-            y,
-            size,
-            line_height: t.font.line_height,
-            weight,
-            color,
-            align: Align::Left,
-            max_width: Some(w),
-        });
-        y += size * t.font.line_height + 3.0;
+    for (text, style) in names {
+        ui.text(text, x0, y, style.max_width(w));
+        y += style.line_box() + 3.0;
     }
     if i.folder {
         return;
@@ -857,33 +814,24 @@ fn info_panel(ui: &mut Ui, i: &InfoView) {
             ui.scene
                 .fill(cx - 8.0, gy + 10.0, 1.0, 52.0, t.color.row_rule);
         }
-        ui.label(label, cx, gy + 8.0, t.color.label);
-        ui.scene.text(crate::scene::Text {
-            text: value.to_string(),
-            x: cx,
-            y: gy + 8.0 + t.font.label * t.font.line_height,
+        ui.text(label, cx, gy + 8.0, t.text.label);
+        let style = match label {
             // Five stars at the readout size don't fit a cell.
-            size: if label == "RATING" {
-                t.font.row
-            } else {
-                t.font.counter
+            "RATING" => TextStyle {
+                size: t.font.row,
+                ..t.text.counter
             },
-            line_height: 1.0,
-            weight: Weight::SemiBold,
-            color: if label == "BPM" {
-                t.color.accent_text
-            } else {
-                t.color.text
-            },
-            align: Align::Left,
-            max_width: Some(cw - 16.0),
-        });
+            "BPM" => t.text.counter.color(t.color.accent_text),
+            _ => t.text.counter,
+        };
+        let y = gy + 8.0 + t.text.label.line_box();
+        ui.text(value.to_string(), cx, y, style.max_width(cw - 16.0));
     }
 
     // Comment, across the rest.
     let cy = 270.0;
     ui.scene.fill(x0, cy, w, 1.0, t.color.row_rule);
-    ui.label("COMMENT", x0, cy + 8.0, t.color.label);
+    ui.text("COMMENT", x0, cy + 8.0, t.text.label);
     let (text, color) = match &i.comment {
         Some(c) => (c.as_str(), t.color.text),
         None => ("No comment", t.color.dim),
@@ -892,17 +840,12 @@ fn info_panel(ui: &mut Ui, i: &InfoView) {
     let line = t.font.small * t.font.line_height;
     let lines = (((384.0 - top) / line) as usize).max(1);
     for (k, l) in wrap(text, w, t.font.small, lines).iter().enumerate() {
-        ui.scene.text(crate::scene::Text {
-            text: l.clone(),
-            x: x0,
-            y: top + k as f32 * line,
-            size: t.font.small,
-            line_height: t.font.line_height,
-            weight: Weight::Regular,
-            color,
-            align: Align::Left,
-            max_width: Some(w),
-        });
+        ui.text(
+            l.clone(),
+            x0,
+            top + k as f32 * line,
+            t.text.small.color(color).max_width(w),
+        );
     }
 }
 
@@ -962,10 +905,7 @@ fn side_panel(ui: &mut Ui, i: &InfoView) {
                 if i.folder { "FOLDER" } else { "NO ARTWORK" },
                 x0 + side * 0.5,
                 line_y(ay, side, t.font.small),
-                t.font.small,
-                Weight::Regular,
-                t.color.dim,
-                Align::Center,
+                t.text.small.color(t.color.dim).center(),
             );
         }
     }
@@ -980,41 +920,19 @@ fn side_panel(ui: &mut Ui, i: &InfoView) {
     let names = [
         (
             i.field(title_label),
-            t.font.row,
-            Weight::SemiBold,
-            title_color,
+            t.text.row.semibold().color(title_color),
         ),
-        (i.field("ARTIST"), t.font.row, Weight::Regular, t.color.text),
-        (
-            i.field("ALBUM"),
-            t.font.label,
-            Weight::Regular,
-            t.color.label,
-        ),
-        (
-            i.field("GENRE"),
-            t.font.label,
-            Weight::Regular,
-            t.color.label,
-        ),
+        (i.field("ARTIST"), t.text.row),
+        (i.field("ALBUM"), t.text.label),
+        (i.field("GENRE"), t.text.label),
     ];
     let mut y = ay - 2.0;
-    for (k, (text, size, weight, color)) in names.into_iter().enumerate() {
+    for (k, (text, style)) in names.into_iter().enumerate() {
         if i.folder && k > 0 {
             break;
         }
-        ui.scene.text(crate::scene::Text {
-            text: text.to_string(),
-            x: tx,
-            y,
-            size,
-            line_height: t.font.line_height,
-            weight,
-            color,
-            align: Align::Left,
-            max_width: Some(tw),
-        });
-        y += size * t.font.line_height + 2.0;
+        ui.text(text.to_string(), tx, y, style.max_width(tw));
+        y += style.line_box() + 2.0;
     }
     if i.folder {
         return;
@@ -1033,24 +951,19 @@ fn side_panel(ui: &mut Ui, i: &InfoView) {
     let cw = w / cells.len() as f32;
     for (k, (label, value)) in cells.into_iter().enumerate() {
         let cx = x0 + k as f32 * cw;
-        ui.label(label, cx, gy + 6.0, t.color.label);
-        ui.scene.text(crate::scene::Text {
-            text: value.to_string(),
-            x: cx,
-            y: gy + 6.0 + t.font.label * t.font.line_height,
-            size: t.font.row,
-            line_height: t.font.line_height,
-            weight: Weight::SemiBold,
-            color: t.color.text,
-            align: Align::Left,
-            max_width: Some(cw - 6.0),
-        });
+        ui.text(label, cx, gy + 6.0, t.text.label);
+        ui.text(
+            value.to_string(),
+            cx,
+            gy + 6.0 + t.font.label * t.font.line_height,
+            t.text.row.semibold().max_width(cw - 6.0),
+        );
     }
 
     // Comment.
     let cy = gy + 62.0;
     ui.scene.fill(x0, cy, w, 1.0, t.color.row_rule);
-    ui.label("COMMENT", x0, cy + 6.0, t.color.label);
+    ui.text("COMMENT", x0, cy + 6.0, t.text.label);
     let (text, color) = match &i.comment {
         Some(c) => (c.as_str(), t.color.text),
         None => ("No comment", t.color.dim),
@@ -1059,17 +972,12 @@ fn side_panel(ui: &mut Ui, i: &InfoView) {
     let room = LIST_Y + ROW_H * ROWS as f32 - top;
     let lines = ((room / (t.font.small * t.font.line_height)) as usize).max(1);
     for (k, l) in wrap(text, w, t.font.small, lines).iter().enumerate() {
-        ui.scene.text(crate::scene::Text {
-            text: l.clone(),
-            x: x0,
-            y: top + k as f32 * t.font.small * t.font.line_height,
-            size: t.font.small,
-            line_height: t.font.line_height,
-            weight: Weight::Regular,
-            color,
-            align: Align::Left,
-            max_width: Some(w),
-        });
+        ui.text(
+            l.clone(),
+            x0,
+            top + k as f32 * t.font.small * t.font.line_height,
+            t.text.small.color(color).max_width(w),
+        );
     }
 }
 
@@ -1121,24 +1029,19 @@ fn modal(ui: &mut Ui, m: &ModalView) {
         t.shape.border_active,
         t.color.accent,
     );
-    ui.scene.text(crate::scene::Text {
-        text: m.title.clone(),
-        x: x + 20.0,
-        y: y + 10.0,
-        size: t.font.row,
-        line_height: t.font.line_height,
-        weight: Weight::SemiBold,
-        color: t.color.text,
-        align: Align::Left,
-        max_width: Some(w - 40.0),
-    });
+    ui.text(
+        m.title.clone(),
+        x + 20.0,
+        y + 10.0,
+        t.text.row.semibold().max_width(w - 40.0),
+    );
     let first = m
         .selected
         .saturating_sub(MODAL_ROWS - 1)
         .min(m.rows.len().saturating_sub(shown));
     for (k, label) in m.rows.iter().enumerate().skip(first).take(shown) {
         let ry = y + top + (k - first) as f32 * (row_h + 4.0);
-        let rect = (x + 16.0, ry, w - 32.0, row_h);
+        let rect = Rect::new(x + 16.0, ry, w - 32.0, row_h);
         let danger = m.danger_first && k == 0;
         if danger {
             let (fill, edge) = if m.selected == k {
@@ -1147,23 +1050,21 @@ fn modal(ui: &mut Ui, m: &ModalView) {
                 (t.color.button, t.color.danger)
             };
             ui.scene.rounded(
-                rect.0,
-                rect.1,
-                rect.2,
-                rect.3,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
                 t.shape.button_radius,
                 fill,
                 t.shape.border,
                 edge,
             );
-            ui.text(
+            ui.text_in(
                 label.clone(),
-                rect.0 + rect.2 * 0.5,
-                ry + (row_h - t.font.button * t.font.line_height) * 0.5,
-                t.font.button,
-                Weight::SemiBold,
-                t.color.danger_text,
-                Align::Center,
+                rect.center_x(),
+                ry,
+                row_h,
+                t.text.button.color(t.color.danger_text).center(),
             );
             ui.hit(Target::ModalRow(k as u16), rect);
         } else {
@@ -1202,15 +1103,7 @@ fn ask_scan(ui: &mut Ui) {
         t.shape.border_active,
         t.color.accent,
     );
-    ui.text(
-        "This USB has no library",
-        x + 24.0,
-        y + 18.0,
-        t.font.title,
-        Weight::SemiBold,
-        t.color.text,
-        Align::Left,
-    );
+    ui.text("This USB has no library", x + 24.0, y + 18.0, t.text.title);
     for (i, line) in [
         "Scan it to list every track under LIBRARY, with its tags?",
         "Scanning reads each file once. Without it, browse the folders;",
@@ -1219,27 +1112,19 @@ fn ask_scan(ui: &mut Ui) {
     .into_iter()
     .enumerate()
     {
-        ui.text(
-            line,
-            x + 24.0,
-            y + 56.0 + i as f32 * 22.0,
-            t.font.label,
-            Weight::Regular,
-            t.color.label,
-            Align::Left,
-        );
+        ui.text(line, x + 24.0, y + 56.0 + i as f32 * 22.0, t.text.label);
     }
     let by = y + h - 68.0;
     ui.button(
         Target::ScanYes,
-        (x + 24.0, by, 260.0, 48.0),
+        Rect::new(x + 24.0, by, 260.0, 48.0),
         "SCAN",
         None,
         true,
     );
     ui.button(
         Target::ScanNo,
-        (x + w - 24.0 - 260.0, by, 260.0, 48.0),
+        Rect::new(x + w - 24.0 - 260.0, by, 260.0, 48.0),
         "FOLDERS ONLY",
         None,
         false,

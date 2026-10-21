@@ -11,7 +11,8 @@
 
 use engine_core::{BEAT_LOOPS, DeckCommand, FALLBACK_BPM, HOT_CUES};
 
-use crate::scene::{Align, Rgba, Weight};
+use crate::kit::Rect;
+use crate::scene::Rgba;
 use crate::screen::{
     PadMode, PerfState, Target, Ui, View, bottom, cue_column, hot_cue_color, hot_cue_letter, phase,
     rail_bottom, status, zoom,
@@ -20,9 +21,9 @@ use crate::screen::{
 /// Pads per bank.
 pub const PADS: usize = 4;
 
-const ZOOM: (f32, f32, f32, f32) = (113.0, 95.0, 703.0, 72.0);
-const PAD_ROW: (f32, f32, f32, f32) = (113.0, 180.0, 703.0, 88.0);
-const LOOP_ROW: (f32, f32, f32, f32) = (113.0, 299.0, 703.0, 67.0);
+const ZOOM: Rect = Rect::new(113.0, 95.0, 703.0, 72.0);
+const PAD_ROW: Rect = Rect::new(113.0, 180.0, 703.0, 88.0);
+const LOOP_ROW: Rect = Rect::new(113.0, 299.0, 703.0, 67.0);
 /// Inner padding of a pad row, and the gap between pads.
 const ROW_PAD: f32 = 6.0;
 
@@ -129,7 +130,7 @@ enum PadLook {
 fn pad(
     ui: &mut Ui,
     target: Target,
-    (x, y, w, h): (f32, f32, f32, f32),
+    Rect { x, y, w, h }: Rect,
     label: &str,
     sub: Option<&str>,
     look: PadLook,
@@ -183,36 +184,25 @@ fn pad(
         label,
         x + w * 0.5,
         top,
-        t.font.pad,
-        Weight::SemiBold,
-        label_color,
-        Align::Center,
+        t.text.pad.color(label_color).center(),
     );
     if let Some(sub) = sub {
         ui.text(
             sub,
             x + w * 0.5,
             top + t.font.pad * lh,
-            t.font.small,
-            Weight::Regular,
-            sub_color,
-            Align::Center,
+            t.text.small.color(sub_color).center(),
         );
     }
-    ui.hit(target, (x, y, w, h));
+    ui.hit(target, Rect::new(x, y, w, h));
 }
 
 /// The rectangles of `n` pads in a row area.
-fn row_cells(
-    (x, y, w, h): (f32, f32, f32, f32),
-    n: usize,
-) -> impl Iterator<Item = (f32, f32, f32, f32)> {
-    let cw = (w - 2.0 * ROW_PAD - ROW_PAD * (n - 1) as f32) / n as f32;
-    let ch = h - 2.0 * ROW_PAD;
-    (0..n).map(move |i| (x + ROW_PAD + i as f32 * (cw + ROW_PAD), y + ROW_PAD, cw, ch))
+fn row_cells(row: Rect, n: usize) -> impl Iterator<Item = Rect> {
+    row.inset(ROW_PAD).columns(n, ROW_PAD)
 }
 
-fn row_frame(ui: &mut Ui, (x, y, w, h): (f32, f32, f32, f32)) {
+fn row_frame(ui: &mut Ui, Rect { x, y, w, h }: Rect) {
     let t = ui.t;
     ui.scene.rounded(
         x,
@@ -234,10 +224,10 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
     // Frame: rail, top row, pads section, status band, bottom strip, column dividers.
     ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
     ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
-    ui.section(106.0, 2.0, 915.0, 85.0);
-    ui.section(106.0, 90.0, 915.0, 301.0);
-    ui.section(106.0, 395.0, 915.0, 99.0);
-    ui.section(106.0, 498.0, 915.0, 99.0);
+    ui.section(Rect::new(106.0, 2.0, 915.0, 85.0));
+    ui.section(Rect::new(106.0, 90.0, 915.0, 301.0));
+    ui.section(Rect::new(106.0, 395.0, 915.0, 99.0));
+    ui.section(Rect::new(106.0, 498.0, 915.0, 99.0));
     for (y, h) in [(7.0, 75.0), (95.0, 292.0), (400.0, 89.0), (502.0, 90.0)] {
         ui.scene.fill(822.0, y, 1.0, h, t.color.section_edge);
     }
@@ -249,7 +239,7 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
     phase(ui, v, 233.0, 367.0, 12.0);
     ui.button(
         Target::Perform,
-        (828.0, 7.0, 188.0, 77.0),
+        Rect::new(828.0, 7.0, 188.0, 77.0),
         "PERFORM",
         None,
         true,
@@ -258,7 +248,7 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
     zoom(ui, v, ZOOM);
     pads(ui, v, perf);
 
-    ui.rule_label("BEAT LOOP", LOOP_ROW.0, 279.0, LOOP_ROW.2);
+    ui.rule_label("BEAT LOOP", LOOP_ROW.x, 279.0, LOOP_ROW.w);
     row_frame(ui, LOOP_ROW);
     let active = loop_beats(v);
     for (k, (cell, beats)) in row_cells(LOOP_ROW, BEAT_LOOPS.len())
@@ -285,26 +275,26 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
 
 fn rail(ui: &mut Ui, perf: PerfState) {
     let t = ui.t;
-    let size = t.font.rail_mode;
-    ui.button_sized(
+    let style = t.text.rail_mode;
+    ui.button_styled(
         Target::HotCueMode,
-        (6.0, 6.0, 88.0, 52.0),
+        Rect::new(6.0, 6.0, 88.0, 52.0),
         "HOT CUE",
         None,
         perf.mode == PadMode::HotCue,
-        size,
+        style,
     );
-    ui.button_sized(
+    ui.button_styled(
         Target::BeatJumpMode,
-        (6.0, 62.0, 88.0, 52.0),
+        Rect::new(6.0, 62.0, 88.0, 52.0),
         "BEAT JUMP",
         None,
         perf.mode == PadMode::BeatJump,
-        size,
+        style,
     );
-    let delete = (6.0, 126.0, 88.0, 62.0);
+    let delete = Rect::new(6.0, 126.0, 88.0, 62.0);
     if perf.delete_armed {
-        let (x, y, w, h) = delete;
+        let Rect { x, y, w, h } = delete;
         ui.scene.rounded(
             x,
             y,
@@ -317,23 +307,12 @@ fn rail(ui: &mut Ui, perf: PerfState) {
         );
         let lh = t.font.line_height;
         let top = y + (h - t.font.button * lh - t.font.small * lh) * 0.5;
-        ui.text(
-            "DELETE",
-            x + w * 0.5,
-            top,
-            t.font.button,
-            Weight::SemiBold,
-            t.color.text,
-            Align::Center,
-        );
+        ui.text("DELETE", x + w * 0.5, top, t.text.button.center());
         ui.text(
             "ARMED",
             x + w * 0.5,
             top + t.font.button * lh,
-            t.font.small,
-            Weight::Regular,
-            t.color.danger_text,
-            Align::Center,
+            t.text.small.color(t.color.danger_text).center(),
         );
         ui.hit(Target::DeleteCall, delete);
     } else {
@@ -350,7 +329,7 @@ fn rail(ui: &mut Ui, perf: PerfState) {
     };
     ui.button(
         Target::Bank,
-        (6.0, 196.0, 88.0, 62.0),
+        Rect::new(6.0, 196.0, 88.0, 62.0),
         "BANK",
         Some(&bank),
         false,

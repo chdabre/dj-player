@@ -11,13 +11,15 @@
 //! next to the colours of what the UI draws around it (grid, cue, loop, playhead), so one
 //! theme drives the screen and the waveform shader.
 
-use crate::scene::Rgba;
+use crate::scene::{Align, Rgba, Weight};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub name: &'static str,
     pub color: Colors,
     pub font: TypeScale,
+    /// Text roles built from `font` and `color`: what screens draw text with.
+    pub text: TextStyles,
     pub shape: Shape,
     pub waveform: WaveformTokens,
 }
@@ -122,6 +124,121 @@ pub struct TypeScale {
     pub row: f32,
 }
 
+/// How a piece of text looks: its role's size, weight, colour and line box, plus the
+/// alignment and width limit a call site sets. Take one from [`TextStyles`] and adjust it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextStyle {
+    pub size: f32,
+    pub weight: Weight,
+    pub color: Rgba,
+    /// Line box height as a multiple of `size` (CSS `line-height`).
+    pub line_height: f32,
+    /// Which edge (or the centre) the anchor x is.
+    pub align: Align,
+    /// Longest the line may be (design pixels); longer text ends in an ellipsis.
+    pub max_width: Option<f32>,
+}
+
+impl TextStyle {
+    const fn new(size: f32, weight: Weight, color: Rgba, line_height: f32) -> Self {
+        Self {
+            size,
+            weight,
+            color,
+            line_height,
+            align: Align::Left,
+            max_width: None,
+        }
+    }
+
+    pub const fn color(self, color: Rgba) -> Self {
+        Self { color, ..self }
+    }
+
+    pub const fn weight(self, weight: Weight) -> Self {
+        Self { weight, ..self }
+    }
+
+    pub const fn semibold(self) -> Self {
+        self.weight(Weight::SemiBold)
+    }
+
+    pub const fn align(self, align: Align) -> Self {
+        Self { align, ..self }
+    }
+
+    pub const fn center(self) -> Self {
+        self.align(Align::Center)
+    }
+
+    pub const fn right(self) -> Self {
+        self.align(Align::Right)
+    }
+
+    pub const fn max_width(self, w: f32) -> Self {
+        Self {
+            max_width: Some(w),
+            ..self
+        }
+    }
+
+    /// The height of one line box.
+    pub fn line_box(self) -> f32 {
+        self.size * self.line_height
+    }
+}
+
+/// Text by role. Running text uses the type scale's line height; number readouts use a
+/// line box of exactly their size (CSS `line-height: 1`), as the wireframe sets them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextStyles {
+    pub label: TextStyle,
+    pub small: TextStyle,
+    pub caption: TextStyle,
+    pub pad: TextStyle,
+    pub rail_mode: TextStyle,
+    pub button: TextStyle,
+    pub chip: TextStyle,
+    pub chip_large: TextStyle,
+    pub title: TextStyle,
+    pub title_aside: TextStyle,
+    pub row: TextStyle,
+    pub readout: TextStyle,
+    pub readout_fraction: TextStyle,
+    pub bpm: TextStyle,
+    pub player: TextStyle,
+    pub counter: TextStyle,
+    pub badge: TextStyle,
+    pub unit: TextStyle,
+}
+
+impl TextStyles {
+    pub fn new(f: &TypeScale, c: &Colors) -> Self {
+        let text = |size, weight, color| TextStyle::new(size, weight, color, f.line_height);
+        let digits = |size| TextStyle::new(size, Weight::SemiBold, c.text, 1.0);
+        Self {
+            label: text(f.label, Weight::Regular, c.label),
+            small: text(f.small, Weight::Regular, c.label),
+            caption: text(f.caption, Weight::Regular, c.label),
+            pad: text(f.pad, Weight::SemiBold, c.text),
+            rail_mode: text(f.rail_mode, Weight::SemiBold, c.text),
+            button: text(f.button, Weight::SemiBold, c.text),
+            chip: text(f.chip, Weight::SemiBold, c.text),
+            chip_large: text(f.chip_large, Weight::SemiBold, c.text),
+            title: text(f.title, Weight::SemiBold, c.text),
+            title_aside: text(f.title_aside, Weight::SemiBold, c.key),
+            row: text(f.row, Weight::Regular, c.text),
+            readout: digits(f.readout),
+            readout_fraction: digits(f.readout_fraction),
+            bpm: digits(f.bpm),
+            player: digits(f.player),
+            counter: digits(f.counter),
+            badge: digits(f.badge),
+            unit: digits(f.unit),
+        }
+    }
+}
+
 /// Corner radii and line widths.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shape {
@@ -187,74 +304,77 @@ impl Theme {
         let accent = Rgba::hex(0x2b7fff);
         let amber = Rgba::hex(0xe0a33a);
         let dim = Rgba::hex(0x6b6f75);
+        let color = Colors {
+            background: Rgba::hex(0x000000),
+            section_edge: Rgba::hex(0x34373d),
+            rule: Rgba::hex(0x3a3d42),
+            button: Rgba::hex(0x222428),
+            button_edge: Rgba::hex(0x5f6369),
+            button_pressed: Rgba::hex(0x33373d),
+            button_pressed_edge: Rgba::hex(0xe6e6e6),
+            button_on: Rgba::hex(0x0b2350),
+            button_on_edge: accent,
+            chip_edge: Rgba::hex(0x7a7e84),
+            chip_selected: Rgba::hex(0x33363b),
+            text: Rgba::hex(0xe6e6e6),
+            label: Rgba::hex(0xa6a9ae),
+            dim,
+            on_badge: Rgba::hex(0x000000),
+            accent,
+            accent_text: Rgba::hex(0x7cb4ff),
+            accent_dim: Rgba::hex(0x22457a),
+            cue: amber,
+            cue_text: Rgba::hex(0xf2c06a),
+            cue_dim: Rgba::hex(0x7a6a4a),
+            key: Rgba::hex(0x6cc4f0),
+            title_bar: Rgba::hex(0x1e2024),
+            track_color: Rgba::hex(0x8b7be0),
+            hot_cue: Rgba::hex(0xe8667a),
+            hot_cue_colors: [
+                Rgba::hex(0xe8667a), // rose
+                Rgba::hex(0xe0a33a), // amber
+                Rgba::hex(0x5ab8ec), // sky
+                Rgba::hex(0x6cc08b), // green
+                Rgba::hex(0xa78bfa), // violet
+                Rgba::hex(0xf0762a), // orange
+                Rgba::hex(0x3fb8ae), // teal
+                Rgba::hex(0xe878c8), // pink
+            ],
+            pad_tint: 0.04,
+            danger: Rgba::hex(0xe8667a),
+            danger_fill: Rgba::hex(0x3a1a20),
+            danger_text: Rgba::hex(0xf0a0ab),
+            overlay: Rgba::hex(0x000000).alpha(0.75),
+            row_selected: accent.alpha(0.09),
+            row_rule: Rgba::hex(0x2c2e33),
+            folder: Rgba::hex(0x7a7e84),
+        };
+        let font = TypeScale {
+            line_height: 1.2,
+            label: 15.0,
+            small: 14.0,
+            caption: 13.0,
+            pad: 25.0,
+            rail_mode: 18.0,
+            button: 20.0,
+            chip: 16.0,
+            chip_large: 22.0,
+            title: 23.0,
+            title_aside: 22.0,
+            readout: 56.0,
+            readout_fraction: 37.0,
+            bpm: 41.0,
+            player: 39.0,
+            counter: 27.0,
+            badge: 19.0,
+            unit: 22.0,
+            row: 20.0,
+        };
         Theme {
             name: "reference",
-            color: Colors {
-                background: Rgba::hex(0x000000),
-                section_edge: Rgba::hex(0x34373d),
-                rule: Rgba::hex(0x3a3d42),
-                button: Rgba::hex(0x222428),
-                button_edge: Rgba::hex(0x5f6369),
-                button_pressed: Rgba::hex(0x33373d),
-                button_pressed_edge: Rgba::hex(0xe6e6e6),
-                button_on: Rgba::hex(0x0b2350),
-                button_on_edge: accent,
-                chip_edge: Rgba::hex(0x7a7e84),
-                chip_selected: Rgba::hex(0x33363b),
-                text: Rgba::hex(0xe6e6e6),
-                label: Rgba::hex(0xa6a9ae),
-                dim,
-                on_badge: Rgba::hex(0x000000),
-                accent,
-                accent_text: Rgba::hex(0x7cb4ff),
-                accent_dim: Rgba::hex(0x22457a),
-                cue: amber,
-                cue_text: Rgba::hex(0xf2c06a),
-                cue_dim: Rgba::hex(0x7a6a4a),
-                key: Rgba::hex(0x6cc4f0),
-                title_bar: Rgba::hex(0x1e2024),
-                track_color: Rgba::hex(0x8b7be0),
-                hot_cue: Rgba::hex(0xe8667a),
-                hot_cue_colors: [
-                    Rgba::hex(0xe8667a), // rose
-                    Rgba::hex(0xe0a33a), // amber
-                    Rgba::hex(0x5ab8ec), // sky
-                    Rgba::hex(0x6cc08b), // green
-                    Rgba::hex(0xa78bfa), // violet
-                    Rgba::hex(0xf0762a), // orange
-                    Rgba::hex(0x3fb8ae), // teal
-                    Rgba::hex(0xe878c8), // pink
-                ],
-                pad_tint: 0.04,
-                danger: Rgba::hex(0xe8667a),
-                danger_fill: Rgba::hex(0x3a1a20),
-                danger_text: Rgba::hex(0xf0a0ab),
-                overlay: Rgba::hex(0x000000).alpha(0.75),
-                row_selected: accent.alpha(0.09),
-                row_rule: Rgba::hex(0x2c2e33),
-                folder: Rgba::hex(0x7a7e84),
-            },
-            font: TypeScale {
-                line_height: 1.2,
-                label: 15.0,
-                small: 14.0,
-                caption: 13.0,
-                pad: 25.0,
-                rail_mode: 18.0,
-                button: 20.0,
-                chip: 16.0,
-                chip_large: 22.0,
-                title: 23.0,
-                title_aside: 22.0,
-                readout: 56.0,
-                readout_fraction: 37.0,
-                bpm: 41.0,
-                player: 39.0,
-                counter: 27.0,
-                badge: 19.0,
-                unit: 22.0,
-                row: 20.0,
-            },
+            text: TextStyles::new(&font, &color),
+            color,
+            font,
             shape: Shape {
                 section_radius: 6.0,
                 button_radius: 4.0,
@@ -321,6 +441,8 @@ mod tests {
             ("gfx.rs", include_str!("gfx.rs")),
             ("perform.rs", include_str!("perform.rs")),
             ("browse.rs", include_str!("browse.rs")),
+            ("kit/mod.rs", include_str!("kit/mod.rs")),
+            ("kit/rect.rs", include_str!("kit/rect.rs")),
         ] {
             let code = src.split("#[cfg(test)]").next().unwrap_or(src);
             for pattern in ["Rgba::hex(", "Rgba(["] {
