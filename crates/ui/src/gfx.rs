@@ -15,7 +15,7 @@ use glyphon::{
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
-use crate::scene::{Align, Rgba, Scene, Weight};
+use crate::scene::{Align, Gradient, Rgba, Scene, Weight};
 
 pub const DESIGN_W: f32 = 1024.0;
 pub const DESIGN_H: f32 = 600.0;
@@ -30,17 +30,19 @@ struct View { xform: vec4<f32>, size: vec4<f32> };  // scale, offset x, offset y
 
 struct Inst {
     @location(0) rect: vec4<f32>,
-    @location(1) params: vec4<f32>,   // radius, border
+    @location(1) params: vec4<f32>,   // radius, border, gradient (0 none, 1 down, 2 mirrored)
     @location(2) fill: vec4<f32>,
     @location(3) stroke: vec4<f32>,
+    @location(4) fill2: vec4<f32>,    // the gradient's other colour
 };
 struct Out {
     @builtin(position) pos: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) half: vec2<f32>,
-    @location(2) params: vec2<f32>,
+    @location(2) params: vec3<f32>,
     @location(3) fill: vec4<f32>,
     @location(4) stroke: vec4<f32>,
+    @location(5) fill2: vec4<f32>,
 };
 
 @vertex
@@ -55,9 +57,10 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> Out {
     o.pos = vec4(p.x / view.size.x * 2.0 - 1.0, 1.0 - p.y / view.size.y * 2.0, 0.0, 1.0);
     o.local = p - (p0 + size * 0.5);
     o.half = size * 0.5;
-    o.params = i.params.xy * s;
+    o.params = vec3(i.params.xy * s, i.params.z);
     o.fill = i.fill;
     o.stroke = i.stroke;
+    o.fill2 = i.fill2;
     return o;
 }
 
@@ -71,7 +74,16 @@ fn fs(o: Out) -> @location(0) vec4<f32> {
     let r = min(o.params.x, min(o.half.x, o.half.y));
     let d = sd_round_box(o.local, o.half, r);
     let coverage = clamp(0.5 - d, 0.0, 1.0);
-    let fill = vec4(o.fill.rgb * o.fill.a, o.fill.a);
+    // Vertical gradient: `fill` at the top (down) or at the edges (mirrored), `fill2` at
+    // the bottom or the centre line.
+    var f = o.fill;
+    let v = clamp(o.local.y / o.half.y, -1.0, 1.0);
+    if (o.params.z > 1.5) {
+        f = mix(o.fill, o.fill2, 1.0 - abs(v));
+    } else if (o.params.z > 0.5) {
+        f = mix(o.fill, o.fill2, v * 0.5 + 0.5);
+    }
+    let fill = vec4(f.rgb * f.a, f.a);
     var c = fill;
     if (o.params.y > 0.0) {
         let inside = clamp(0.5 - (d + o.params.y), 0.0, 1.0);
@@ -179,9 +191,10 @@ const WAVE_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
 const WAVE_INSTANCE_BYTES: u64 = 12 * 4;
 
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
-const INSTANCE_BYTES: u64 = 16 * 4;
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4
+];
+const INSTANCE_BYTES: u64 = 20 * 4;
 
 /// Design pixels → physical pixels on a `w`×`h` target: (scale, offset x, offset y). The
 /// design is scaled uniformly and centred.
@@ -640,10 +653,16 @@ impl Gfx {
         for r in &scene.rects {
             let fill = self.color(r.fill);
             let stroke = self.color(r.stroke);
-            for v in [r.x, r.y, r.w, r.h, r.radius, r.border, 0.0, 0.0]
+            let (kind, fill2) = match r.gradient {
+                None => (0.0, fill),
+                Some((to, Gradient::Down)) => (1.0, self.color(to)),
+                Some((to, Gradient::Mirrored)) => (2.0, self.color(to)),
+            };
+            for v in [r.x, r.y, r.w, r.h, r.radius, r.border, kind, 0.0]
                 .into_iter()
                 .chain(fill)
                 .chain(stroke)
+                .chain(fill2)
             {
                 self.instance_bytes.extend_from_slice(&v.to_ne_bytes());
             }

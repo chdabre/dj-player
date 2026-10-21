@@ -124,7 +124,10 @@ pub struct WaveformTokens {
     /// Palettes, gains and dimming of the waveform (the waveform crate's theme). The track
     /// gain inside it is set per track at run time.
     pub style: waveform::display::Style,
+    /// The panel behind the waveform: a vertical gradient from `background` at the edges
+    /// (top, for a bottom-aligned view) to `background_glow` at the baseline.
     pub background: Rgba,
+    pub background_glow: Rgba,
     pub center_line: Rgba,
     pub beat_line: Rgba,
     pub bar_line: Rgba,
@@ -215,6 +218,7 @@ impl Theme {
             waveform: WaveformTokens {
                 style: waveform::display::Style::default(),
                 background: Rgba::hex(0x07080a),
+                background_glow: Rgba::hex(0x1f2430),
                 center_line: Rgba::hex(0x15171b),
                 beat_line: Rgba::hex(0x262a30),
                 bar_line: Rgba::hex(0x48505a),

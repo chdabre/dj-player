@@ -9,7 +9,7 @@
 
 use engine_core::DeckGrid;
 
-use crate::scene::{Align, Rgba, Scene, Text, Weight};
+use crate::scene::{Align, Gradient, Rgba, Scene, Text, Weight};
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveSettings};
 
@@ -672,21 +672,33 @@ fn meter(ui: &mut Ui, x: f32, y: f32, active: Option<u8>, filled: bool) {
     }
 }
 
+/// The panel behind a waveform: a gradient towards the waveform's baseline (the centre line
+/// for a mirrored view, the bottom for a bottom-aligned one).
+fn panel(ui: &mut Ui, (x, y, w, h): (f32, f32, f32, f32), align: Option<crate::waves::Align>) {
+    let t = ui.t;
+    let wf = &t.waveform;
+    let kind = match align {
+        Some(crate::waves::Align::Bottom) => Gradient::Down,
+        _ => Gradient::Mirrored,
+    };
+    ui.scene.gradient(
+        x,
+        y,
+        w,
+        h,
+        t.shape.panel_radius,
+        wf.background,
+        wf.background_glow,
+        kind,
+    );
+}
+
 /// Zoomed view around the playhead: beat grid, loop, cue, hot cue strip, playhead.
 fn zoom(ui: &mut Ui, v: &View) {
     let t = ui.t;
     let wf = &t.waveform;
     let (x0, y0, w, h) = ZOOM;
-    ui.scene.rounded(
-        x0,
-        y0,
-        w,
-        h,
-        t.shape.panel_radius,
-        wf.background,
-        0.0,
-        wf.background,
-    );
+    panel(ui, ZOOM, v.wave.map(|w| w.settings.zoom_align));
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
     // Frames per design pixel.
     let span = match v.grid {
@@ -923,16 +935,7 @@ fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let t = ui.t;
     let wf = &t.waveform;
     let (x0, y0, w, h) = OVERVIEW;
-    ui.scene.rounded(
-        x0,
-        y0,
-        w,
-        h,
-        t.shape.panel_radius,
-        wf.background,
-        0.0,
-        wf.background,
-    );
+    panel(ui, OVERVIEW, v.wave.map(|w| w.settings.overview_align));
     if v.length > 0.0 {
         let to_x = |pos: f64| x0 + (pos / v.length).clamp(0.0, 1.0) as f32 * w;
         if let Some(wave) = &v.wave {
