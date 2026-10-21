@@ -30,7 +30,12 @@ usage: engined <file> [--device <name>] [--buffer <frames>] [--bpm-range MIN-MAX
 Set TEMPOCNN_MODEL to the TempoCNN .onnx model for model-based tempo (see docs/plan/analysis.md).
 
 keys:  space play/pause   <-/-> seek -/+5 s   +/- rate +/-1 %   0 reset rate
-       k keylock   r reverse   s slip   q quit";
+       k keylock   r reverse   s slip   z quantize   c cue   1-4 hot cue A-D (!@#$ delete)
+       i/o loop in/out   l reloop/exit   b 4-beat loop   [/] loop 1/2X / 2X   ,/. jump -/+4 beats
+       q quit
+
+A terminal reports no key releases, so c is a tap: back cue and set cue work, holding to
+preview does not.";
 
 struct Args {
     file: Option<PathBuf>,
@@ -154,8 +159,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let _raw = interactive.then_some(RawModeGuard);
     if interactive {
         out(
-            "space play/pause  <-/-> seek 5 s  +/- rate 1 %  0 reset  k keylock  r reverse  \
-             s slip  q quit",
+            "space play  c cue  1-4 hot cues  i/o/l loop  b beat loop  [/] 1/2X 2X  ,/. jump  \
+             z quantize  k keylock  r reverse  s slip  q quit (engined --help for all keys)",
         );
     } else {
         out("stdin is not a terminal: playing to the end without key control");
@@ -175,6 +180,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     Action::Quit => break,
                     Action::Send(cmd) => {
                         if handle.send_deck(DECK, cmd).is_err() {
+                            out("command ring full, key dropped");
+                        }
+                    }
+                    Action::Tap(press, release) => {
+                        if handle.send_deck(DECK, press).is_err()
+                            || handle.send_deck(DECK, release).is_err()
+                        {
                             out("command ring full, key dropped");
                         }
                     }
@@ -365,8 +377,34 @@ fn report(state: &DeckState, meter: &LoadMeter, source: &Source, rate: u32) {
     } else {
         String::new()
     };
+    let hot = state.hot_cues.load(Ordering::Relaxed);
+    let pads: String = (0..8)
+        .map(|i| {
+            if hot & (1 << i) != 0 {
+                (b'A' + i) as char
+            } else {
+                '.'
+            }
+        })
+        .take(4)
+        .collect();
+    let extras = format!(
+        "  Q{}  {}  hot {pads}",
+        match state.quantize.load() {
+            q if q > 0.0 => format!(" {q}"),
+            _ => " off".into(),
+        },
+        if state.looping.load(Ordering::Relaxed) {
+            format!(
+                "LOOP {}",
+                clock((state.loop_end.load() - state.loop_start.load()) / sr)
+            )
+        } else {
+            "no loop".into()
+        },
+    );
     let mut line = format!(
-        "{} / {}  rate {:+.2} %{tempo}  {} {} {} {}  load avg {:4.1} % peak {:4.1} % ({} cb)",
+        "{} / {}  rate {:+.2} %{tempo}  {} {} {} {}{extras}  load avg {:4.1} % peak {:4.1} % ({} cb)",
         clock(state.position.load() / sr),
         clock(state.length.load() / sr),
         (state.rate.load() - 1.0) * 100.0,
@@ -405,6 +443,8 @@ enum Action {
     None,
     Quit,
     Send(DeckCommand),
+    /// A button press and its release (the terminal reports no releases).
+    Tap(DeckCommand, DeckCommand),
 }
 
 /// Maps keys to deck commands. Rate is kept here in whole 1 % steps and sent as an absolute
@@ -412,6 +452,7 @@ enum Action {
 struct Controls {
     sample_rate: f64,
     rate_steps: i32,
+    quantize: bool,
 }
 
 impl Controls {
@@ -419,6 +460,8 @@ impl Controls {
         Self {
             sample_rate: f64::from(sample_rate),
             rate_steps: 0,
+            // The deck starts with quantize on (one beat).
+            quantize: true,
         }
     }
 
@@ -453,6 +496,25 @@ impl Controls {
             KeyCode::Char('k') => DeckCommand::ToggleKeylock,
             KeyCode::Char('r') => DeckCommand::ToggleReverse,
             KeyCode::Char('s') => DeckCommand::ToggleSlip,
+            KeyCode::Char('z') => {
+                self.quantize = !self.quantize;
+                DeckCommand::SetQuantize(self.quantize.then_some(1.0))
+            }
+            KeyCode::Char('c') => {
+                return Action::Tap(DeckCommand::CuePress, DeckCommand::CueRelease);
+            }
+            KeyCode::Char(c @ '1'..='4') => DeckCommand::HotCue(c as usize - '1' as usize),
+            KeyCode::Char(c @ ('!' | '@' | '#' | '$')) => {
+                DeckCommand::DeleteHotCue("!@#$".find(c).unwrap_or(0))
+            }
+            KeyCode::Char('i') => DeckCommand::LoopIn,
+            KeyCode::Char('o') => DeckCommand::LoopOut,
+            KeyCode::Char('l') => DeckCommand::ReloopExit,
+            KeyCode::Char('b') => DeckCommand::BeatLoop(4.0),
+            KeyCode::Char('[') => DeckCommand::LoopResize(0.5),
+            KeyCode::Char(']') => DeckCommand::LoopResize(2.0),
+            KeyCode::Char(',') => DeckCommand::BeatJump(-4.0),
+            KeyCode::Char('.') => DeckCommand::BeatJump(4.0),
             _ => return Action::None,
         })
     }

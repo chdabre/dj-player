@@ -4,7 +4,7 @@
 //! That is fine for meters and displays. A seqlock'd fast-state block replaces this once the
 //! UI needs a coherent snapshot.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// An `f64` stored as its bit pattern in an `AtomicU64`.
 #[derive(Debug, Default)]
@@ -48,6 +48,17 @@ pub struct DeckState {
     pub track_bpm: AtomicF64,
     /// Fractional beat number at the playhead (0.0 = first grid beat); NaN without a grid.
     pub beat: AtomicF64,
+    /// Cue point, frames.
+    pub cue: AtomicF64,
+    /// Hot cues in use (bit 0 = A).
+    pub hot_cues: AtomicU8,
+    /// Quantize resolution in beats; 0 = off.
+    pub quantize: AtomicF64,
+    /// A loop is active.
+    pub looping: AtomicBool,
+    /// The active or stored loop (frames); NaN if none.
+    pub loop_start: AtomicF64,
+    pub loop_end: AtomicF64,
     /// Track length in frames (estimate while loading).
     pub length: AtomicF64,
     /// True if the last block hit a chunk that was not loaded yet.

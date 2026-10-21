@@ -10,7 +10,7 @@ Install Rust with [rustup](https://rustup.rs) and the Xcode command line tools (
 cargo run -p engined --release -- <file>
 ```
 
-Any MP3, AAC/M4A, ALAC, FLAC, WAV, AIFF or Ogg file works. Keys: space play/pause, ←/→ seek ±5 s, `+`/`-` rate ±1 %, `0` reset the rate, `k` keylock, `r` reverse, `s` slip, `q` quit. Once per second the engine prints the playhead, the rate and the callback load meter. `--list-devices`, `--device <name>` and `--buffer <frames>` select the output. See [docs/dev-setup.md](docs/dev-setup.md) for more.
+Any MP3, AAC/M4A, ALAC, FLAC, WAV, AIFF or Ogg file works. Keys: space play/pause, ←/→ seek ±5 s, `+`/`-` rate ±1 %, `0` reset the rate, `k` keylock, `r` reverse, `s` slip, `z` quantize, `c` cue, `1`–`4` hot cues (`!@#$` delete), `i`/`o` loop in/out, `l` reloop/exit, `b` 4-beat loop, `[`/`]` loop 1/2X/2X, `,`/`.` beat jump ∓4, `q` quit. Once per second the engine prints the playhead, the rate and the callback load meter. `--list-devices`, `--device <name>` and `--buffer <frames>` select the output. See [docs/dev-setup.md](docs/dev-setup.md) for more.
 
 ## Layout
 

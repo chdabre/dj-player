@@ -26,7 +26,7 @@ The claude.ai links need the project owner's account. The exported copies in `do
 - Rekordbox libraries are **read-only**. All writes go to our own library format (snapshot + per-device append-only journals + content-addressed blobs), on the USB stick or a cloud folder.
 - No internal storage by default: RAM is the working cache, the stick (or cloud) is the persistent store.
 - Never hard-code 48 kHz; resample at load to the device rate.
-- License: GPL-3.0-or-later.
+- License: GPL-3.0-or-later. AGPL-3.0 components are accepted (decided 2026-10-21): the TempoCNN model and the `hpcpkey` port in `engine-analysis` (see `docs/plan/analysis.md`).
 
 ## Current step
 

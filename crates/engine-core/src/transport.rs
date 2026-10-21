@@ -14,6 +14,15 @@
 //!
 //! A seek is not slip-able: it moves both playheads and ends any active slip.
 //!
+//! # Loops
+//!
+//! An active loop wraps the playhead from its end back to its start (and from its start to
+//! its end in reverse) on the exact frame, so one block may read several pieces:
+//! [`Transport::advance`] returns them as [`Segments`]. A loop is slip-able: with slip on, the
+//! shadow keeps running straight and exiting the loop snaps to it. The loop is remembered
+//! after exit for RELOOP. Loops shorter than [`MIN_LOOP_FRAMES`] are refused, which bounds
+//! the number of pieces per block.
+//!
 //! # Keylock
 //!
 //! Keylock is a flag here and changes nothing about how the playheads move:
@@ -28,6 +37,85 @@ pub enum SlipAction {
     Pause = 1 << 0,
     /// Playing in reverse.
     Reverse = 1 << 1,
+    /// Inside an active loop.
+    Loop = 1 << 2,
+}
+
+/// Shortest loop, in frames. With blocks of at most 1024 frames and rates up to 4x, a block
+/// then wraps at most 8 times.
+pub const MIN_LOOP_FRAMES: f64 = 512.0;
+
+/// Most pieces one block can be split into.
+pub const MAX_SEGMENTS: usize = 16;
+
+/// A loop between two positions (frames), `start < end`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Loop {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl Loop {
+    pub fn len(&self) -> f64 {
+        self.end - self.start
+    }
+
+    pub fn contains(&self, position: f64) -> bool {
+        position >= self.start && position < self.end
+    }
+}
+
+/// The pieces of one block: piece `i` starts at output frame `offset` and reads its
+/// [`Segment`] until the next piece (or the end of the block).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Segments {
+    parts: [(usize, Segment); MAX_SEGMENTS],
+    len: usize,
+}
+
+impl Segments {
+    fn new() -> Self {
+        Self {
+            parts: [(
+                0,
+                Segment {
+                    start: 0.0,
+                    step: 0.0,
+                },
+            ); MAX_SEGMENTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, offset: usize, segment: Segment) {
+        if self.len < MAX_SEGMENTS {
+            self.parts[self.len] = (offset, segment);
+            self.len += 1;
+        }
+    }
+
+    /// The first piece (the whole block when there is no loop wrap).
+    pub fn first(&self) -> Segment {
+        self.parts[0].1
+    }
+
+    /// (offset, frames, segment) per piece, for a block of `frames` frames.
+    pub fn iter(&self, frames: usize) -> impl Iterator<Item = (usize, usize, Segment)> + '_ {
+        (0..self.len).map(move |i| {
+            let (offset, seg) = self.parts[i];
+            let end = if i + 1 < self.len {
+                self.parts[i + 1].0
+            } else {
+                frames
+            };
+            (offset, end - offset, seg)
+        })
+    }
+
+    /// Number of pieces: 1 without a loop wrap in the block.
+    pub fn count(&self) -> usize {
+        self.len
+    }
 }
 
 /// One block of playhead movement: frame `k` of the block reads the source at
@@ -48,6 +136,9 @@ pub struct Transport {
     slip_enabled: bool,
     shadow: f64,
     slip_held: u8,
+    /// The current or last loop; `looping` says whether it is active.
+    loop_: Option<Loop>,
+    looping: bool,
     keylock: bool,
 }
 
@@ -69,6 +160,8 @@ impl Transport {
             slip_enabled: false,
             shadow: 0.0,
             slip_held: 0,
+            loop_: None,
+            looping: false,
             keylock: false,
         }
     }
@@ -116,6 +209,65 @@ impl Transport {
         self.keylock = enabled;
     }
 
+    /// The active loop, if any.
+    pub fn active_loop(&self) -> Option<Loop> {
+        self.loop_.filter(|_| self.looping)
+    }
+
+    /// The current or last loop (for RELOOP), active or not.
+    pub fn stored_loop(&self) -> Option<Loop> {
+        self.loop_
+    }
+
+    /// Set and enter a loop. Refused (returns false) if shorter than [`MIN_LOOP_FRAMES`] or
+    /// not inside the track. The playhead is not moved: it wraps when it reaches the end.
+    pub fn set_loop(&mut self, l: Loop) -> bool {
+        if l.len() < MIN_LOOP_FRAMES || l.start < 0.0 || l.end > self.length.max(l.start) {
+            return false;
+        }
+        self.loop_ = Some(l);
+        if !self.looping {
+            self.looping = true;
+            self.begin_slip(SlipAction::Loop);
+        }
+        true
+    }
+
+    /// Leave the active loop; with slip, snap to the shadow.
+    pub fn exit_loop(&mut self) {
+        if self.looping {
+            self.looping = false;
+            self.end_slip(SlipAction::Loop);
+        }
+    }
+
+    /// RELOOP: re-enter the stored loop from its start.
+    pub fn reloop(&mut self) {
+        if let Some(l) = self.loop_
+            && !self.looping
+        {
+            self.looping = true;
+            self.begin_slip(SlipAction::Loop);
+            self.position = l.start;
+        }
+    }
+
+    /// Loop move: shift the loop and the playhead by `frames`, keeping any slip.
+    pub fn shift_loop(&mut self, frames: f64) {
+        if let Some(l) = self.loop_ {
+            let moved = Loop {
+                start: l.start + frames,
+                end: l.end + frames,
+            };
+            if moved.start >= 0.0 && moved.end <= self.length {
+                self.loop_ = Some(moved);
+                if self.looping {
+                    self.position = (self.position + frames).clamp(0.0, self.length);
+                }
+            }
+        }
+    }
+
     /// Playhead movement in frames per output frame: signed, 0 when paused.
     pub fn velocity(&self) -> f64 {
         if !self.playing {
@@ -151,11 +303,17 @@ impl Transport {
         }
     }
 
-    /// Jump to `frame` (clamped to the track). Ends any active slip.
+    /// Jump to `frame` (clamped to the track). Ends any active slip; leaves an active loop if
+    /// `frame` is outside it.
     pub fn seek(&mut self, frame: f64) {
         self.position = frame.clamp(0.0, self.length);
         self.shadow = self.position;
         self.slip_held = 0;
+        if let Some(l) = self.active_loop()
+            && !l.contains(self.position)
+        {
+            self.looping = false;
+        }
     }
 
     pub fn seek_relative(&mut self, frames: f64) {
@@ -214,21 +372,56 @@ impl Transport {
         }
     }
 
-    /// Advance by `frames` output frames and return the segment the block should read.
+    /// Advance by `frames` output frames and return the pieces the block should read.
     ///
     /// Reaching the end while moving forward stops playback at the end; reaching the start
-    /// in reverse holds at frame 0.
-    pub fn advance(&mut self, frames: usize) -> Segment {
+    /// in reverse holds at frame 0. An active loop wraps on the exact frame.
+    pub fn advance(&mut self, frames: usize) -> Segments {
         let step = self.velocity();
-        let segment = Segment {
-            start: self.position,
-            step,
-        };
         let n = frames as f64;
-        self.position += step * n;
-        if self.position >= self.length && step > 0.0 {
-            self.position = self.length;
-            self.playing = false;
+        let mut parts = Segments::new();
+        match self.active_loop() {
+            Some(l) if step != 0.0 && frames > 0 => {
+                let len = l.len();
+                // A playhead outside the loop (e.g. after LOOP 1/2X) continues inside it.
+                if !l.contains(self.position) {
+                    self.position = l.start + (self.position - l.start).rem_euclid(len);
+                }
+                let mut p = self.position;
+                let mut done = 0usize;
+                while done < frames && parts.count() < MAX_SEGMENTS {
+                    // Output frames until a read leaves [start, end).
+                    let until = if step > 0.0 {
+                        ((l.end - p) / step).ceil()
+                    } else {
+                        ((p - l.start) / -step).floor() + 1.0
+                    };
+                    let take = (until.max(1.0) as usize).min(frames - done);
+                    parts.push(done, Segment { start: p, step });
+                    p += step * take as f64;
+                    done += take;
+                    if step > 0.0 && p >= l.end {
+                        p -= len;
+                    } else if step < 0.0 && p < l.start {
+                        p += len;
+                    }
+                }
+                self.position = p;
+            }
+            _ => {
+                parts.push(
+                    0,
+                    Segment {
+                        start: self.position,
+                        step,
+                    },
+                );
+                self.position += step * n;
+                if self.position >= self.length && step > 0.0 {
+                    self.position = self.length;
+                    self.playing = false;
+                }
+            }
         }
         self.position = self.position.clamp(0.0, self.length);
         if self.is_slip_active() {
@@ -236,7 +429,7 @@ impl Transport {
         } else {
             self.shadow = self.position;
         }
-        segment
+        parts
     }
 }
 
@@ -256,7 +449,7 @@ mod tests {
     fn starts_stopped_at_zero() {
         let mut t = Transport::new(LEN);
         assert_eq!(t.velocity(), 0.0);
-        let s = t.advance(128);
+        let s = t.advance(128).first();
         assert_eq!(
             s,
             Segment {
@@ -270,7 +463,7 @@ mod tests {
     #[test]
     fn plays_at_unity_rate() {
         let mut t = playing();
-        let s = t.advance(128);
+        let s = t.advance(128).first();
         assert_eq!(
             s,
             Segment {
@@ -279,7 +472,7 @@ mod tests {
             }
         );
         assert_eq!(t.position(), 128.0);
-        assert_eq!(t.advance(64).start, 128.0);
+        assert_eq!(t.advance(64).first().start, 128.0);
     }
 
     #[test]
@@ -298,7 +491,7 @@ mod tests {
         let mut t = playing();
         t.seek(1000.0);
         t.set_reverse(true);
-        let s = t.advance(100);
+        let s = t.advance(100).first();
         assert_eq!(
             s,
             Segment {
@@ -330,7 +523,7 @@ mod tests {
         let mut t = playing();
         t.seek(42.5);
         t.set_rate(0.0);
-        let s = t.advance(512);
+        let s = t.advance(512).first();
         assert_eq!(
             s,
             Segment {
@@ -398,7 +591,7 @@ mod tests {
         t.set_reverse(false);
         assert!(!t.is_slip_active());
         assert_eq!(t.position(), 11_500.0);
-        assert_eq!(t.advance(10).start, 11_500.0);
+        assert_eq!(t.advance(10).first().start, 11_500.0);
     }
 
     #[test]

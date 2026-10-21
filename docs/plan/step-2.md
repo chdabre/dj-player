@@ -30,3 +30,9 @@ Behaviours and values come from the XDJ reference spec (Playback & performance).
 ## Out of scope
 
 Memory cues and storing anything (needs the library), hot-cue loops/banks/colours, auto cue on silence, cue/loop fine adjust (UI), slip auto-end rules (hot cue 4 beats, reverse 8 beats) and the 8 s slip-loop limit, beat sync, grid adjust.
+
+## Status
+
+As of 2026-10-21 the engine part is done: grid on load, quantize, cue, hot cues A–H, loops (IN/OUT, RELOOP/EXIT, beat loops, 1/2X and 2X, slip), beat jump and loop move, with `engined` keys. Offline tests (`engine-core/tests/cues_loops.rs`) check frame-exact wraps for 1/2–16 beats at a non-integer beat period, reverse wraps, slip snap-back, quantized cue and hot cue, beat jump and a click-free wrap, all under `assert_no_alloc`.
+
+Known gaps: holding CUE to preview cannot be tried in a terminal (no key releases; the engine supports it); with keylock on, a loop wrap re-primes the stretcher with no crossfade (the 64-frame wrap fade is resampler-only), so keylocked loops can click at the wrap and cost one prime (~0.6 ms on the Mac) per wrap; the fix is the stretcher's read-ahead following the loop; listening on the Mac is still to do.

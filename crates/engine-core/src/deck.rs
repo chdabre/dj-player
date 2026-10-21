@@ -7,12 +7,14 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::cue::CueState;
 use crate::grid::DeckGrid;
 use crate::keylock::Keylock;
+use crate::looping::LoopControl;
 use crate::scaler::Scaler;
 use crate::source::{CHANNELS, Source};
 use crate::state::DeckState;
-use crate::transport::Transport;
+use crate::transport::{Segment, Transport};
 
 /// Largest block a deck renders in one go. [`crate::Engine::process`] splits longer device
 /// buffers into blocks of at most this many frames, so the deck's scratch space is fixed.
@@ -22,6 +24,9 @@ pub const MAX_BLOCK_FRAMES: usize = 1024;
 /// or the deck switches between resampler and stretcher. Shorter blocks fade over the whole
 /// block.
 pub const DECLICK_FRAMES: usize = 128;
+
+/// Length of the crossfade across a loop wrap (resampler path).
+pub const WRAP_FADE_FRAMES: usize = 64;
 
 /// Operations on one deck, sent into the callback as part of a [`crate::Command`].
 #[derive(Debug, Clone)]
@@ -53,6 +58,22 @@ pub enum DeckCommand {
     /// Keylock: rate changes speed, not pitch. Kept across track loads.
     SetKeylock(bool),
     ToggleKeylock,
+    /// The CUE button (see [`crate::cue`]): press and release.
+    CuePress,
+    CueRelease,
+    /// Hot cue pad A–H (0–7): set if empty, else jump.
+    HotCue(usize),
+    DeleteHotCue(usize),
+    /// Quantize resolution in beats, `None` = off. Kept across track loads.
+    SetQuantize(Option<f64>),
+    /// Loops and beat jump (see [`crate::looping`]).
+    LoopIn,
+    LoopOut,
+    ReloopExit,
+    BeatLoop(f64),
+    /// LOOP 1/2X (0.5) or LOOP 2X (2.0).
+    LoopResize(f64),
+    BeatJump(f64),
 }
 
 /// What the deck did with the last block.
@@ -70,6 +91,9 @@ pub enum BlockOutcome {
 pub struct Deck {
     source: Option<Arc<Source>>,
     grid: Option<Arc<DeckGrid>>,
+    cues: CueState,
+    loops: LoopControl,
+    sample_rate: u32,
     transport: Transport,
     scaler: Scaler,
     /// `None` if no stretcher backend is compiled in; keylock then has no effect.
@@ -81,6 +105,7 @@ pub struct Deck {
     fade_from: Option<Transport>,
     declick: bool,
     scratch: Box<[f32]>,
+    wrap_scratch: Box<[f32]>,
 }
 
 impl Deck {
@@ -88,14 +113,17 @@ impl Deck {
     /// stretcher. Allocates its scratch space and stretcher; call off the audio thread.
     pub fn new(state: Arc<DeckState>, sample_rate: u32) -> Self {
         let stretcher = engine_stretch::default_stretcher(CHANNELS, sample_rate);
-        Self::with_keylock(state, stretcher.map(Keylock::new))
+        Self::with_keylock(state, sample_rate, stretcher.map(Keylock::new))
     }
 
     /// Create an empty deck with an explicit keylock path (or none).
-    pub fn with_keylock(state: Arc<DeckState>, keylock: Option<Keylock>) -> Self {
+    pub fn with_keylock(state: Arc<DeckState>, sample_rate: u32, keylock: Option<Keylock>) -> Self {
         Self {
             source: None,
             grid: None,
+            cues: CueState::default(),
+            loops: LoopControl::default(),
+            sample_rate,
             transport: Transport::default(),
             scaler: Scaler::new(),
             keylock,
@@ -104,6 +132,7 @@ impl Deck {
             fade_from: None,
             declick: true,
             scratch: vec![0.0; MAX_BLOCK_FRAMES * CHANNELS].into_boxed_slice(),
+            wrap_scratch: vec![0.0; WRAP_FADE_FRAMES * CHANNELS].into_boxed_slice(),
         }
     }
 
@@ -123,6 +152,10 @@ impl Deck {
 
     pub fn state(&self) -> &Arc<DeckState> {
         &self.state
+    }
+
+    pub fn cues(&self) -> &CueState {
+        &self.cues
     }
 
     pub fn grid(&self) -> Option<&Arc<DeckGrid>> {
@@ -147,6 +180,12 @@ impl Deck {
     ) -> (Option<Arc<Source>>, Option<Arc<DeckGrid>>) {
         let length = source.as_ref().map_or(0.0, |s| s.len_frames() as f64);
         let keylock = self.transport.is_keylock_enabled();
+        // Cues and loops belong to the track; the quantize setting stays.
+        self.cues = CueState {
+            quantize: self.cues.quantize,
+            ..CueState::default()
+        };
+        self.loops = LoopControl::default();
         self.transport = Transport::new(length);
         self.transport.set_keylock(keylock);
         self.fade_from = None;
@@ -166,11 +205,36 @@ impl Deck {
             self.fade_from = Some(self.transport);
         }
         let t = &mut self.transport;
+        let cues = &mut self.cues;
+        let loops = &mut self.loops;
+        let sr = self.sample_rate;
+        let grid = self.grid.as_deref();
         match *cmd {
             DeckCommand::Load(_) | DeckCommand::Unload | DeckCommand::SetGrid { .. } => {}
-            DeckCommand::Play => t.play(),
+            DeckCommand::Play => {
+                cues.play_pressed();
+                t.play();
+            }
             DeckCommand::Pause => t.pause(),
-            DeckCommand::TogglePlay => t.toggle_play(),
+            DeckCommand::TogglePlay => {
+                if !t.is_playing() || cues.previewing {
+                    cues.play_pressed();
+                    t.play();
+                } else {
+                    t.pause();
+                }
+            }
+            DeckCommand::CuePress => cues.cue_press(t, grid),
+            DeckCommand::CueRelease => cues.cue_release(t),
+            DeckCommand::HotCue(i) => cues.hot_cue(i, t, grid),
+            DeckCommand::DeleteHotCue(i) => cues.delete_hot_cue(i),
+            DeckCommand::SetQuantize(q) => cues.quantize = q.filter(|r| *r > 0.0),
+            DeckCommand::LoopIn => loops.loop_in(t, grid, cues),
+            DeckCommand::LoopOut => loops.loop_out(t, grid, cues),
+            DeckCommand::ReloopExit => loops.reloop_exit(t),
+            DeckCommand::BeatLoop(beats) => loops.beat_loop(beats, t, grid, cues, sr),
+            DeckCommand::LoopResize(factor) => loops.resize(factor, t, grid, sr),
+            DeckCommand::BeatJump(beats) => loops.beat_jump(beats, t, grid, sr),
             DeckCommand::Seek(frame) => t.seek(frame),
             DeckCommand::SeekRelative(frames) => t.seek_relative(frames),
             DeckCommand::SetRate(rate) => t.set_rate(rate),
@@ -214,12 +278,13 @@ impl Deck {
         }
 
         let mut next = self.transport;
-        let segment = next.advance(frames);
+        let parts = next.advance(frames);
+        let first = parts.first();
         let audible = self.transport.is_playing();
         let stretch = self.uses_keylock(&self.transport);
         let fade = fade_from.filter(|old| {
             self.declick
-                && (old.position() != segment.start
+                && (old.position() != first.start
                     || old.is_playing() != audible
                     || self.uses_keylock(old) != stretch)
         });
@@ -230,39 +295,78 @@ impl Deck {
         if let Some(mut old) = fade {
             let old_stretch = self.uses_keylock(&old);
             let old_audible = old.is_playing();
-            let old_segment = old.advance(fade_len);
+            let old_parts = old.advance(fade_len);
             let scratch = &mut self.scratch[..fade_len * CHANNELS];
-            let (first, last) = Scaler::span(old_segment, fade_len);
-            let rendered = match &mut self.keylock {
-                Some(k) if old_stretch && k.is_aligned(old_segment.start) => {
-                    k.render(source, old_segment, scratch)
-                }
-                _ if old_audible && source.range_ready(first, last) => {
-                    self.scaler.render(source, old_segment, scratch);
-                    true
-                }
-                _ => false,
-            };
+            let mut rendered = old_audible;
+            for (off, n, seg) in old_parts.iter(fade_len) {
+                let dst = &mut scratch[off * CHANNELS..(off + n) * CHANNELS];
+                let (lo, hi) = Scaler::span(seg, n);
+                rendered &= match &mut self.keylock {
+                    Some(k) if old_stretch && k.is_aligned(seg.start) => k.render(source, seg, dst),
+                    _ if source.range_ready(lo, hi) => {
+                        self.scaler.render(source, seg, dst);
+                        true
+                    }
+                    _ => false,
+                };
+            }
             if !rendered {
                 scratch.fill(0.0);
             }
         }
 
         if audible {
-            let ready = match &mut self.keylock {
-                Some(k) if stretch => k.render(source, segment, out),
-                _ => {
-                    let (first, last) = Scaler::span(segment, frames);
-                    let ready = source.range_ready(first, last);
-                    if ready {
-                        self.scaler.render(source, segment, out);
-                    }
-                    ready
-                }
-            };
-            if !ready {
+            // Every piece must be readable before anything is rendered.
+            if !stretch
+                && !parts.iter(frames).all(|(_, n, seg)| {
+                    let (lo, hi) = Scaler::span(seg, n);
+                    source.range_ready(lo, hi)
+                })
+            {
                 out.fill(0.0);
                 return BlockOutcome::Starved;
+            }
+            let mut prev: Option<(usize, Segment)> = None;
+            for (off, n, seg) in parts.iter(frames) {
+                let dst = &mut out[off * CHANNELS..(off + n) * CHANNELS];
+                match &mut self.keylock {
+                    Some(k) if stretch => {
+                        if !k.render(source, seg, dst) {
+                            out.fill(0.0);
+                            return BlockOutcome::Starved;
+                        }
+                    }
+                    _ => self.scaler.render(source, seg, dst),
+                }
+                // Loop wrap (resampler path): crossfade from the audio after the loop end.
+                if let Some((prev_off, prev_seg)) = prev
+                    && !stretch
+                    && self.declick
+                {
+                    let len = WRAP_FADE_FRAMES.min(frames - off);
+                    let tail = Segment {
+                        start: prev_seg.start + (off - prev_off) as f64 * prev_seg.step,
+                        step: prev_seg.step,
+                    };
+                    let (lo, hi) = Scaler::span(tail, len);
+                    if source.range_ready(lo, hi) {
+                        let ws = &mut self.wrap_scratch[..len * CHANNELS];
+                        self.scaler.render(source, tail, ws);
+                        let inv = 1.0 / len as f32;
+                        let span = &mut out[off * CHANNELS..(off + len) * CHANNELS];
+                        for (k, (o, w)) in span
+                            .chunks_exact_mut(CHANNELS)
+                            .zip(ws.chunks_exact(CHANNELS))
+                            .enumerate()
+                        {
+                            let g = (k + 1) as f32 * inv;
+                            for c in 0..CHANNELS {
+                                o[c] = w[c] + (o[c] - w[c]) * g;
+                            }
+                        }
+                    }
+                }
+                prev = Some((off, seg));
             }
         } else {
             out.fill(0.0);
@@ -302,6 +406,16 @@ impl Deck {
         s.position.store(t.position());
         s.shadow_position.store(t.shadow_position());
         s.rate.store(t.rate());
+        s.cue.store(self.cues.cue);
+        s.hot_cues.store(self.cues.hot_mask(), Ordering::Relaxed);
+        s.quantize.store(self.cues.quantize.unwrap_or(0.0));
+        let (looping, l) = match (t.active_loop(), t.stored_loop()) {
+            (Some(l), _) => (true, Some(l)),
+            (None, l) => (false, l),
+        };
+        s.looping.store(looping, Ordering::Relaxed);
+        s.loop_start.store(l.map_or(f64::NAN, |l| l.start));
+        s.loop_end.store(l.map_or(f64::NAN, |l| l.end));
         match &self.grid {
             Some(g) => {
                 s.track_bpm.store(g.bpm());
