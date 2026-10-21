@@ -51,6 +51,8 @@ pub struct WaveDraw {
     pub first_x: f32,
     pub column_width: f32,
     pub columns: Vec<Column>,
+    /// Opacity of the whole waveform over what is below it.
+    pub opacity: f32,
 }
 
 /// The band-wise max of `entries[a..b]` (at least one entry if `a` is in range).
@@ -109,6 +111,7 @@ pub fn zoom(
         first_x: x + (half + first as f64 - playhead / spp) as f32,
         column_width: 1.0,
         columns,
+        opacity: 1.0,
     }
 }
 
@@ -172,6 +175,7 @@ impl OverviewCache {
             first_x: x,
             column_width: w / px as f32,
             columns,
+            opacity: 1.0,
         }
     }
 }

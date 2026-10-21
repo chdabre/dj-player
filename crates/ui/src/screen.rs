@@ -11,7 +11,7 @@ use engine_core::DeckGrid;
 
 use crate::scene::{Align, Gradient, Rgba, Scene, Text, Weight};
 use crate::theme::Theme;
-use crate::waves::{OverviewCache, WaveSettings};
+use crate::waves::{OverviewCache, WaveDraw, WaveSettings};
 
 /// Things on screen that can be touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,7 +734,10 @@ fn zoom(ui: &mut Ui, v: &View) {
             &wave.settings,
             &wave.style,
         );
-        ui.scene.waveform(draw);
+        ui.scene.waveform(WaveDraw {
+            opacity: wf.opacity,
+            ..draw
+        });
     }
     if v.looping || v.loop_end > v.loop_start {
         let (a, b) = (to_x(v.loop_start).max(x0), to_x(v.loop_end).min(x0 + w));
@@ -948,7 +951,10 @@ fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
                 &wave.settings,
                 &wave.style,
             );
-            ui.scene.waveform(draw);
+            ui.scene.waveform(WaveDraw {
+                opacity: wf.opacity,
+                ..draw
+            });
         }
         if v.loaded_fraction < 1.0 {
             let lx = to_x(v.loaded_fraction * v.length);

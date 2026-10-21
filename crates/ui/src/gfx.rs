@@ -106,7 +106,7 @@ struct View { xform: vec4<f32>, size: vec4<f32> };  // size.z: 1 = sRGB surface
 struct Inst {
     @location(0) rect: vec4<f32>,
     @location(1) params: vec4<f32>,  // first x, column width, column count, first row
-    @location(2) extra: vec4<f32>,   // align: 0 mirrored, 1 bottom
+    @location(2) extra: vec4<f32>,   // align (0 mirrored, 1 bottom), opacity
 };
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -174,7 +174,7 @@ fn fs(o: Out) -> @location(0) vec4<f32> {
         column_color(i32(j0), d, count, row),
         column_color(i32(j0) + 1, d, count, row),
         w1,
-    );
+    ) * o.extra.y;
     if (view.size.z < 0.5 || c.a <= 0.0) {
         return c;
     }
@@ -757,7 +757,7 @@ impl Gfx {
                 n as f32,
                 row as f32,
                 align,
-                0.0,
+                wave.opacity.clamp(0.0, 1.0),
                 0.0,
                 0.0,
             ] {
