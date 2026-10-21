@@ -302,7 +302,9 @@ impl Deck {
                 let dst = &mut scratch[off * CHANNELS..(off + n) * CHANNELS];
                 let (lo, hi) = Scaler::span(seg, n);
                 rendered &= match &mut self.keylock {
-                    Some(k) if old_stretch && k.is_aligned(seg.start) => k.render(source, seg, dst),
+                    Some(k) if old_stretch && k.is_aligned(seg.start) => {
+                        k.render(source, seg, dst, false)
+                    }
                     _ if source.range_ready(lo, hi) => {
                         self.scaler.render(source, seg, dst);
                         true
@@ -317,12 +319,14 @@ impl Deck {
 
         if audible {
             // Every piece must be readable before anything is rendered.
-            if !stretch
-                && !parts.iter(frames).all(|(_, n, seg)| {
+            let ready = match &self.keylock {
+                Some(k) if stretch => k.ready(source, parts.iter(frames).map(|(_, n, s)| (n, s))),
+                _ => parts.iter(frames).all(|(_, n, seg)| {
                     let (lo, hi) = Scaler::span(seg, n);
                     source.range_ready(lo, hi)
-                })
-            {
+                }),
+            };
+            if !ready {
                 out.fill(0.0);
                 return BlockOutcome::Starved;
             }
@@ -331,7 +335,10 @@ impl Deck {
                 let dst = &mut out[off * CHANNELS..(off + n) * CHANNELS];
                 match &mut self.keylock {
                     Some(k) if stretch => {
-                        if !k.render(source, seg, dst) {
+                        // The deck declicks a commanded jump itself (first piece); the keylock
+                        // fades the rest (loop wraps).
+                        let fade_jump = self.declick && !(off == 0 && fade.is_some());
+                        if !k.render(source, seg, dst, fade_jump) {
                             out.fill(0.0);
                             return BlockOutcome::Starved;
                         }

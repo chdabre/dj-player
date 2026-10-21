@@ -18,7 +18,9 @@
 //! - **Jumps** (seek, loop wrap, slip snap-back, first block): the segment does not continue
 //!   the last one, so the path re-primes: one pre-roll grain before the new position, run
 //!   until the first chunk at it, earlier output dropped. The next frame is exactly the new
-//!   position. The old audio still in the FIFO is crossfaded out over [`JUMP_FADE_FRAMES`].
+//!   position. On a jump the deck does not declick itself (a loop wrap), the old audio
+//!   still in the FIFO is crossfaded out over [`JUMP_FADE_FRAMES`]; commanded jumps get only
+//!   the deck's declick, so the two fades never stack.
 //! - **Rate changes** need no correction: grains already requested keep the old velocity
 //!   (about 30 ms of output). The next grain is placed on the new trajectory, and Bungee works
 //!   the hop out from the position difference, so the audio rejoins the playhead within one
@@ -33,8 +35,9 @@ use crate::transport::Segment;
 /// Fastest rate the stretcher plays; above it the deck uses the resampler.
 pub const MAX_STRETCH_RATE: f64 = 4.0;
 
-/// Crossfade from the old audio when the path re-primes at a jump. The deck's own
-/// declick covers jumps from commands; this covers loop wraps.
+/// Crossfade from the old audio when the path re-primes at a jump the deck does not declick
+/// itself (loop wraps). It carries over into the next block if the jump is near the end of
+/// one.
 pub const JUMP_FADE_FRAMES: usize = 64;
 
 /// Playheads closer than this (frames) count as the same position.
@@ -86,19 +89,32 @@ impl Keylock {
         self.path.cursor = None;
     }
 
+    /// True if every frame needed to render `parts` (frames, segment) in order is loaded,
+    /// so a block split at loop wraps either renders whole or not at all. Real-time safe.
+    pub fn ready(&self, source: &Source, parts: impl Iterator<Item = (usize, Segment)>) -> bool {
+        self.path.ready(source, parts)
+    }
+
     /// Render `out.len() / 2` frames of `segment` (whose step must satisfy
     /// [`Keylock::handles`]), overwriting `out`. Primes first if the stretcher is not at
-    /// `segment.start`.
+    /// `segment.start`; then, if `fade_jump`, crossfades from the old audio over
+    /// [`JUMP_FADE_FRAMES`] (pass `false` when the caller declicks the jump itself).
     ///
     /// Real-time safe. Returns `false`, with `out` untouched and the stretcher unchanged, if a
     /// frame it needs is not loaded yet.
-    pub fn render(&mut self, source: &Source, segment: Segment, out: &mut [f32]) -> bool {
+    pub fn render(
+        &mut self,
+        source: &Source,
+        segment: Segment,
+        out: &mut [f32],
+        fade_jump: bool,
+    ) -> bool {
         debug_assert!(
             Self::handles(segment.step),
             "keylock cannot play step {}",
             segment.step
         );
-        self.path.render(source, segment, out)
+        self.path.render(source, segment, out, fade_jump)
     }
 }
 
@@ -134,29 +150,40 @@ impl Fifo {
         (self.len > 0).then(|| self.position[self.head])
     }
 
+    /// Append a frame. The FIFO is sized so it never fills; if it did, the frame would be
+    /// dropped rather than panic on the audio thread.
     fn push(&mut self, frame: [f32; CHANNELS], position: f64) {
-        assert!(self.len < self.capacity(), "keylock fifo overflow");
+        debug_assert!(self.len < self.capacity(), "keylock fifo overflow");
+        if self.len == self.capacity() {
+            return;
+        }
         let at = (self.head + self.len) % self.capacity();
         self.audio[at * CHANNELS..(at + 1) * CHANNELS].copy_from_slice(&frame);
         self.position[at] = position;
         self.len += 1;
     }
 
-    /// Copy the first `out.len() / 2` frames into `out` without removing them.
+    /// Copy the first `out.len() / 2` frames into `out` without removing them; frames the
+    /// FIFO does not hold are silence.
     fn peek(&self, out: &mut [f32]) {
-        let frames = out.len() / CHANNELS;
-        debug_assert!(frames <= self.len);
-        for (k, dst) in out.chunks_exact_mut(CHANNELS).enumerate().take(frames) {
-            let at = (self.head + k) % self.capacity();
-            dst.copy_from_slice(&self.audio[at * CHANNELS..(at + 1) * CHANNELS]);
+        let frames = (out.len() / CHANNELS).min(self.len);
+        for (k, dst) in out.chunks_exact_mut(CHANNELS).enumerate() {
+            if k < frames {
+                let at = (self.head + k) % self.capacity();
+                dst.copy_from_slice(&self.audio[at * CHANNELS..(at + 1) * CHANNELS]);
+            } else {
+                dst.fill(0.0);
+            }
         }
     }
 
-    /// Fill `out` from the front and remove those frames.
+    /// Fill `out` from the front and remove those frames. The path always queues enough
+    /// first; a shortfall would be silence rather than a panic on the audio thread.
     fn pop(&mut self, out: &mut [f32]) {
         let frames = out.len() / CHANNELS;
-        assert!(frames <= self.len, "keylock fifo underrun");
+        debug_assert!(frames <= self.len, "keylock fifo underrun");
         self.peek(out);
+        let frames = frames.min(self.len);
         self.head = (self.head + frames) % self.capacity();
         self.len -= frames;
     }
@@ -165,7 +192,7 @@ impl Fifo {
 struct GrainPath {
     stretcher: bungee::Stretcher,
     hop: i64,
-    /// Planar grain input, one channel per `stride` floats.
+    /// Planar grain input, one channel per `stride` floats (one grain's chunk).
     input: Box<[f32]>,
     stride: usize,
     fifo: Fifo,
@@ -175,8 +202,19 @@ struct GrainPath {
     emit: i64,
     /// Transport position the next output frame corresponds to, if primed.
     cursor: Option<f64>,
-    /// Old audio to crossfade from after a jump.
+    /// Old audio to crossfade from after a jump, `fade_len` frames, `fade_done` already used.
     fade: Box<[f32]>,
+    fade_len: usize,
+    fade_done: usize,
+}
+
+/// The grains one render will run.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    prime: bool,
+    /// Output clock of the chunk the first grain's call emits.
+    first_emit: i64,
+    grains: i64,
 }
 
 impl GrainPath {
@@ -187,7 +225,7 @@ impl GrainPath {
         };
         let stretcher = bungee::Stretcher::new(rates, CHANNELS);
         let hop = stretcher.synthesis_hop();
-        let stride = stretcher.max_input_frame_count();
+        let stride = stretcher.grain_input_frame_count();
         // The FIFO holds at most one block, the fade lead and one chunk beyond.
         let fifo = MAX_BLOCK_FRAMES + JUMP_FADE_FRAMES + 2 * stretcher.max_output_frame_count();
         Self {
@@ -200,70 +238,117 @@ impl GrainPath {
             emit: 0,
             cursor: None,
             fade: vec![0.0; JUMP_FADE_FRAMES * CHANNELS].into_boxed_slice(),
+            fade_len: 0,
+            fade_done: 0,
         }
     }
 
     /// Position for the grain specified while the chunk at `emit` comes out: its own output
     /// starts two chunks later. `segment` holds from the block start at `clock`.
-    fn grain_position(&self, segment: Segment, emit: i64) -> f64 {
-        segment.start + segment.step * (emit + 2 * self.hop - self.clock) as f64
+    fn grain_position(&self, segment: Segment, clock: i64, emit: i64) -> f64 {
+        segment.start + segment.step * (emit + 2 * self.hop - clock) as f64
     }
 
-    fn render(&mut self, source: &Source, segment: Segment, out: &mut [f32]) -> bool {
-        let frames = out.len() / CHANNELS;
-        let aligned = self
-            .cursor
-            .is_some_and(|c| (c - segment.start).abs() < ALIGN_EPSILON);
-        // A NaN drift counts as drifted too.
-        let drifted = self
-            .fifo
-            .head_position()
-            .map(|p| (p - segment.start).abs())
-            .is_some_and(|d| d.is_nan() || d > MAX_DRIFT);
-        let prime = !aligned || drifted;
+    fn request(&self, segment: Segment, clock: i64, emit: i64, reset: bool) -> Request {
+        Request {
+            position: self.grain_position(segment, clock, emit),
+            speed: segment.step,
+            pitch: 1.0,
+            reset,
+        }
+    }
 
-        // Plan the grains: from the next chunk (or a pre-roll grain three chunks before the
-        // block, on a prime) until the FIFO covers the block plus the fade lead.
-        let first_emit = if prime {
-            self.clock - 3 * self.hop
-        } else {
-            self.emit
-        };
-        let need = self.clock + (frames + JUMP_FADE_FRAMES) as i64;
+    /// The grains to render `frames` of `segment` from a state of `clock`, `emit` and
+    /// `cursor`: from the next chunk, or on a prime from a pre-roll grain three chunks
+    /// before the block, until the FIFO covers the block plus the fade lead.
+    fn plan(
+        &self,
+        segment: Segment,
+        frames: usize,
+        clock: i64,
+        emit: i64,
+        cursor: Option<f64>,
+        drifted: bool,
+    ) -> Plan {
+        let aligned = cursor.is_some_and(|c| (c - segment.start).abs() < ALIGN_EPSILON);
+        let prime = !aligned || drifted;
+        let first_emit = if prime { clock - 3 * self.hop } else { emit };
+        let need = clock + (frames + JUMP_FADE_FRAMES) as i64;
         let grains = ((need - first_emit).max(0) as u64).div_ceil(self.hop as u64) as i64;
-        if grains > 0 {
-            let request = |emit: i64| Request {
-                position: self.grain_position(segment, emit),
-                speed: segment.step,
-                pitch: 1.0,
-                reset: false,
-            };
-            let a = self.stretcher.input_chunk(&request(first_emit), 0.0);
-            let last = first_emit + (grains - 1) * self.hop;
-            let b = self.stretcher.input_chunk(&request(last), 0.0);
-            let (lo, hi) = (a.begin.min(b.begin), a.end.max(b.end) - 1);
-            if !source.range_ready(lo, hi) {
+        Plan {
+            prime,
+            first_emit,
+            grains,
+        }
+    }
+
+    /// True if the audio at the FIFO head is implausibly far from `position` (or NaN).
+    fn drifted(&self, position: f64) -> bool {
+        self.fifo
+            .head_position()
+            .map(|p| (p - position).abs())
+            .is_some_and(|d| d.is_nan() || d > MAX_DRIFT)
+    }
+
+    /// True if every input frame `plan` reads is loaded.
+    fn plan_ready(&self, source: &Source, segment: Segment, clock: i64, plan: Plan) -> bool {
+        if plan.grains == 0 {
+            return true;
+        }
+        let last_emit = plan.first_emit + (plan.grains - 1) * self.hop;
+        // Positions are linear in the output clock, so the first and last grains bound the
+        // range.
+        let a = self
+            .stretcher
+            .input_chunk(&self.request(segment, clock, plan.first_emit, false), 0.0);
+        let b = self
+            .stretcher
+            .input_chunk(&self.request(segment, clock, last_emit, false), 0.0);
+        source.range_ready(a.begin.min(b.begin), a.end.max(b.end) - 1)
+    }
+
+    fn ready(&self, source: &Source, parts: impl Iterator<Item = (usize, Segment)>) -> bool {
+        let (mut clock, mut emit, mut cursor) = (self.clock, self.emit, self.cursor);
+        for (k, (frames, segment)) in parts.enumerate() {
+            let drifted = k == 0 && self.drifted(segment.start);
+            let plan = self.plan(segment, frames, clock, emit, cursor, drifted);
+            if !self.plan_ready(source, segment, clock, plan) {
                 return false;
             }
+            emit = plan.first_emit + plan.grains * self.hop;
+            clock += frames as i64;
+            cursor = Some(segment.start + segment.step * frames as f64);
+        }
+        true
+    }
+
+    fn render(
+        &mut self,
+        source: &Source,
+        segment: Segment,
+        out: &mut [f32],
+        fade_jump: bool,
+    ) -> bool {
+        let frames = out.len() / CHANNELS;
+        let drifted = self.drifted(segment.start);
+        let plan = self.plan(segment, frames, self.clock, self.emit, self.cursor, drifted);
+        if !self.plan_ready(source, segment, self.clock, plan) {
+            return false;
         }
 
-        let mut fade_len = 0;
-        if prime {
-            if self.cursor.is_some() {
-                fade_len = self.fifo.len.min(JUMP_FADE_FRAMES).min(frames);
-                self.fifo.peek(&mut self.fade[..fade_len * CHANNELS]);
+        if plan.prime {
+            self.fade_len = 0;
+            self.fade_done = 0;
+            if fade_jump && self.cursor.is_some() {
+                self.fade_len = self.fifo.len.min(JUMP_FADE_FRAMES);
+                self.fifo.peek(&mut self.fade[..self.fade_len * CHANNELS]);
             }
             self.fifo.clear();
-            self.emit = first_emit;
+            self.emit = plan.first_emit;
         }
 
-        for g in 0..grains {
-            let request = Request {
-                position: self.grain_position(segment, self.emit),
-                speed: segment.step,
-                pitch: 1.0,
-                reset: prime && g == 0,
-            };
+        for g in 0..plan.grains {
+            let request = self.request(segment, self.clock, self.emit, plan.prime && g == 0);
             self.grain(source, &request);
         }
 
@@ -271,19 +356,22 @@ impl GrainPath {
         self.clock += frames as i64;
         self.cursor = Some(segment.start + segment.step * frames as f64);
 
-        if fade_len > 0 {
-            let inv = 1.0 / fade_len as f32;
+        // Crossfade from the old audio, continuing a fade a previous block started.
+        let fade = self.fade_len - self.fade_done;
+        if fade > 0 {
+            let inv = 1.0 / self.fade_len as f32;
+            let old = &self.fade[self.fade_done * CHANNELS..self.fade_len * CHANNELS];
             for (k, (o, s)) in out
                 .chunks_exact_mut(CHANNELS)
-                .zip(self.fade.chunks_exact(CHANNELS))
-                .take(fade_len)
+                .zip(old.chunks_exact(CHANNELS))
                 .enumerate()
             {
-                let g = (k + 1) as f32 * inv;
+                let g = (self.fade_done + k + 1) as f32 * inv;
                 for c in 0..CHANNELS {
                     o[c] = s[c] + (o[c] - s[c]) * g;
                 }
             }
+            self.fade_done += fade.min(frames);
         }
         true
     }
@@ -292,6 +380,7 @@ impl GrainPath {
     fn grain(&mut self, source: &Source, request: &Request) {
         let chunk = self.stretcher.specify_grain(request, 0.0);
         let n = chunk.len().min(self.stride);
+        debug_assert_eq!(n, chunk.len(), "grain input longer than the buffer");
         for k in 0..n {
             let frame = source.frame(chunk.begin + k as i64);
             for (c, s) in frame.iter().enumerate() {
@@ -321,6 +410,111 @@ mod tests {
 
     const SR: u32 = 48_000;
 
+    fn sine_source(seconds: usize, hz: f64) -> std::sync::Arc<Source> {
+        let w = std::f64::consts::TAU * hz / f64::from(SR);
+        let frames: Vec<f32> = (0..seconds * SR as usize)
+            .flat_map(|i| {
+                let x = (0.5 * (w * i as f64).sin()) as f32;
+                [x, x]
+            })
+            .collect();
+        Source::from_interleaved(SR, &frames)
+    }
+
+    fn max_step(out: &[f32]) -> f32 {
+        out.chunks_exact(CHANNELS)
+            .zip(out.chunks_exact(CHANNELS).skip(1))
+            .map(|(a, b)| (b[0] - a[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_wrap_near_the_end_of_a_block_still_fades_over_the_whole_fade() {
+        // 100 Hz at 0.5: natural steps up to ~0.0065. Jump to an arbitrary phase 4 frames
+        // before the end of a block; the fade must continue into the next block.
+        let src = sine_source(10, 100.0);
+        let mut k = Keylock::new(SR);
+        let mut out = vec![0.0; 40 * 128 * CHANNELS];
+        let mut pos = 48_000.0;
+        for (b, block) in out.chunks_mut(128 * CHANNELS).enumerate() {
+            if b == 20 {
+                let (head, tail) = block.split_at_mut(124 * CHANNELS);
+                let seg = Segment {
+                    start: pos,
+                    step: 1.0,
+                };
+                assert!(k.render(&src, seg, head, true));
+                // Half a cycle out of phase with the audio it replaces.
+                pos = 50_684.0 + 48_000.0 + 240.0;
+                let seg = Segment {
+                    start: pos,
+                    step: 1.0,
+                };
+                assert!(k.render(&src, seg, tail, true));
+                pos += 4.0;
+            } else {
+                let seg = Segment {
+                    start: pos,
+                    step: 1.0,
+                };
+                assert!(k.render(&src, seg, block, true));
+                pos += 128.0;
+            }
+        }
+        let step = max_step(&out[10 * 128 * CHANNELS..]);
+        assert!(step < 0.03, "max step {step}");
+    }
+
+    #[test]
+    fn a_jump_without_fade_plays_the_new_position_exactly() {
+        // When the caller declicks, the keylock must not mix in old audio of its own: its
+        // output after the jump is what a freshly primed keylock plays there.
+        let src = sine_source(10, 440.0);
+        let mut played = Keylock::new(SR);
+        let mut fresh = Keylock::new(SR);
+        let mut out = vec![0.0; 128 * CHANNELS];
+        for b in 0..30 {
+            let seg = Segment {
+                start: 48_000.0 + 128.0 * b as f64,
+                step: 1.08,
+            };
+            assert!(played.render(&src, seg, &mut out, true));
+        }
+        let seg = Segment {
+            start: 200_000.0,
+            step: 1.08,
+        };
+        let mut a = vec![0.0; 128 * CHANNELS];
+        let mut b = vec![0.0; 128 * CHANNELS];
+        assert!(played.render(&src, seg, &mut a, false));
+        assert!(fresh.render(&src, seg, &mut b, false));
+        let diff = a
+            .iter()
+            .zip(&b)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(diff < 1e-6, "differs from a fresh prime by {diff}");
+    }
+
+    #[test]
+    fn ready_covers_every_part_of_a_split_block() {
+        // Only the first second is loaded: a block whose second part wraps into unloaded
+        // audio is not ready as a whole, and checking changes nothing.
+        let (src, mut writer) = Source::with_chunk_frames(SR, 10 * SR as usize, 4096);
+        writer.push(&vec![0.1; SR as usize * CHANNELS]);
+        let k = Keylock::new(SR);
+        let near = Segment {
+            start: 20_000.0,
+            step: 1.0,
+        };
+        let far = Segment {
+            start: 300_000.0,
+            step: 1.0,
+        };
+        assert!(k.ready(&src, [(64, near)].into_iter()));
+        assert!(!k.ready(&src, [(64, near), (64, far)].into_iter()));
+        assert!(!k.is_aligned(20_000.0));
+    }
+
     #[test]
     fn handles_both_directions_up_to_the_limit() {
         assert!(Keylock::handles(1.0));
@@ -345,7 +539,7 @@ mod tests {
                     start: pos,
                     step: rate,
                 };
-                assert!(k.render(&src, seg, &mut out));
+                assert!(k.render(&src, seg, &mut out, true));
                 pos += rate * 128.0;
                 assert!(k.is_aligned(pos));
             }
@@ -365,7 +559,7 @@ mod tests {
             start: 0.0,
             step: 1.0,
         };
-        assert!(!k.render(&src, seg, &mut out));
+        assert!(!k.render(&src, seg, &mut out, true));
         assert!(out.iter().all(|&s| s == 7.0));
         assert!(!k.is_aligned(0.0));
     }

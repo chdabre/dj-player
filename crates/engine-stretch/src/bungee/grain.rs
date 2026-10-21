@@ -138,20 +138,36 @@ impl Grain {
 
         self.log2_transform_length = log2_synthesis_hop + 3;
 
-        // Without input resampling (autoOut) the chunk is exactly one transform long.
-        let half = (transform_length(self.log2_transform_length) / 2) as i64;
-        self.input_chunk = InputChunk {
-            begin: -half,
-            end: half,
-        };
-
+        self.input_chunk = input_chunk(log2_synthesis_hop, f64::NAN, 0.0);
         if self.request.position.is_nan() {
             return InputChunk::default();
         }
-
-        let offset = (self.request.position - buffer_start_position).round() as i64;
-        self.input_chunk.begin += offset;
-        self.input_chunk.end += offset;
+        self.input_chunk = input_chunk(
+            log2_synthesis_hop,
+            self.request.position,
+            buffer_start_position,
+        );
         self.input_chunk
+    }
+}
+
+/// The input a grain at `position` needs, relative to `buffer_start_position`. Without
+/// input resampling (autoOut) the chunk is exactly one transform long, centred on the
+/// grain. A NaN position gives the chunk centred on 0 (Bungee keeps that as the grain's
+/// chunk even though `specify` returns an empty one).
+pub fn input_chunk(
+    log2_synthesis_hop: u32,
+    position: f64,
+    buffer_start_position: f64,
+) -> InputChunk {
+    let half = (transform_length(log2_synthesis_hop + 3) / 2) as i64;
+    let offset = if position.is_nan() {
+        0
+    } else {
+        (position - buffer_start_position).round() as i64
+    };
+    InputChunk {
+        begin: offset - half,
+        end: offset + half,
     }
 }

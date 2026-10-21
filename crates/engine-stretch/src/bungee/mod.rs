@@ -240,13 +240,18 @@ impl Stretcher {
         if request.position.is_nan() {
             return InputChunk::default();
         }
-        // Without input resampling (autoOut) the chunk is one transform long, centred.
-        let half = (4i64) << self.timing.log2_synthesis_hop;
-        let offset = (request.position - buffer_start_position).round() as i64;
-        InputChunk {
-            begin: offset - half,
-            end: offset + half,
-        }
+        grain::input_chunk(
+            self.timing.log2_synthesis_hop,
+            request.position,
+            buffer_start_position,
+        )
+    }
+
+    /// The input frames every grain asks for: one transform, at any pitch, since this port
+    /// never resamples input. Smaller than [`Stretcher::max_input_frame_count`], Bungee's
+    /// bound, which allows for input resampling.
+    pub fn grain_input_frame_count(&self) -> usize {
+        grain::input_chunk(self.timing.log2_synthesis_hop, 0.0, 0.0).len()
     }
 
     /// Storage index of Bungee's `grains[i]` (0 is the newest).
