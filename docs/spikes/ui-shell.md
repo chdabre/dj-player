@@ -26,6 +26,24 @@ cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
   - keys as in `engined`, plus a real CUE hold: winit reports key releases, so holding CUE at the cue point previews, which the terminal could not do.
 - **Waveforms:** real, from the `waveform` crate (see "Waveforms" below). The zoom view marks the analysed beat grid with ticks along its top and bottom edges, drawn over the waveform: white for beats, solid red for downbeats. The loop, cue, slip shadow and centred playhead are drawn on top. The overview adds loading progress and 16-bar ticks. `w` cycles 3-band → RGB → single colour; `--wave-mode` and `--wave-theme` (default, findings, spectrum, blended) pick them at start.
 
+## Hardware stand-in (debug shell)
+
+Until the control surface exists, the window draws the player's physical controls around the device screen, so the prototype can be played on a laptop. The layout is the canvas artboard "8 · Hardware stand-in" (1512×950, the reference player's controls in their real order). It is a debug tool only:
+
+- **A separate layer, discarded for the device.** It lives in `standin.rs` behind the cargo feature `standin` (on by default). The device screen is rendered on its own into an offscreen texture the size of the shell's display slot, the shell is drawn to the window, and the texture is copied into the slot (`gfx::ShellFrame`). The device layer never knows about the shell.
+  - `--no-standin` turns it off at run time: the device screen alone, byte-identical to the build without it.
+  - `cargo build -p ui --no-default-features` leaves it out entirely, as the device build will.
+- **The controls send the same deck commands** the RP2040 control surface will:
+  - CUE (hold to preview), PLAY/PAUSE, REV, QUANTIZE, KEYLOCK, loop IN / OUT / RELOOP;
+  - hot cue pads A–H (right click or shift deletes); track search back to the start;
+  - SEARCH scrubs at 4x while held;
+  - the jog's top plate scratches (one turn = 1.8 s, a record at 33⅓ rpm), its ring bends the pitch by its speed, and with JOG MODE off the top plate bends too;
+  - the tempo fader (up is slower), with TEMPO cycling ±6 / ±10 / ±16 / WIDE.
+- **Lights follow the deck:** the CUE and PLAY rings, the quantize and keylock lights, REV, the loop buttons, the set pads, the fader cap (it follows the rate, bends included), and a marker that turns with the track on the jog.
+- **Not wired yet:** time mode, track search forward, BACK, TAG TRACK, the browse knob, F1 and F2 (there is no browser yet). The keyboard keys still work; `+` / `−` now nudge the rate, so they agree with the fader.
+- **Tests** (`standin.rs`): CUE hold and release, pads set and delete, the fader's rate (top = −10 % on ±10), a quarter turn of the plate scratching a quarter of 1.8 s, ring bend and its release, SEARCH while held, and the display slot staying clear of the controls.
+- **Cost:** about 1.5 ms of CPU per frame with the shell at 100–114 fps on the M1 Max (1.2 ms without).
+
 ## Scrubbing the waveform
 
 Touching the zoom waveform (on either screen) takes the track; dragging moves it with the waveform under the finger (drag left to play forward); letting go releases it.

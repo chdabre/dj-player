@@ -10,7 +10,7 @@ Install Rust with [rustup](https://rustup.rs) and the Xcode command line tools (
 cargo run -p engined --release -- <file>
 ```
 
-Or the UI (same keys, plus touch or mouse; `w` cycles the waveform mode, `p` switches to the performance screen with hot cue and beat jump pads and beat loops, `d` shows frame timing):
+Or the UI, with on-screen stand-ins for the player's controls around its screen until the hardware exists (same keys, plus touch or mouse; `w` cycles the waveform mode, `p` switches to the performance screen with hot cue and beat jump pads and beat loops, `d` shows frame timing):
 
 ```sh
 cargo run -p ui --release -- <file>

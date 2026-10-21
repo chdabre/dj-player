@@ -1,8 +1,15 @@
 //! The renderer: one wgpu pipeline for rounded rectangles (an instanced quad with a
-//! signed-distance fragment shader) and glyphon for text.
+//! signed-distance fragment shader), one for waveforms, and glyphon for text.
 //!
-//! Layout happens in design pixels (1024×600); the view uniform scales and centres that onto
-//! the surface, so the same scene fits a Retina window on the Mac and the panel on the Pi.
+//! Layout happens in design pixels (1024×600 for the device screen); the view uniform scales
+//! and centres that onto the target, so the same scene fits a Retina window on the Mac and the
+//! panel on the Pi.
+//!
+//! **Layers.** The device screen is one layer. A debug shell (the hardware stand-in, feature
+//! `standin`) is a second layer with its own design size: when it is on, the device layer is
+//! rendered on its own into an offscreen texture exactly the size of the shell's display slot,
+//! the shell is rendered to the window, and the device texture is copied into the slot. The
+//! device layer never knows about the shell, so a device build simply drops it.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -196,12 +203,129 @@ const INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
 ];
 const INSTANCE_BYTES: u64 = 20 * 4;
 
-/// Design pixels → physical pixels on a `w`×`h` target: (scale, offset x, offset y). The
-/// design is scaled uniformly and centred.
-fn transform(w: u32, h: u32) -> (f32, f32, f32) {
+/// A design of `design` pixels → physical pixels on a `w`×`h` target: (scale, offset x,
+/// offset y). The design is scaled uniformly and centred.
+fn transform(w: u32, h: u32, (dw, dh): (f32, f32)) -> (f32, f32, f32) {
     let (w, h) = (w as f32, h as f32);
-    let s = (w / DESIGN_W).min(h / DESIGN_H);
-    (s, (w - DESIGN_W * s) * 0.5, (h - DESIGN_H * s) * 0.5)
+    let s = (w / dw).min(h / dh);
+    (s, (w - dw * s) * 0.5, (h - dh * s) * 0.5)
+}
+
+/// Copies the device layer's offscreen texture into the shell's display slot.
+const BLIT_SHADER: &str = r#"
+struct Rect { clip: vec4<f32> };  // left, top, right, bottom in clip space
+@group(0) @binding(0) var<uniform> rect: Rect;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
+struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> Out {
+    let c = vec2<f32>(f32(vi & 1u), f32(vi >> 1u));
+    var o: Out;
+    o.pos = vec4(mix(rect.clip.x, rect.clip.z, c.x), mix(rect.clip.y, rect.clip.w, c.y), 0.0, 1.0);
+    o.uv = c;
+    return o;
+}
+
+@fragment
+fn fs(o: Out) -> @location(0) vec4<f32> {
+    return textureSample(tex, smp, o.uv);
+}
+"#;
+
+/// Which layer a draw is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Device,
+    Shell,
+}
+
+/// A debug shell around the device screen: its scene, its design size, and the slot (in its
+/// design pixels) where the device screen goes.
+pub struct ShellFrame<'a> {
+    pub scene: &'a Scene,
+    pub size: (f32, f32),
+    pub display: (f32, f32, f32, f32),
+}
+
+/// What one scene needs on the GPU: its view uniform, rectangle instances and text.
+struct Layer {
+    view_buffer: wgpu::Buffer,
+    view_bind: wgpu::BindGroup,
+    instances: wgpu::Buffer,
+    instance_capacity: u64,
+    instance_bytes: Vec<u8>,
+    viewport: Viewport,
+    text: TextRenderer,
+    slots: Vec<TextSlot>,
+}
+
+impl Layer {
+    fn new(
+        device: &wgpu::Device,
+        cache: &Cache,
+        atlas: &mut TextAtlas,
+        view_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let view_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let view_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("view"),
+            layout: view_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: view_buffer.as_entire_binding(),
+            }],
+        });
+        let instance_capacity = 1024;
+        Self {
+            view_buffer,
+            view_bind,
+            instances: instance_buffer(device, instance_capacity),
+            instance_capacity,
+            instance_bytes: Vec::new(),
+            viewport: Viewport::new(device, cache),
+            text: TextRenderer::new(atlas, device, wgpu::MultisampleState::default(), None),
+            slots: Vec::new(),
+        }
+    }
+}
+
+fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rect instances"),
+        size: capacity * INSTANCE_BYTES,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The device layer's offscreen target while a shell is on, and the bind group that copies it.
+struct Offscreen {
+    size: (u32, u32),
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+}
+
+/// sRGB colour → what the shader writes (linear for an sRGB target).
+fn color(srgb: bool, c: Rgba) -> [f32; 4] {
+    let [r, g, b, a] = c.0;
+    if !srgb {
+        return [r, g, b, a];
+    }
+    let lin = |v: f32| {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    [lin(r), lin(g), lin(b), a]
 }
 
 /// How long the last frame spent where.
@@ -227,11 +351,17 @@ pub struct Gfx {
     config: wgpu::SurfaceConfiguration,
     srgb: bool,
     pipeline: wgpu::RenderPipeline,
-    view_buffer: wgpu::Buffer,
-    view_bind: wgpu::BindGroup,
-    instances: wgpu::Buffer,
-    instance_capacity: u64,
-    instance_bytes: Vec<u8>,
+    device_layer: Layer,
+    shell_layer: Layer,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+    blit_rect: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    offscreen: Option<Offscreen>,
+    /// Where the last frame put the device screen and the shell, in window pixels: the device
+    /// screen's (scale, x, y) and the shell's (scale, x, y), for mapping touches.
+    device_xform: (f32, f32, f32),
+    shell_xform: Option<(f32, f32, f32)>,
     wave_pipeline: wgpu::RenderPipeline,
     wave_texture: wgpu::Texture,
     wave_bind: wgpu::BindGroup,
@@ -240,10 +370,7 @@ pub struct Gfx {
 
     fonts: FontSystem,
     swash: SwashCache,
-    viewport: Viewport,
     atlas: TextAtlas,
-    text: TextRenderer,
-    slots: Vec<TextSlot>,
 
     pub adapter_info: wgpu::AdapterInfo,
     pub present_mode: wgpu::PresentMode,
@@ -309,20 +436,6 @@ impl Gfx {
                     min_binding_size: None,
                 },
                 count: None,
-            }],
-        });
-        let view_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("view"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let view_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("view"),
-            layout: &view_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: view_buffer.as_entire_binding(),
             }],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -445,16 +558,93 @@ impl Gfx {
             mapped_at_creation: false,
         });
 
-        let instance_capacity = 1024;
-        let instances = Self::instance_buffer(&device, instance_capacity);
+        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(BLIT_SHADER)),
+        });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            bind_group_layouts: &[Some(&blit_layout)],
+            ..Default::default()
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            cache: None,
+            multiview_mask: None,
+        });
+        let blit_rect = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit rect"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let mut fonts = FontSystem::new();
         fonts.db_mut().load_font_data(FONT_REGULAR.to_vec());
         fonts.db_mut().load_font_data(FONT_SEMIBOLD.to_vec());
         let cache = Cache::new(&device);
-        let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
+        let device_layer = Layer::new(&device, &cache, &mut atlas, &view_layout);
+        let shell_layer = Layer::new(&device, &cache, &mut atlas, &view_layout);
 
         Ok(Self {
             device,
@@ -463,11 +653,15 @@ impl Gfx {
             config,
             srgb: format.is_srgb(),
             pipeline,
-            view_buffer,
-            view_bind,
-            instances,
-            instance_capacity,
-            instance_bytes: Vec::new(),
+            device_layer,
+            shell_layer,
+            blit_pipeline,
+            blit_layout,
+            blit_rect,
+            sampler,
+            offscreen: None,
+            device_xform: (1.0, 0.0, 0.0),
+            shell_xform: None,
             wave_pipeline,
             wave_texture,
             wave_bind,
@@ -475,22 +669,10 @@ impl Gfx {
             wave_bytes: Vec::new(),
             fonts,
             swash: SwashCache::new(),
-            viewport,
             atlas,
-            text,
-            slots: Vec::new(),
             adapter_info,
             present_mode,
             window,
-        })
-    }
-
-    fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rect instances"),
-            size: capacity * INSTANCE_BYTES,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         })
     }
 
@@ -504,30 +686,31 @@ impl Gfx {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Physical pixel position in the window → design pixels.
+    /// Physical pixel position in the window → the device screen's design pixels, as the
+    /// last frame placed it. Outside the device screen (on a shell) it is out of range.
     pub fn to_design(&self, x: f64, y: f64) -> (f32, f32) {
-        let (s, ox, oy) = transform(self.config.width, self.config.height);
+        let (s, ox, oy) = self.device_xform;
         ((x as f32 - ox) / s, (y as f32 - oy) / s)
     }
 
-    fn color(&self, c: Rgba) -> [f32; 4] {
-        let [r, g, b, a] = c.0;
-        if !self.srgb {
-            return [r, g, b, a];
-        }
-        let lin = |v: f32| {
-            if v <= 0.04045 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        [lin(r), lin(g), lin(b), a]
+    /// True if a window pixel falls on the device screen.
+    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
+    pub fn on_device(&self, x: f64, y: f64) -> bool {
+        let (dx, dy) = self.to_design(x, y);
+        (0.0..DESIGN_W).contains(&dx) && (0.0..DESIGN_H).contains(&dy)
     }
 
-    /// Draw `scene` and present it. Returns `None` if the frame was skipped (surface not
-    /// ready); the caller requests another redraw either way.
-    pub fn render(&mut self, scene: &Scene) -> Option<FrameTiming> {
+    /// Window pixel → the shell's design pixels, if a shell was drawn.
+    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
+    pub fn to_shell(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        self.shell_xform
+            .map(|(s, ox, oy)| ((x as f32 - ox) / s, (y as f32 - oy) / s))
+    }
+
+    /// Draw the device screen `scene`, inside `shell` if there is one, and present it.
+    /// Returns `None` if the frame was skipped (surface not ready); the caller requests
+    /// another redraw either way.
+    pub fn render(&mut self, scene: &Scene, shell: Option<ShellFrame>) -> Option<FrameTiming> {
         let t0 = Instant::now();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
@@ -547,8 +730,8 @@ impl Gfx {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let (w, h) = (self.config.width, self.config.height);
-        let commands = self.draw(scene, &target, w, h);
-        self.queue.submit(Some(commands));
+        let commands = self.compose(scene, shell.as_ref(), &target, w, h);
+        self.queue.submit(commands);
         self.window.pre_present_notify();
         self.queue.present(frame);
         self.atlas.trim();
@@ -558,9 +741,13 @@ impl Gfx {
         })
     }
 
-    /// Render `scene` offscreen at the panel's native 1024×600 and return RGBA8 pixels.
-    pub fn screenshot(&mut self, scene: &Scene) -> Vec<u8> {
-        let (w, h) = (DESIGN_W as u32, DESIGN_H as u32);
+    /// Render offscreen at 1:1 design pixels and return (width, height, RGBA8 pixels): the
+    /// device screen at the panel's native 1024×600, or with `shell` the whole shell.
+    pub fn screenshot(&mut self, scene: &Scene, shell: Option<ShellFrame>) -> (u32, u32, Vec<u8>) {
+        let (w, h) = match &shell {
+            Some(f) => (f.size.0 as u32, f.size.1 as u32),
+            None => (DESIGN_W as u32, DESIGN_H as u32),
+        };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screenshot"),
             size: wgpu::Extent3d {
@@ -576,8 +763,9 @@ impl Gfx {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let draw = self.draw(scene, &view, w, h);
-        let row = w * 4; // 4096: already a multiple of the 256-byte copy alignment
+        let draws = self.compose(scene, shell.as_ref(), &view, w, h);
+        // Rows padded to the 256-byte copy alignment.
+        let row = (w * 4).div_ceil(256) * 256;
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("screenshot readback"),
             size: u64::from(row * h),
@@ -608,18 +796,24 @@ impl Gfx {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit([draw, encoder.finish()]);
+        let mut commands = draws;
+        commands.push(encoder.finish());
+        self.queue.submit(commands);
         readback
             .slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.expect("map screenshot"));
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
-        let mut pixels = readback
+        let padded = readback
             .slice(..)
             .get_mapped_range()
             .expect("screenshot mapping")
             .to_vec();
+        let mut pixels: Vec<u8> = padded
+            .chunks_exact(row as usize)
+            .flat_map(|r| r[..(w * 4) as usize].iter().copied())
+            .collect();
         if matches!(
             self.config.format,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
@@ -628,35 +822,156 @@ impl Gfx {
                 px.swap(0, 2);
             }
         }
-        // The window's next frame re-prepares text for its own size.
-        self.slots.clear();
-        pixels
+        (w, h, pixels)
     }
 
-    /// Encode `scene` into `target` (`w`×`h` physical pixels).
+    /// Encode a whole frame into `target`: the device layer alone, or the shell with the
+    /// device layer rendered offscreen and copied into its display slot.
+    fn compose(
+        &mut self,
+        scene: &Scene,
+        shell: Option<&ShellFrame>,
+        target: &wgpu::TextureView,
+        w: u32,
+        h: u32,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let Some(shell) = shell else {
+            let xform = transform(w, h, (DESIGN_W, DESIGN_H));
+            self.device_xform = xform;
+            self.shell_xform = None;
+            return vec![self.draw(Which::Device, scene, target, w, h, xform)];
+        };
+        let sx = transform(w, h, shell.size);
+        let (s, ox, oy) = sx;
+        let (dx, dy, dw, dh) = shell.display;
+        let px = ((ox + dx * s).round(), (oy + dy * s).round());
+        let size = (
+            ((dw * s).round() as u32).max(1),
+            ((dh * s).round() as u32).max(1),
+        );
+        self.ensure_offscreen(size);
+        let dev_xform = transform(size.0, size.1, (DESIGN_W, DESIGN_H));
+        self.device_xform = (dev_xform.0, px.0 + dev_xform.1, px.1 + dev_xform.2);
+        self.shell_xform = Some(sx);
+        let off = self.offscreen.as_ref().expect("just made").view.clone();
+        let device = self.draw(Which::Device, scene, &off, size.0, size.1, dev_xform);
+        let frame = self.draw(Which::Shell, shell.scene, target, w, h, sx);
+        // The device screen into its slot.
+        let (wf, hf) = (w as f32, h as f32);
+        let clip = [
+            px.0 / wf * 2.0 - 1.0,
+            1.0 - px.1 / hf * 2.0,
+            (px.0 + size.0 as f32) / wf * 2.0 - 1.0,
+            1.0 - (px.1 + size.1 as f32) / hf * 2.0,
+        ];
+        let bytes: Vec<u8> = clip.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        self.queue.write_buffer(&self.blit_rect, 0, &bytes);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("device screen into the shell"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.blit_pipeline);
+            pass.set_bind_group(0, &self.offscreen.as_ref().expect("just made").bind, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        vec![device, frame, encoder.finish()]
+    }
+
+    /// Make sure the device layer's offscreen target is `size` physical pixels.
+    fn ensure_offscreen(&mut self, size: (u32, u32)) {
+        if self.offscreen.as_ref().is_some_and(|o| o.size == size) {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("device screen"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.blit_rect.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.offscreen = Some(Offscreen { size, view, bind });
+    }
+
+    /// Encode `scene` on layer `which` into `target` (`w`×`h` physical pixels), placed by
+    /// `xform` (scale, offset x, offset y).
     fn draw(
         &mut self,
+        which: Which,
         scene: &Scene,
         target: &wgpu::TextureView,
         w: u32,
         h: u32,
+        xform: (f32, f32, f32),
     ) -> wgpu::CommandBuffer {
-        let (s, ox, oy) = transform(w, h);
+        // Waveforms belong to the device screen.
+        let waves = if which == Which::Device {
+            self.upload_waves(scene)
+        } else {
+            0
+        };
+        let srgb = self.srgb;
+        let layer = match which {
+            Which::Device => &mut self.device_layer,
+            Which::Shell => &mut self.shell_layer,
+        };
+        let (s, ox, oy) = xform;
         let mut view = Vec::with_capacity(32);
-        let srgb = if self.srgb { 1.0 } else { 0.0 };
-        for v in [s, ox, oy, 0.0, w as f32, h as f32, srgb, 0.0] {
+        let srgb_flag = if srgb { 1.0 } else { 0.0 };
+        for v in [s, ox, oy, 0.0, w as f32, h as f32, srgb_flag, 0.0] {
             view.extend_from_slice(&v.to_ne_bytes());
         }
-        self.queue.write_buffer(&self.view_buffer, 0, &view);
+        self.queue.write_buffer(&layer.view_buffer, 0, &view);
 
-        self.instance_bytes.clear();
+        layer.instance_bytes.clear();
         for r in &scene.rects {
-            let fill = self.color(r.fill);
-            let stroke = self.color(r.stroke);
+            let fill = color(srgb, r.fill);
+            let stroke = color(srgb, r.stroke);
             let (kind, fill2) = match r.gradient {
                 None => (0.0, fill),
-                Some((to, Gradient::Down)) => (1.0, self.color(to)),
-                Some((to, Gradient::Mirrored)) => (2.0, self.color(to)),
+                Some((to, Gradient::Down)) => (1.0, color(srgb, to)),
+                Some((to, Gradient::Mirrored)) => (2.0, color(srgb, to)),
             };
             for v in [r.x, r.y, r.w, r.h, r.radius, r.border, kind, 0.0]
                 .into_iter()
@@ -664,21 +979,30 @@ impl Gfx {
                 .chain(stroke)
                 .chain(fill2)
             {
-                self.instance_bytes.extend_from_slice(&v.to_ne_bytes());
+                layer.instance_bytes.extend_from_slice(&v.to_ne_bytes());
             }
         }
         let count = scene.rects.len() as u64;
-        if count > self.instance_capacity {
-            self.instance_capacity = count.next_power_of_two();
-            self.instances = Self::instance_buffer(&self.device, self.instance_capacity);
+        if count > layer.instance_capacity {
+            layer.instance_capacity = count.next_power_of_two();
+            layer.instances = instance_buffer(&self.device, layer.instance_capacity);
         }
         if count > 0 {
             self.queue
-                .write_buffer(&self.instances, 0, &self.instance_bytes);
+                .write_buffer(&layer.instances, 0, &layer.instance_bytes);
         }
-        let waves = self.upload_waves(scene);
-        self.prepare_text(scene, w, h);
-        let [r, g, b, a] = self.color(scene.background).map(f64::from);
+        prepare_text(
+            layer,
+            &self.device,
+            &self.queue,
+            &mut self.fonts,
+            &mut self.atlas,
+            &mut self.swash,
+            scene,
+            (w, h),
+            xform,
+        );
+        let [r, g, b, a] = color(srgb, scene.background).map(f64::from);
         let clear = wgpu::Color { r, g, b, a };
 
         let mut encoder = self
@@ -711,20 +1035,20 @@ impl Gfx {
                     .map_or(count as u32, |(at, _)| *at as u32);
                 if until > drawn {
                     pass.set_pipeline(&self.pipeline);
-                    pass.set_bind_group(0, &self.view_bind, &[]);
-                    pass.set_vertex_buffer(0, self.instances.slice(..count * INSTANCE_BYTES));
+                    pass.set_bind_group(0, &layer.view_bind, &[]);
+                    pass.set_vertex_buffer(0, layer.instances.slice(..count * INSTANCE_BYTES));
                     pass.draw(0..4, drawn..until);
                     drawn = until;
                 }
                 if k < waves {
                     pass.set_pipeline(&self.wave_pipeline);
-                    pass.set_bind_group(0, &self.view_bind, &[]);
+                    pass.set_bind_group(0, &layer.view_bind, &[]);
                     pass.set_bind_group(1, &self.wave_bind, &[]);
                     pass.set_vertex_buffer(0, self.wave_instances.slice(..));
                     pass.draw(0..4, k as u32..k as u32 + 1);
                 }
             }
-            if let Err(e) = self.text.render(&self.atlas, &self.viewport, &mut pass) {
+            if let Err(e) = layer.text.render(&self.atlas, &layer.viewport, &mut pass) {
                 eprintln!("text render: {e}");
             }
         }
@@ -811,87 +1135,94 @@ impl Gfx {
         }
         waves
     }
+}
 
-    fn prepare_text(&mut self, scene: &Scene, w: u32, h: u32) {
-        let (s, ox, oy) = transform(w, h);
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: w,
-                height: h,
-            },
+/// Shape (or reuse) `scene`'s texts on `layer` and prepare them for a `w`×`h` target placed by
+/// `xform`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_text(
+    layer: &mut Layer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    fonts: &mut FontSystem,
+    atlas: &mut TextAtlas,
+    swash: &mut SwashCache,
+    scene: &Scene,
+    (w, h): (u32, u32),
+    (s, ox, oy): (f32, f32, f32),
+) {
+    layer.viewport.update(
+        queue,
+        Resolution {
+            width: w,
+            height: h,
+        },
+    );
+    for (i, t) in scene.texts.iter().enumerate() {
+        let key = (
+            t.text.clone(),
+            t.size.to_bits(),
+            t.weight,
+            t.line_height.to_bits(),
         );
-        for (i, t) in scene.texts.iter().enumerate() {
-            let key = (
-                t.text.clone(),
-                t.size.to_bits(),
-                t.weight,
-                t.line_height.to_bits(),
-            );
-            if self.slots.get(i).is_some_and(|slot| slot.key == key) {
-                continue;
-            }
-            let metrics = Metrics::new(t.size, t.size * t.line_height);
-            let weight = match t.weight {
-                Weight::Regular => glyphon::Weight::NORMAL,
-                Weight::SemiBold => glyphon::Weight::SEMIBOLD,
-            };
-            let attrs = Attrs::new().family(Family::Name(FAMILY)).weight(weight);
-            if i == self.slots.len() {
-                self.slots.push(TextSlot {
-                    key: key.clone(),
-                    buffer: Buffer::new(&mut self.fonts, metrics),
-                    width: 0.0,
-                });
-            }
-            let slot = &mut self.slots[i];
-            slot.buffer.set_metrics(metrics);
-            slot.buffer.set_size(None, None);
-            slot.buffer
-                .set_text(&t.text, &attrs, Shaping::Advanced, None);
-            slot.buffer.shape_until_scroll(&mut self.fonts, false);
-            slot.width = slot
-                .buffer
-                .layout_runs()
-                .map(|r| r.line_w)
-                .fold(0.0, f32::max);
-            slot.key = key;
+        if layer.slots.get(i).is_some_and(|slot| slot.key == key) {
+            continue;
         }
-        self.slots.truncate(scene.texts.len());
-        let bounds = TextBounds {
-            left: 0,
-            top: 0,
-            right: w as i32,
-            bottom: h as i32,
+        let metrics = Metrics::new(t.size, t.size * t.line_height);
+        let weight = match t.weight {
+            Weight::Regular => glyphon::Weight::NORMAL,
+            Weight::SemiBold => glyphon::Weight::SEMIBOLD,
         };
-        let areas = scene.texts.iter().zip(&self.slots).map(|(t, slot)| {
-            let left = match t.align {
-                Align::Left => t.x,
-                Align::Center => t.x - slot.width * 0.5,
-                Align::Right => t.x - slot.width,
-            };
-            let [r, g, b, a] = t.color.0;
-            let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-            TextArea {
-                buffer: &slot.buffer,
-                left: ox + left * s,
-                top: oy + t.y * s,
-                scale: s,
-                bounds,
-                default_color: Color::rgba(byte(r), byte(g), byte(b), byte(a)),
-                custom_glyphs: &[],
-            }
-        });
-        if let Err(e) = self.text.prepare(
-            &self.device,
-            &self.queue,
-            &mut self.fonts,
-            &mut self.atlas,
-            &self.viewport,
-            areas,
-            &mut self.swash,
-        ) {
-            eprintln!("text prepare: {e}");
+        let attrs = Attrs::new().family(Family::Name(FAMILY)).weight(weight);
+        if i == layer.slots.len() {
+            layer.slots.push(TextSlot {
+                key: key.clone(),
+                buffer: Buffer::new(fonts, metrics),
+                width: 0.0,
+            });
         }
+        let slot = &mut layer.slots[i];
+        slot.buffer.set_metrics(metrics);
+        slot.buffer.set_size(None, None);
+        slot.buffer
+            .set_text(&t.text, &attrs, Shaping::Advanced, None);
+        slot.buffer.shape_until_scroll(fonts, false);
+        slot.width = slot
+            .buffer
+            .layout_runs()
+            .map(|r| r.line_w)
+            .fold(0.0, f32::max);
+        slot.key = key;
+    }
+    layer.slots.truncate(scene.texts.len());
+    let bounds = TextBounds {
+        left: 0,
+        top: 0,
+        right: w as i32,
+        bottom: h as i32,
+    };
+    let areas = scene.texts.iter().zip(&layer.slots).map(|(t, slot)| {
+        let left = match t.align {
+            Align::Left => t.x,
+            Align::Center => t.x - slot.width * 0.5,
+            Align::Right => t.x - slot.width,
+        };
+        let [r, g, b, a] = t.color.0;
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        TextArea {
+            buffer: &slot.buffer,
+            left: ox + left * s,
+            top: oy + t.y * s,
+            scale: s,
+            bounds,
+            default_color: Color::rgba(byte(r), byte(g), byte(b), byte(a)),
+            custom_glyphs: &[],
+        }
+    });
+    if let Err(e) = layer
+        .text
+        .prepare(device, queue, fonts, atlas, &layer.viewport, areas, swash)
+    {
+        eprintln!("text prepare: {e}");
     }
 }
