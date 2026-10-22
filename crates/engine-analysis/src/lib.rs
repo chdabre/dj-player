@@ -17,6 +17,7 @@
 //! Analysis runs on worker threads and never touches the audio callback.
 
 pub mod analyzer;
+mod audio;
 #[cfg(feature = "essentia")]
 pub mod essentia;
 pub mod gridfit;
@@ -32,31 +33,15 @@ pub mod stratum;
 pub mod tempocnn;
 
 pub use analyzer::{AnalysisError, Analyzer, CancelFlag, RunResults, run_all};
+pub use audio::{TrackAudio, load, load_until};
 pub use gridfit::{GridFit, GridFitConfig, PhaseSource};
 pub use model::{
     Analysed, Analysis, AnalyzerId, Beat, Beatgrid, BpmRange, Feature, FeatureSet, Key, Mode,
-    PitchClass, Provenance, Settings, Tempo, TrackAudio,
+    PitchClass, Provenance, Settings, Tempo,
 };
 pub use select::{Policy, Source};
 #[cfg(feature = "stratum")]
 pub use stratum::Stratum;
-
-/// Decode a file for analysis, at its own sample rate.
-pub fn load(path: impl AsRef<std::path::Path>) -> Result<TrackAudio, engine_media::LoadError> {
-    load_until(path, &engine_media::Cancel::new())
-}
-
-/// [`load`], stopped once `cancel` is set.
-pub fn load_until(
-    path: impl AsRef<std::path::Path>,
-    cancel: &engine_media::Cancel,
-) -> Result<TrackAudio, engine_media::LoadError> {
-    let (stereo, sample_rate) = engine_media::decode_native_until(path, cancel)?;
-    Ok(TrackAudio {
-        sample_rate,
-        stereo,
-    })
-}
 
 /// Every analyzer compiled into this build, in default preference order, with default
 /// settings.

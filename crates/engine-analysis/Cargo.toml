@@ -3,7 +3,7 @@ name = "engine-analysis"
 description = "Track analysis (tempo, beatgrid, key) behind pluggable backends, plus a ground-truth scorer."
 version.workspace = true
 edition.workspace = true
-# hpcpkey.rs is AGPL-3.0-or-later (ported from Essentia); everything else is GPL-3.0-or-later.
+# hpcpkey/ is AGPL-3.0-or-later (ported from Essentia); everything else is GPL-3.0-or-later.
 license = "GPL-3.0-or-later AND AGPL-3.0-or-later"
 rust-version.workspace = true
 publish = false

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use engine_analysis::rekordbox::XmlTrack;
 use engine_analysis::score::{TrackScore, Truth, report, score_track};
 use engine_analysis::{
     Analysis, BpmRange, CancelFlag, FeatureSet, Key, Settings, TrackAudio, analyzers_with, load,
@@ -178,42 +179,98 @@ fn score(csv: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rekordbox(args: &[String]) -> Result<()> {
-    let mut xml = None;
-    let mut min_seconds = 30.0;
-    let mut limit = usize::MAX;
-    let mut only: Vec<String> = Vec::new();
-    let mut overrides = None;
-    let mut playlist: Option<String> = None;
-    let mut offset_correction = true;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--min-seconds" => min_seconds = it.next().ok_or("--min-seconds N")?.parse()?,
-            "--limit" => limit = it.next().ok_or("--limit N")?.parse()?,
-            "--no-offset-correction" => offset_correction = false,
-            "--playlist" => playlist = Some(it.next().ok_or("--playlist NAME")?.clone()),
-            "--overrides" => overrides = Some(PathBuf::from(it.next().ok_or("--overrides FILE")?)),
-            "--only" => {
-                only = it
-                    .next()
-                    .ok_or("--only NAME[,NAME...]")?
-                    .split(',')
-                    .map(str::to_string)
-                    .collect()
+/// Options of the `rekordbox` subcommand.
+struct RekordboxArgs {
+    xml: PathBuf,
+    min_seconds: f64,
+    limit: usize,
+    only: Vec<String>,
+    overrides: Option<PathBuf>,
+    playlist: Option<String>,
+    offset_correction: bool,
+}
+
+impl RekordboxArgs {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut xml = None;
+        let mut min_seconds = 30.0;
+        let mut limit = usize::MAX;
+        let mut only: Vec<String> = Vec::new();
+        let mut overrides = None;
+        let mut playlist: Option<String> = None;
+        let mut offset_correction = true;
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--min-seconds" => min_seconds = it.next().ok_or("--min-seconds N")?.parse()?,
+                "--limit" => limit = it.next().ok_or("--limit N")?.parse()?,
+                "--no-offset-correction" => offset_correction = false,
+                "--playlist" => playlist = Some(it.next().ok_or("--playlist NAME")?.clone()),
+                "--overrides" => {
+                    overrides = Some(PathBuf::from(it.next().ok_or("--overrides FILE")?))
+                }
+                "--only" => {
+                    only = it
+                        .next()
+                        .ok_or("--only NAME[,NAME...]")?
+                        .split(',')
+                        .map(str::to_string)
+                        .collect()
+                }
+                _ => xml = Some(PathBuf::from(a)),
             }
-            _ => xml = Some(PathBuf::from(a)),
         }
+        Ok(Self {
+            xml: xml.ok_or("rekordbox needs the XML export")?,
+            min_seconds,
+            limit,
+            only,
+            overrides,
+            playlist,
+            offset_correction,
+        })
     }
-    let xml = xml.ok_or("rekordbox needs the XML export")?;
-    let text = std::fs::read_to_string(&xml)?;
+}
+
+/// What a `rekordbox` run measured: scores and wall time per analyzer, and each scored
+/// track's file extension (in scoring order).
+#[derive(Default)]
+struct RekordboxRun {
+    by_analyzer: Vec<(String, Vec<TrackScore>)>,
+    timing: Vec<(String, f64)>,
+    audio_seconds: f64,
+    formats: Vec<String>,
+}
+
+fn rekordbox(args: &[String]) -> Result<()> {
+    let args = RekordboxArgs::parse(args)?;
+    let tracks = rekordbox_tracks(&args)?;
+    let usable: Vec<_> = tracks
+        .iter()
+        .filter(|t| !t.tempo.is_empty() && t.location.exists())
+        .take(args.limit)
+        .collect();
+    eprintln!(
+        "{} tracks in the collection, {} with a Rekordbox grid and a file present",
+        tracks.len(),
+        usable.len()
+    );
+    let run = rekordbox_score(&args, &usable)?;
+    print_speed(&run);
+    print_reports(&run);
+    Ok(())
+}
+
+/// The collection, narrowed to the playlist and corrected by the overrides, if given.
+fn rekordbox_tracks(args: &RekordboxArgs) -> Result<Vec<XmlTrack>> {
+    let text = std::fs::read_to_string(&args.xml)?;
     let mut tracks = engine_analysis::rekordbox::read_collection(&text)?;
-    if let Some(name) = &playlist {
+    if let Some(name) = &args.playlist {
         let ids = engine_analysis::rekordbox::read_playlist(&text, name)?
             .ok_or_else(|| format!("no playlist {name:?}"))?;
         tracks.retain(|t| ids.contains(&t.id));
     }
-    if let Some(path) = &overrides {
+    if let Some(path) = &args.overrides {
         let o = engine_analysis::rekordbox::Overrides::parse(&std::fs::read_to_string(path)?)?;
         for (rule, hits) in o.apply(&mut tracks) {
             if hits != 1 {
@@ -221,24 +278,16 @@ fn rekordbox(args: &[String]) -> Result<()> {
             }
         }
     }
-    let usable: Vec<_> = tracks
-        .iter()
-        .filter(|t| !t.tempo.is_empty() && t.location.exists())
-        .take(limit)
-        .collect();
-    eprintln!(
-        "{} tracks in the collection, {} with a Rekordbox grid and a file present",
-        tracks.len(),
-        usable.len()
-    );
-    let mut by_analyzer: Vec<(String, Vec<TrackScore>)> = Vec::new();
-    let mut timing: Vec<(String, f64)> = Vec::new();
-    let mut audio_seconds = 0.0;
-    let mut formats: Vec<String> = Vec::new();
+    Ok(tracks)
+}
+
+/// Analyse and score every usable track at least `min_seconds` long.
+fn rekordbox_score(args: &RekordboxArgs, usable: &[&XmlTrack]) -> Result<RekordboxRun> {
+    let mut run = RekordboxRun::default();
     let mut skipped = 0;
     for (n, t) in usable.iter().enumerate() {
         let audio = load(&t.location)?;
-        if audio.duration() < min_seconds {
+        if audio.duration() < args.min_seconds {
             skipped += 1;
             continue;
         }
@@ -250,54 +299,62 @@ fn rekordbox(args: &[String]) -> Result<()> {
         eprintln!("[{}/{}] {name}", n + 1, usable.len());
         // Rekordbox's MP3 timeline starts before ours by the gapless trim.
         let mut t = (*t).clone();
-        if offset_correction {
+        if args.offset_correction {
             let info = engine_media::probe(&t.location)?;
             t.shift(-engine_analysis::rekordbox::timeline_offset(&info));
         }
         let truth = t.truth(audio.duration());
-        audio_seconds += audio.duration();
-        for (analyzer, a, secs) in run_audio(&audio, &only)? {
-            match timing.iter_mut().find(|(n, _)| *n == analyzer) {
+        run.audio_seconds += audio.duration();
+        for (analyzer, a, secs) in run_audio(&audio, &args.only)? {
+            match run.timing.iter_mut().find(|(n, _)| *n == analyzer) {
                 Some((_, t)) => *t += secs,
-                None => timing.push((analyzer.clone(), secs)),
+                None => run.timing.push((analyzer.clone(), secs)),
             }
             let s = score_track(&name, &a, &truth);
-            match by_analyzer.iter_mut().find(|(n, _)| *n == analyzer) {
+            match run.by_analyzer.iter_mut().find(|(n, _)| *n == analyzer) {
                 Some((_, v)) => v.push(s),
-                None => by_analyzer.push((analyzer, vec![s])),
+                None => run.by_analyzer.push((analyzer, vec![s])),
             }
         }
-        formats.push(
+        run.formats.push(
             t.location
                 .extension()
                 .map_or_else(|| "?".into(), |e| e.to_string_lossy().to_lowercase()),
         );
     }
-    eprintln!("skipped {skipped} shorter than {min_seconds} s");
+    eprintln!("skipped {skipped} shorter than {} s", args.min_seconds);
+    Ok(run)
+}
+
+fn print_speed(run: &RekordboxRun) {
     println!(
         "# Speed\n\n{:.0} s of audio in {} tracks.\n",
-        audio_seconds,
-        formats.len()
+        run.audio_seconds,
+        run.formats.len()
     );
     println!("| analyzer | total s | x real time | s per 5-min track |\n| --- | --- | --- | --- |");
-    for (analyzer, secs) in &timing {
+    for (analyzer, secs) in &run.timing {
         println!(
             "| {analyzer} | {secs:.1} | {:.0} | {:.2} |",
-            audio_seconds / secs,
-            300.0 * secs / audio_seconds
+            run.audio_seconds / secs,
+            300.0 * secs / run.audio_seconds
         );
     }
     println!();
-    for (analyzer, scores) in &by_analyzer {
+}
+
+/// The score report per analyzer, each followed by its median beat offset per file format.
+fn print_reports(run: &RekordboxRun) {
+    for (analyzer, scores) in &run.by_analyzer {
         println!("{}", report(analyzer, scores));
         println!("## Median beat offset by format\n");
-        let mut kinds: Vec<&String> = formats.iter().collect();
+        let mut kinds: Vec<&String> = run.formats.iter().collect();
         kinds.sort();
         kinds.dedup();
         for kind in kinds {
             let mut offsets: Vec<f64> = scores
                 .iter()
-                .zip(&formats)
+                .zip(&run.formats)
                 .filter(|(_, f)| *f == kind)
                 .filter_map(|(s, _)| s.beats.and_then(|b| b.median_offset_ms))
                 .collect();
@@ -309,7 +366,6 @@ fn rekordbox(args: &[String]) -> Result<()> {
         }
         println!();
     }
-    Ok(())
 }
 
 /// Split one CSV line, honouring double quotes ("" inside quotes is a quote).
