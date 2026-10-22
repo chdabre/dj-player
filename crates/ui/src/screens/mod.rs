@@ -18,67 +18,32 @@ pub mod deck;
 pub mod main;
 pub mod perform;
 
-use crate::app::engine::DeckSnapshot;
+use std::path::Path;
+
+use engined::browse::{Browser, Source};
+
+use crate::app::effects::Effects;
+use crate::app::engine::{DeckSnapshot, LibraryView};
+use crate::input::Nav;
 use crate::kit;
 use crate::render::scene::Scene;
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveSettings};
 
-pub use perform::PerfState;
+pub use browse::{BrowseState, BrowseTarget};
+pub use chrome::ChromeTarget;
+pub use deck::{DeckState, DeckTarget};
+pub use perform::{PerfState, PerfTarget};
 
-/// Things on screen that can be touched.
+/// Things on screen that can be touched, by the part of the screen that owns them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-    Library,
-    Link,
-    Usb,
-    Slip,
-    Browse,
-    TagList,
-    Info,
-    Menu,
-    Perform,
-    Delete,
-    Memory,
-    CallPrev,
-    CallNext,
-    Zoom,
-    Grid,
-    Sync,
-    Master,
-    TempoRange,
-    JumpSize,
-    /// The overview: touching it seeks (needle search).
-    Overview,
-    /// The zoom waveform: touching it takes the track, dragging scrubs it.
-    Waveform,
-    // Performance screen.
-    HotCueMode,
-    BeatJumpMode,
-    DeleteCall,
-    Bank,
-    /// One of the four pads (0..4, left to right).
-    Pad(u8),
-    /// One of the beat loop lengths ([`crate::screens::perform::BEAT_LOOPS`] index).
-    BeatLoop(u8),
-    // Browse screen.
-    /// A shown row of the list (0 = top).
-    Row(u8),
-    /// The list header: up a level.
-    BrowseBack,
-    /// Header chips: the sort order, search, scan the stick.
-    Sort,
-    Search,
-    Scan,
-    /// ANALYZE ALL (or STOP while it runs).
-    AnalyzeAll,
-    /// The "scan this stick?" question's answers.
-    ScanYes,
-    ScanNo,
-    /// A key of the on-screen keyboard ([`crate::screens::browse::KEYS`] index).
-    Key(u8),
-    /// A row of a modal over the browse list (its index among all the modal's rows).
-    ModalRow(u16),
+    /// The rail and the tab row.
+    Chrome(ChromeTarget),
+    /// The deck displays of the playback screens.
+    Deck(DeckTarget),
+    Perform(PerfTarget),
+    Browse(BrowseTarget),
 }
 
 /// Which screen is up.
@@ -150,6 +115,170 @@ pub struct Wave<'a> {
 
 /// The toolkit, drawing for the device screen's targets.
 pub(crate) type Ui<'s> = kit::Ui<'s, Target>;
+
+/// What an input handler may use: the deck as the screen shows it, the browser, the library
+/// to look at, and the effects to ask for.
+pub struct Cx<'a> {
+    pub deck: &'a DeckSnapshot,
+    pub browser: Option<&'a mut Browser>,
+    pub library: LibraryView<'a>,
+    /// The file on the deck, if any.
+    pub loaded: Option<&'a Path>,
+    /// The playhead the last frame showed (frames).
+    pub shown: Option<f64>,
+    pub effects: &'a mut Effects,
+}
+
+/// A screen a handler asks to show.
+pub type Show = Option<ScreenKind>;
+
+/// Which screen is up, each screen's own state (kept while another is up), and the touch
+/// in progress. Input from the device screen and the browse controls comes here and goes to
+/// the part of the screen it is for.
+#[derive(Default)]
+pub struct Screens {
+    pub screen: ScreenKind,
+    pub deck: DeckState,
+    pub perform: PerfState,
+    pub browse: BrowseState,
+    /// The target the finger is on (drawn pressed), until it lifts or drags the list.
+    pub pressed: Option<Target>,
+}
+
+impl Screens {
+    fn show(&mut self, s: Show) {
+        if let Some(s) = s {
+            self.screen = s;
+        }
+    }
+
+    /// A finger (or click) went down on `hit` at design pixels (`x`, `y`).
+    pub fn tap(&mut self, hit: HitBox, (x, y): (f32, f32), cx: &mut Cx) {
+        self.pressed = Some(hit.target);
+        match hit.target {
+            Target::Chrome(t) => chrome::tap(self, t, cx),
+            Target::Deck(t) => self.deck.tap(t, hit.rect, x, cx),
+            Target::Perform(t) => {
+                let (hot, beats) = (cx.deck.hot_cues, cx.deck.loop_beats());
+                if let Some(cmd) = perform::press(&mut self.perform, t, hot, beats) {
+                    cx.effects.push(crate::app::effects::Effect::Deck(cmd));
+                }
+            }
+            Target::Browse(BrowseTarget::Back) => self.nav(Nav::Back, cx),
+            Target::Browse(BrowseTarget::Search) => {
+                if self.browse.search(cx) {
+                    self.screen = ScreenKind::Browse;
+                }
+            }
+            Target::Browse(t) => self.browse.tap(t, y, cx),
+        }
+    }
+
+    /// The finger moved to design pixels (`x`, `y`).
+    pub fn drag(&mut self, (x, y): (f32, f32), cx: &mut Cx) {
+        let pressed = match self.pressed {
+            Some(Target::Deck(t)) => Some(t),
+            _ => None,
+        };
+        if self.deck.drag(pressed, x, cx) {
+            return;
+        }
+        if self.browse.drag(y, cx) == Some(true) {
+            self.pressed = None;
+        }
+    }
+
+    /// The finger came up.
+    pub fn release(&mut self, cx: &mut Cx) {
+        self.pressed = None;
+        self.deck.release(cx);
+        self.browse.release(cx);
+    }
+
+    /// A browse control: the knob turned or pushed, BACK, TAG TRACK.
+    pub fn nav(&mut self, n: Nav, cx: &mut Cx) {
+        if self.screen == ScreenKind::Info && n == Nav::Back {
+            self.screen = ScreenKind::Main;
+            return;
+        }
+        if n == Nav::Tag || n == Nav::Untag {
+            let browsing = self.screen == ScreenKind::Browse;
+            return self.browse.tag_track(n == Nav::Untag, browsing, cx);
+        }
+        if cx.browser.is_none() {
+            return;
+        }
+        if self.screen != ScreenKind::Browse {
+            // Pushing the knob elsewhere opens the browser.
+            if n == Nav::Push {
+                self.screen = ScreenKind::Browse;
+            }
+            return;
+        }
+        let show = self.browse.nav(n, cx);
+        self.show(show);
+    }
+
+    /// The mouse wheel turned `rows` over the device screen.
+    pub fn wheel(&mut self, rows: i32, cx: &mut Cx) {
+        if self.screen == ScreenKind::Browse
+            && let Some(b) = cx.browser.as_deref_mut()
+        {
+            b.scroll_by(rows as isize);
+        }
+    }
+
+    /// PERFORM: the performance screen, or back to the main screen.
+    pub fn toggle_perform(&mut self) {
+        self.screen = match self.screen {
+            ScreenKind::Performance => ScreenKind::Main,
+            _ => ScreenKind::Performance,
+        };
+    }
+
+    /// BROWSE: the browse screen, or back to the main screen (with a browser).
+    pub fn toggle_browse(&mut self, cx: &Cx) {
+        if cx.browser.is_some() {
+            self.screen = match self.screen {
+                ScreenKind::Browse => ScreenKind::Main,
+                _ => ScreenKind::Browse,
+            };
+        }
+    }
+
+    /// SEARCH from anywhere.
+    pub fn search(&mut self, cx: &mut Cx) {
+        if self.browse.search(cx) {
+            self.screen = ScreenKind::Browse;
+        }
+    }
+
+    /// INFO: in the browser, the selected track's details beside the list (or not); on any
+    /// other screen, the INFO screen of the loaded track (or back to the main screen).
+    pub fn toggle_info(&mut self) {
+        match self.screen {
+            ScreenKind::Browse => self.browse.toggle_side(),
+            ScreenKind::Info => self.screen = ScreenKind::Main,
+            _ => self.screen = ScreenKind::Info,
+        }
+    }
+
+    /// Show the browser at `source`.
+    fn browse_source(&mut self, source: Source, cx: &mut Cx) {
+        if let Some(b) = cx.browser.as_deref_mut() {
+            b.set_source(source);
+            self.browse.keyboard = false;
+            self.screen = ScreenKind::Browse;
+        }
+    }
+
+    /// A track loaded: the main screen shows it.
+    pub fn loaded(&mut self) {
+        self.browse.keyboard = false;
+        self.deck.loaded();
+        self.screen = ScreenKind::Main;
+    }
+}
 
 /// Lay out the screen into `scene`; returns the touch targets.
 pub fn build(
@@ -397,7 +526,10 @@ mod tests {
                     assert!(!overlap, "{:?} overlaps {:?}", a.target, c.target);
                 }
             }
-            for h in hits.iter().filter(|h| h.target != Target::Overview) {
+            for h in hits
+                .iter()
+                .filter(|h| h.target != Target::Deck(DeckTarget::Overview))
+            {
                 assert!(
                     h.rect.w >= 36.0 && h.rect.h >= 36.0,
                     "{:?} is {}×{}",
@@ -409,7 +541,7 @@ mod tests {
             let has = |t: Target| hits.iter().any(|h| h.target == t);
             let rows = hits
                 .iter()
-                .filter(|h| matches!(h.target, Target::Row(_)))
+                .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::Row(_))))
                 .count();
             let listing = b.info.is_none();
             let covered = b.ask_scan || b.modal.is_some() || !listing;
@@ -418,47 +550,53 @@ mod tests {
                 // Inside the list area, clear of the status band.
                 for h in hits
                     .iter()
-                    .filter(|h| matches!(h.target, Target::ModalRow(_)))
+                    .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::ModalRow(_))))
                 {
                     assert!(h.rect.bottom() <= 386.0, "{h:?}");
                 }
                 let shown = hits
                     .iter()
-                    .filter(|h| matches!(h.target, Target::ModalRow(_)));
+                    .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::ModalRow(_))));
                 assert_eq!(shown.count(), m.rows.len().min(MODAL_ROWS));
                 // Scrolled to keep the cursor in view.
-                let sel = Target::ModalRow(m.selected as u16);
+                let sel = Target::Browse(BrowseTarget::ModalRow(m.selected as u16));
                 assert!(hits.iter().any(|h| h.target == sel));
             }
             if let Some(h) = &b.header_override {
                 assert!(scene.texts.iter().any(|t| &t.text == h));
             }
-            assert_eq!(has(Target::BrowseBack), !b.at_root && listing);
-            assert_eq!(has(Target::Scan), b.library && b.scan.is_none() && listing);
-            assert_eq!(has(Target::ScanYes), b.ask_scan);
+            assert_eq!(
+                has(Target::Browse(BrowseTarget::Back)),
+                !b.at_root && listing
+            );
+            assert_eq!(
+                has(Target::Browse(BrowseTarget::Scan)),
+                b.library && b.scan.is_none() && listing
+            );
+            assert_eq!(has(Target::Browse(BrowseTarget::ScanYes)), b.ask_scan);
             let analyze = listing
                 && b.library
                 && b.scan.is_none()
                 && (b.unanalysed > 0 || b.analyzing.is_some());
-            assert_eq!(has(Target::AnalyzeAll), analyze);
+            assert_eq!(has(Target::Browse(BrowseTarget::AnalyzeAll)), analyze);
             if b.analyzing.is_some() {
                 assert!(scene.texts.iter().any(|t| t.text == "ANALYZING 3 / 12"));
             }
             let keys = hits
                 .iter()
-                .filter(|h| matches!(h.target, Target::Key(_)))
+                .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::Key(_))))
                 .count();
             let all_keys = crate::screens::browse::key_count();
             assert_eq!(keys, if b.keyboard { all_keys } else { 0 });
             assert_eq!(
-                has(Target::Overview),
+                has(Target::Deck(DeckTarget::Overview)),
                 !b.keyboard,
                 "the keyboard covers the overview"
             );
             let tab = if b.tag_list {
-                Target::TagList
+                Target::Chrome(ChromeTarget::TagList)
             } else {
-                Target::Browse
+                Target::Chrome(ChromeTarget::Browse)
             };
             assert!(hits.iter().any(|h| h.target == tab));
             // The title column's divider: only with tracks (or beside the info panel).
@@ -471,7 +609,10 @@ mod tests {
             }
             if b.side.is_some() {
                 // The list keeps its jacket and title columns; the panel is beside it.
-                for h in hits.iter().filter(|h| matches!(h.target, Target::Row(_))) {
+                for h in hits
+                    .iter()
+                    .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::Row(_))))
+                {
                     assert!(h.rect.right() <= 560.0, "{h:?}");
                 }
                 assert!(!scene.texts.iter().any(|t| t.text == "128.0   8A   5:12"));
@@ -525,7 +666,10 @@ mod tests {
             }
         }
         // Touch targets the design pass sized for a 7" panel: at least 36 px on each side.
-        for h in hits.iter().filter(|h| h.target != Target::Overview) {
+        for h in hits
+            .iter()
+            .filter(|h| h.target != Target::Deck(DeckTarget::Overview))
+        {
             assert!(
                 h.rect.w >= 36.0 && h.rect.h >= 36.0,
                 "{:?} is {}×{}",
@@ -578,7 +722,10 @@ mod tests {
                     assert!(!overlap, "{perf:?}: {:?} overlaps {:?}", a.target, b.target);
                 }
             }
-            for h in hits.iter().filter(|h| h.target != Target::Overview) {
+            for h in hits
+                .iter()
+                .filter(|h| h.target != Target::Deck(DeckTarget::Overview))
+            {
                 assert!(
                     h.rect.w >= 36.0 && h.rect.h >= 36.0,
                     "{:?} is {}×{}",
@@ -589,12 +736,12 @@ mod tests {
             }
             let pads = hits
                 .iter()
-                .filter(|h| matches!(h.target, Target::Pad(_)))
+                .filter(|h| matches!(h.target, Target::Perform(PerfTarget::Pad(_))))
                 .count();
             assert_eq!(pads, crate::screens::perform::PADS, "{perf:?}");
             let loops = hits
                 .iter()
-                .filter(|h| matches!(h.target, Target::BeatLoop(_)))
+                .filter(|h| matches!(h.target, Target::Perform(PerfTarget::BeatLoop(_))))
                 .count();
             assert_eq!(loops, engine_core::BEAT_LOOPS.len());
         }
@@ -610,5 +757,184 @@ mod tests {
             &mut scene,
         );
         assert!(scene.texts.iter().any(|t| t.text == "--.-"));
+    }
+
+    // ----- Input: what taps, drags and the browse controls do -----
+
+    use crate::app::effects::Effect;
+    use crate::kit::Rect;
+    use engine_core::DeckCommand;
+
+    fn cx<'a>(
+        deck: &'a DeckSnapshot,
+        browser: Option<&'a mut Browser>,
+        fx: &'a mut Effects,
+    ) -> Cx<'a> {
+        Cx {
+            deck,
+            browser,
+            library: LibraryView::default(),
+            loaded: None,
+            shown: None,
+            effects: fx,
+        }
+    }
+
+    fn hit(target: Target, rect: Rect) -> HitBox {
+        HitBox { target, rect }
+    }
+
+    fn said(fx: &[Effect]) -> Vec<String> {
+        fx.iter().map(|e| format!("{e:?}")).collect()
+    }
+
+    /// A stick with ten tracks in its root, in a folder named after the test.
+    fn stick(name: &str) -> (Browser, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("ui-screens-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..10 {
+            std::fs::write(d.join(format!("{i:02}.mp3")), b"").unwrap();
+        }
+        (Browser::new(d.clone(), browse::ROWS), d)
+    }
+
+    #[test]
+    fn tabs_and_the_knob_switch_screens_only_with_a_browser() {
+        let d = deck(None);
+        let mut fx = Vec::new();
+        let mut s = Screens::default();
+        let tab = hit(Target::Chrome(ChromeTarget::Browse), Rect::default());
+        s.tap(tab, (0.0, 0.0), &mut cx(&d, None, &mut fx));
+        assert_eq!(s.screen, ScreenKind::Main, "no stick, no browser");
+        s.nav(Nav::Push, &mut cx(&d, None, &mut fx));
+        assert_eq!(s.screen, ScreenKind::Main);
+
+        let (mut b, dir) = stick("tabs");
+        s.tap(tab, (0.0, 0.0), &mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(s.screen, ScreenKind::Browse);
+        s.tap(tab, (0.0, 0.0), &mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(s.screen, ScreenKind::Main);
+        // Pushing the knob elsewhere opens the browser; BACK at its top leaves it.
+        s.nav(Nav::Push, &mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(s.screen, ScreenKind::Browse);
+        s.nav(Nav::Back, &mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(s.screen, ScreenKind::Main);
+        // INFO from the main screen, BACK out of it.
+        s.toggle_info();
+        assert_eq!(s.screen, ScreenKind::Info);
+        s.nav(Nav::Back, &mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(s.screen, ScreenKind::Main);
+        assert!(fx.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn call_jumps_or_resizes_the_loop_and_slip_toggles() {
+        let mut d = deck(None);
+        let mut fx = Vec::new();
+        let mut s = Screens::default();
+        for (looping, t) in [(true, DeckTarget::CallPrev), (false, DeckTarget::CallNext)] {
+            d.looping = looping;
+            s.tap(
+                hit(Target::Deck(t), Rect::default()),
+                (0.0, 0.0),
+                &mut cx(&d, None, &mut fx),
+            );
+            s.release(&mut cx(&d, None, &mut fx));
+        }
+        let slip = hit(Target::Chrome(ChromeTarget::Slip), Rect::default());
+        s.tap(slip, (0.0, 0.0), &mut cx(&d, None, &mut fx));
+        let deck_cmds = |c: &[DeckCommand]| {
+            c.iter()
+                .map(|c| format!("{:?}", Effect::Deck(c.clone())))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            said(&fx),
+            deck_cmds(&[
+                DeckCommand::LoopResize(0.5),
+                DeckCommand::BeatJump(4.0),
+                DeckCommand::ToggleSlip
+            ])
+        );
+    }
+
+    #[test]
+    fn the_waveform_scrubs_with_the_finger_and_the_overview_seeks() {
+        let d = deck(None);
+        let mut fx = Vec::new();
+        let mut s = Screens::default();
+        let wave = Rect::new(113.0, 172.0, 703.0, 211.0);
+        s.tap(
+            hit(Target::Deck(DeckTarget::Waveform), wave),
+            (400.0, 200.0),
+            &mut cx(&d, None, &mut fx),
+        );
+        // Dragging left moves the track forward under the finger.
+        s.drag((390.0, 200.0), &mut cx(&d, None, &mut fx));
+        let scrubbed = s.deck.scrubbed().unwrap();
+        assert!(scrubbed > d.position, "{scrubbed}");
+        s.release(&mut cx(&d, None, &mut fx));
+        assert!(s.deck.scrubbed().is_none() && s.pressed.is_none());
+        match fx.as_slice() {
+            [
+                Effect::Deck(DeckCommand::ScratchBegin),
+                Effect::Deck(DeckCommand::ScratchBy(f)),
+                Effect::Deck(DeckCommand::ScratchEnd),
+            ] => assert!((d.position + f - scrubbed).abs() < 1e-6),
+            other => panic!("{other:?}"),
+        }
+
+        // The overview: a touch seeks, and a drag keeps seeking.
+        fx.clear();
+        let o = deck::OVERVIEW;
+        s.tap(
+            hit(Target::Deck(DeckTarget::Overview), o),
+            (o.x, o.y),
+            &mut cx(&d, None, &mut fx),
+        );
+        s.drag((o.x + o.w * 0.5, o.y), &mut cx(&d, None, &mut fx));
+        let seeks: Vec<f64> = fx
+            .iter()
+            .map(|e| match e {
+                Effect::Deck(DeckCommand::Seek(at)) => *at,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(seeks, [0.0, d.length * 0.5]);
+    }
+
+    #[test]
+    fn a_row_taps_selects_then_loads_and_a_drag_scrolls_instead() {
+        let d = deck(None);
+        let (mut b, dir) = stick("rows");
+        let mut fx = Vec::new();
+        let mut s = Screens {
+            screen: ScreenKind::Browse,
+            ..Screens::default()
+        };
+        let row = |i: u8| hit(Target::Browse(BrowseTarget::Row(i)), Rect::default());
+        // A drag of two rows up scrolls by two and is no tap.
+        s.tap(row(3), (500.0, 250.0), &mut cx(&d, Some(&mut b), &mut fx));
+        s.drag(
+            (500.0, 250.0 - 2.0 * browse::ROW_H),
+            &mut cx(&d, Some(&mut b), &mut fx),
+        );
+        assert_eq!(s.pressed, None, "the drag leaves the row");
+        s.release(&mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(b.level().top, 2);
+        assert!(fx.is_empty());
+        // A tap selects; a tap on the selection loads it.
+        for _ in 0..2 {
+            s.tap(row(1), (500.0, 150.0), &mut cx(&d, Some(&mut b), &mut fx));
+            s.release(&mut cx(&d, Some(&mut b), &mut fx));
+        }
+        assert_eq!(b.level().cursor, 3);
+        assert_eq!(
+            said(&fx),
+            [format!("{:?}", Effect::Load(dir.join("03.mp3")))]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

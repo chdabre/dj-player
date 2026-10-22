@@ -57,24 +57,36 @@ pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
             last.rect.h = hit_h;
         }
     };
-    let pressed_back = ui.pressed == Some(Target::BrowseBack);
+    let pressed_back = ui.pressed == Some(Target::Browse(BrowseTarget::Back));
     ui.scene.fill(x, y + h - 1.0, w, 1.0, t.color.button_edge);
-    chip(ui, Target::Search, SEARCH_CHIP, "SEARCH", b.searching);
     chip(
         ui,
-        Target::Sort,
+        Target::Browse(BrowseTarget::Search),
+        SEARCH_CHIP,
+        "SEARCH",
+        b.searching,
+    );
+    chip(
+        ui,
+        Target::Browse(BrowseTarget::Sort),
         SORT_CHIP,
         &format!("SORT: {}", b.sort),
         false,
     );
     if b.library && b.can_scan && b.scan.is_none() {
-        chip(ui, Target::Scan, SCAN_CHIP, "SCAN", false);
+        chip(
+            ui,
+            Target::Browse(BrowseTarget::Scan),
+            SCAN_CHIP,
+            "SCAN",
+            false,
+        );
         chips_left = SCAN_CHIP.0;
         match b.analyzing {
             Some((done, total, stopping)) => {
                 chip(
                     ui,
-                    Target::AnalyzeAll,
+                    Target::Browse(BrowseTarget::AnalyzeAll),
                     ANALYZE_CHIP,
                     if stopping { "STOPPING" } else { "STOP" },
                     true,
@@ -88,7 +100,13 @@ pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
                 chips_left = ANALYZE_CHIP.0 - 150.0;
             }
             None if b.unanalysed > 0 => {
-                chip(ui, Target::AnalyzeAll, ANALYZE_CHIP, "ANALYZE ALL", false);
+                chip(
+                    ui,
+                    Target::Browse(BrowseTarget::AnalyzeAll),
+                    ANALYZE_CHIP,
+                    "ANALYZE ALL",
+                    false,
+                );
                 chips_left = ANALYZE_CHIP.0;
             }
             None => {}
@@ -120,7 +138,10 @@ pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
         if pressed_back {
             ui.scene.fill(x, y, back_w, h - 1.0, t.color.button_pressed);
         }
-        ui.hit(Target::BrowseBack, Rect::new(x, hit_y, back_w, hit_h));
+        ui.hit(
+            Target::Browse(BrowseTarget::Back),
+            Rect::new(x, hit_y, back_w, hit_h),
+        );
     }
 }
 
@@ -213,7 +234,7 @@ pub(super) fn list(ui: &mut Ui, b: &BrowseView) {
         );
         if b.side.is_some() {
             ui.hit(
-                Target::Row(i as u8),
+                Target::Browse(BrowseTarget::Row(i as u8)),
                 Rect::new(JACKET_X, y, right - JACKET_X, ROW_H),
             );
             continue;
@@ -238,7 +259,7 @@ pub(super) fn list(ui: &mut Ui, b: &BrowseView) {
             );
         }
         ui.hit(
-            Target::Row(i as u8),
+            Target::Browse(BrowseTarget::Row(i as u8)),
             Rect::new(JACKET_X, y, ARTIST_X + ARTIST_W - JACKET_X, ROW_H),
         );
     }

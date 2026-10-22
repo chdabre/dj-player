@@ -7,7 +7,38 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use engine_core::{DeckGrid, FALLBACK_BPM, HOT_CUES};
-use engined::Player;
+use engined::persist::{Listing, Playlists};
+use engined::{BatchProgress, Player};
+
+/// The library as input handlers may look at it: what it lists and what it is doing. Changes
+/// go through `Effect`s.
+#[derive(Clone, Copy, Default)]
+pub struct LibraryView<'a> {
+    /// The library's tracks, once it has said.
+    pub listing: Option<&'a Arc<Listing>>,
+    pub playlists: Option<&'a Arc<Playlists>>,
+    /// ANALYZE ALL under way.
+    pub batch: Option<&'a BatchProgress>,
+    /// A scan under way: files done, total.
+    pub scan: Option<(usize, usize)>,
+}
+
+impl<'a> LibraryView<'a> {
+    pub fn read(player: &'a Player) -> Self {
+        Self {
+            listing: player.listing(),
+            playlists: player.playlists(),
+            batch: player.batch_progress(),
+            scan: player.scan_progress(),
+        }
+    }
+
+    /// A scan is running (or asked for and not started).
+    pub fn scanning(&self) -> bool {
+        self.scan
+            .is_some_and(|(done, total)| done < total || total == 0)
+    }
+}
 
 /// The deck at the start of a frame. Positions are frames at the engine rate.
 #[derive(Debug, Clone, PartialEq)]

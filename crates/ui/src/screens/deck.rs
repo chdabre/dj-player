@@ -2,11 +2,147 @@
 //! overview, the status band (track, remaining time, tempo), the phase meters and the
 //! CUE/LOOP and CALL column.
 
-use super::{SaveState, Target, Ui, View};
+use engine_core::DeckCommand;
+
+use super::{Cx, SaveState, Target, Ui, View};
+use crate::app::effects::Effect;
 use crate::kit::Rect;
 use crate::render::scene::{Gradient, Rgba};
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveDraw};
+
+/// Beats across the zoom view, by ZOOM step.
+pub const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
+
+/// The hand on the zoom waveform: where the finger was (design x), the frames one design
+/// pixel covers, and the playhead the finger has moved the track to.
+#[derive(Debug, Clone, Copy)]
+struct Scrub {
+    last_x: f32,
+    frames_per_px: f64,
+    shown: f64,
+}
+
+/// The deck displays' own state, shared by the main and performance screens.
+#[derive(Debug)]
+pub struct DeckState {
+    /// Index into [`ZOOM_STEPS`].
+    zoom: usize,
+    scrub: Option<Scrub>,
+}
+
+impl Default for DeckState {
+    fn default() -> Self {
+        Self {
+            zoom: 1,
+            scrub: None,
+        }
+    }
+}
+
+impl DeckState {
+    /// Beats across the zoom view.
+    pub fn zoom_beats(&self) -> f64 {
+        ZOOM_STEPS[self.zoom]
+    }
+
+    /// The playhead the finger has moved the track to, while it scrubs: the picture follows
+    /// the hand at once, the audio trails it by the scratch spring's few milliseconds.
+    pub fn scrubbed(&self) -> Option<f64> {
+        self.scrub.map(|s| s.shown)
+    }
+
+    /// A touch on `t` (drawn at `r`) at design x `x`.
+    pub fn tap(&mut self, t: DeckTarget, r: Rect, x: f32, cx: &mut Cx) {
+        let looping = cx.deck.looping;
+        let mut send = |c| cx.effects.push(Effect::Deck(c));
+        match t {
+            DeckTarget::CallPrev if looping => send(DeckCommand::LoopResize(0.5)),
+            DeckTarget::CallNext if looping => send(DeckCommand::LoopResize(2.0)),
+            DeckTarget::CallPrev => send(DeckCommand::BeatJump(-4.0)),
+            DeckTarget::CallNext => send(DeckCommand::BeatJump(4.0)),
+            DeckTarget::Zoom => self.zoom = (self.zoom + 1) % ZOOM_STEPS.len(),
+            DeckTarget::Overview => seek_overview(x, cx),
+            DeckTarget::Waveform => {
+                let span = cx.deck.zoom_span(self.zoom_beats());
+                self.scrub = Some(Scrub {
+                    last_x: x,
+                    frames_per_px: span / f64::from(r.w),
+                    shown: cx.shown.unwrap_or(cx.deck.position),
+                });
+                send(DeckCommand::ScratchBegin);
+            }
+            // Not wired yet.
+            DeckTarget::Delete
+            | DeckTarget::Memory
+            | DeckTarget::Grid
+            | DeckTarget::Sync
+            | DeckTarget::Master
+            | DeckTarget::TempoRange
+            | DeckTarget::JumpSize => {}
+        }
+    }
+
+    /// The finger moved to design x `x` while on `pressed`; true if the deck displays took it.
+    pub fn drag(&mut self, pressed: Option<DeckTarget>, x: f32, cx: &mut Cx) -> bool {
+        if let Some(mut scrub) = self.scrub {
+            // The waveform moves with the finger: dragging left plays forward.
+            let frames = -f64::from(x - scrub.last_x) * scrub.frames_per_px;
+            scrub.shown = (scrub.shown + frames).clamp(0.0, cx.deck.length);
+            scrub.last_x = x;
+            self.scrub = Some(scrub);
+            if frames != 0.0 {
+                cx.effects
+                    .push(Effect::Deck(DeckCommand::ScratchBy(frames)));
+            }
+            return true;
+        }
+        if pressed == Some(DeckTarget::Overview) {
+            seek_overview(x, cx);
+            return true;
+        }
+        false
+    }
+
+    /// The finger came up.
+    pub fn release(&mut self, cx: &mut Cx) {
+        if self.scrub.take().is_some() {
+            cx.effects.push(Effect::Deck(DeckCommand::ScratchEnd));
+        }
+    }
+
+    /// A track loaded: the hand is off it.
+    pub fn loaded(&mut self) {
+        self.scrub = None;
+    }
+}
+
+/// Needle search: seek to where design x `x` falls on the overview.
+fn seek_overview(x: f32, cx: &mut Cx) {
+    let Rect { x: x0, w, .. } = OVERVIEW;
+    let f = f64::from(((x - x0) / w).clamp(0.0, 1.0));
+    cx.effects
+        .push(Effect::Deck(DeckCommand::Seek(f * cx.deck.length)));
+}
+
+/// The deck displays' touch targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckTarget {
+    Delete,
+    Memory,
+    CallPrev,
+    CallNext,
+    Zoom,
+    Grid,
+    Sync,
+    Master,
+    TempoRange,
+    JumpSize,
+    /// The overview: touching it seeks (needle search).
+    Overview,
+    /// The zoom waveform: touching it takes the track, dragging scrubs it.
+    Waveform,
+}
 
 /// The overview's bounds, for turning a touch into a track position.
 pub const OVERVIEW: Rect = Rect::new(113.0, 502.0, 703.0, 67.0);
@@ -111,14 +247,14 @@ pub(crate) fn cue_column(ui: &mut Ui, v: &View, rule: f32, button_h: f32, call_h
     let call_y = rule + 113.0 + (button_h - 58.0);
     ui.rule_label("CUE/LOOP", 828.0, rule, 188.0);
     ui.button(
-        Target::Delete,
+        Target::Deck(DeckTarget::Delete),
         Rect::new(828.0, button_y, 88.0, button_h),
         "DELETE",
         None,
         false,
     );
     ui.button(
-        Target::Memory,
+        Target::Deck(DeckTarget::Memory),
         Rect::new(923.0, button_y, 93.0, button_h),
         "MEMORY",
         None,
@@ -131,14 +267,14 @@ pub(crate) fn cue_column(ui: &mut Ui, v: &View, rule: f32, button_h: f32, call_h
         ("◀", "▶")
     };
     ui.button(
-        Target::CallPrev,
+        Target::Deck(DeckTarget::CallPrev),
         Rect::new(828.0, call_y, 88.0, call_h),
         prev,
         None,
         false,
     );
     ui.button(
-        Target::CallNext,
+        Target::Deck(DeckTarget::CallNext),
         Rect::new(923.0, call_y, 93.0, call_h),
         next,
         None,
@@ -201,7 +337,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
     let Rect { x: x0, y: y0, w, h } = area;
     panel(ui, area, v.wave.map(|w| w.settings.zoom_align));
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
-    ui.hit(Target::Waveform, area);
+    ui.hit(Target::Deck(DeckTarget::Waveform), area);
     // Frames per design pixel.
     let span = v.deck.zoom_span(v.zoom_beats);
     let fpp = span / f64::from(w);
@@ -425,14 +561,14 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
     ui.text("%", 792.0, 448.0, t.text.unit);
 
     ui.button(
-        Target::Sync,
+        Target::Deck(DeckTarget::Sync),
         Rect::new(828.0, 408.0, 88.0, 78.0),
         "SYNC",
         Some("– INST.D."),
         false,
     );
     ui.button(
-        Target::Master,
+        Target::Deck(DeckTarget::Master),
         Rect::new(923.0, 408.0, 93.0, 78.0),
         "MASTER",
         None,
@@ -518,7 +654,7 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
         y0 + 4.0,
         t.text.small.color(t.color.dim),
     );
-    ui.hit(Target::Overview, OVERVIEW);
+    ui.hit(Target::Deck(DeckTarget::Overview), OVERVIEW);
     ui.scene.fill(x0, 572.0, w, 1.0, t.color.button_edge);
     ui.text("NEEDLE SEARCH", x0 + w * 0.5, 574.0, t.text.small.center());
 
@@ -529,7 +665,10 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
         t.color.cue,
         Rgba::TRANSPARENT,
     );
-    ui.hit(Target::TempoRange, Rect::new(828.0, 502.0, 62.0, 39.0));
+    ui.hit(
+        Target::Deck(DeckTarget::TempoRange),
+        Rect::new(828.0, 502.0, 62.0, 39.0),
+    );
     ui.chip(
         Rect::new(828.0, 545.0, 62.0, 43.0),
         "[4]",
@@ -537,7 +676,10 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
         t.color.chip_edge,
         Rgba::TRANSPARENT,
     );
-    ui.hit(Target::JumpSize, Rect::new(828.0, 545.0, 62.0, 43.0));
+    ui.hit(
+        Target::Deck(DeckTarget::JumpSize),
+        Rect::new(828.0, 545.0, 62.0, 43.0),
+    );
     ui.scene.rounded(
         898.0,
         502.0,

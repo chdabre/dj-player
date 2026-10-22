@@ -2,7 +2,7 @@
 //! waveform over the status band and overview.
 
 use super::deck::{cue_column, phase, zoom};
-use super::{Target, Ui, View, chrome, deck};
+use super::{ChromeTarget, DeckTarget, Target, Ui, View, chrome, deck};
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
 use crate::waves::OverviewCache;
@@ -20,7 +20,7 @@ pub(crate) fn build(ui: &mut Ui, view: &View, overview: &mut OverviewCache) {
     ui.scene
         .fill(822.0, 117.0, 1.0, 269.0, t.color.section_edge);
 
-    chrome::rail(ui, view, Target::Usb);
+    chrome::rail(ui, view, Target::Chrome(ChromeTarget::Usb));
     chrome::tabs(ui, None);
     info(ui, view);
     deck::status(ui, view);
@@ -77,7 +77,10 @@ fn info(ui: &mut Ui, v: &View) {
         t.color.chip_edge,
         t.color.chip_selected,
     );
-    ui.hit(Target::Zoom, Rect::new(828.0, 344.0, 88.0, 36.0));
+    ui.hit(
+        Target::Deck(DeckTarget::Zoom),
+        Rect::new(828.0, 344.0, 88.0, 36.0),
+    );
     ui.chip(
         Rect::new(923.0, 344.0, 93.0, 36.0),
         "GRID",
@@ -85,5 +88,8 @@ fn info(ui: &mut Ui, v: &View) {
         t.color.chip_edge,
         Rgba::TRANSPARENT,
     );
-    ui.hit(Target::Grid, Rect::new(923.0, 344.0, 93.0, 36.0));
+    ui.hit(
+        Target::Deck(DeckTarget::Grid),
+        Rect::new(923.0, 344.0, 93.0, 36.0),
+    );
 }

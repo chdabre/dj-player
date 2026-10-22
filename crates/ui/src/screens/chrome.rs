@@ -1,9 +1,47 @@
 //! The frame every screen shares: the rail (sources, player number, SLIP), the tab row, and
 //! the lower bands' panels.
 
-use super::{Target, Ui, View};
+use engine_core::DeckCommand;
+use engined::browse::Source;
+
+use super::{Cx, ScreenKind, Screens, Target, Ui, View};
+use crate::app::effects::Effect;
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
+
+/// The rail's and the tab row's touch targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeTarget {
+    Library,
+    Link,
+    Usb,
+    Slip,
+    Browse,
+    TagList,
+    Info,
+    Menu,
+    Perform,
+}
+
+/// A touch on the rail or a tab.
+pub(crate) fn tap(s: &mut Screens, t: ChromeTarget, cx: &mut Cx) {
+    match t {
+        ChromeTarget::Perform => s.toggle_perform(),
+        ChromeTarget::Browse => s.toggle_browse(cx),
+        ChromeTarget::Library => s.browse_source(Source::Library, cx),
+        ChromeTarget::Usb => s.browse_source(Source::Folders, cx),
+        ChromeTarget::TagList => {
+            if cx.browser.is_some() {
+                s.browse.editing.modal = None;
+            }
+            s.browse_source(Source::TagList, cx);
+        }
+        ChromeTarget::Menu if s.screen == ScreenKind::Browse => s.browse.open_menu(cx),
+        ChromeTarget::Info => s.toggle_info(),
+        ChromeTarget::Slip => cx.effects.push(Effect::Deck(DeckCommand::ToggleSlip)),
+        ChromeTarget::Menu | ChromeTarget::Link => {}
+    }
+}
 
 /// The rail's panel and the rule beside it.
 pub(crate) fn rail_panel(ui: &mut Ui) {
@@ -24,25 +62,25 @@ pub(crate) fn lower(ui: &mut Ui) {
 /// The rail with the source `lit` (LIBRARY or USB) on.
 pub(crate) fn rail(ui: &mut Ui, v: &View, lit: Target) {
     ui.button(
-        Target::Library,
+        Target::Chrome(ChromeTarget::Library),
         Rect::new(6.0, 16.0, 88.0, 117.0),
         "LIBRARY",
         None,
-        lit == Target::Library,
+        lit == Target::Chrome(ChromeTarget::Library),
     );
     ui.button(
-        Target::Link,
+        Target::Chrome(ChromeTarget::Link),
         Rect::new(6.0, 138.0, 88.0, 124.0),
         "LINK",
         None,
         false,
     );
     ui.button(
-        Target::Usb,
+        Target::Chrome(ChromeTarget::Usb),
         Rect::new(6.0, 267.0, 88.0, 117.0),
         "USB",
         None,
-        lit == Target::Usb,
+        lit == Target::Chrome(ChromeTarget::Usb),
     );
     rail_bottom(ui, v);
 }
@@ -63,7 +101,7 @@ pub(crate) fn rail_bottom(ui: &mut Ui, v: &View) {
     ui.text("PLAYER", 50.0, 418.0, t.text.small.center());
     ui.text("1", 50.0, 438.0, t.text.player.center());
     ui.button(
-        Target::Slip,
+        Target::Chrome(ChromeTarget::Slip),
         Rect::new(6.0, 505.0, 88.0, 76.0),
         "SLIP",
         None,
@@ -89,38 +127,38 @@ pub(crate) fn tabs(ui: &mut Ui, active: Option<Target>) {
     let y = 7.0;
     let h = 54.0;
     ui.button(
-        Target::Browse,
+        Target::Chrome(ChromeTarget::Browse),
         Rect::new(113.0, y, 171.0, h),
         "BROWSE",
         Some("– SEARCH"),
-        active == Some(Target::Browse),
+        active == Some(Target::Chrome(ChromeTarget::Browse)),
     );
     ui.button(
-        Target::TagList,
+        Target::Chrome(ChromeTarget::TagList),
         Rect::new(289.0, y, 171.0, h),
         "TAG LIST",
         None,
-        active == Some(Target::TagList),
+        active == Some(Target::Chrome(ChromeTarget::TagList)),
     );
     ui.button(
-        Target::Info,
+        Target::Chrome(ChromeTarget::Info),
         Rect::new(464.0, y, 171.0, h),
         "INFO",
         Some("– LINK INFO"),
-        active == Some(Target::Info),
+        active == Some(Target::Chrome(ChromeTarget::Info)),
     );
     ui.button(
-        Target::Menu,
+        Target::Chrome(ChromeTarget::Menu),
         Rect::new(640.0, y, 171.0, h),
         "MENU",
         Some("– UTILITY"),
-        active == Some(Target::Menu),
+        active == Some(Target::Chrome(ChromeTarget::Menu)),
     );
     ui.button(
-        Target::Perform,
+        Target::Chrome(ChromeTarget::Perform),
         Rect::new(841.0, y, 175.0, h),
         "PERFORM",
         None,
-        active == Some(Target::Perform),
+        active == Some(Target::Chrome(ChromeTarget::Perform)),
     );
 }

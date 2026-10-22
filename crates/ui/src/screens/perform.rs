@@ -13,9 +13,22 @@ use engine_core::{BEAT_LOOPS, DeckCommand, HOT_CUES};
 
 use super::chrome::{lower, rail_bottom, rail_panel};
 use super::deck::{bottom, cue_column, hot_cue_color, hot_cue_letter, phase, status, zoom};
-use super::{Target, Ui, View};
+use super::{ChromeTarget, Target, Ui, View};
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
+/// The performance screen's touch targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerfTarget {
+    HotCueMode,
+    BeatJumpMode,
+    DeleteCall,
+    Bank,
+    /// One of the four pads (0..4, left to right).
+    Pad(u8),
+    /// One of the beat loop lengths ([`BEAT_LOOPS`] index).
+    BeatLoop(u8),
+}
+
 /// Pads per bank.
 pub const PADS: usize = 4;
 
@@ -39,22 +52,22 @@ pub const BANKS: usize = HOT_CUES.div_ceil(PADS);
 /// length in beats (None when not looping).
 pub fn press(
     perf: &mut PerfState,
-    target: Target,
+    target: PerfTarget,
     hot_cues: u8,
     loop_beats: Option<f64>,
 ) -> Option<DeckCommand> {
     match target {
-        Target::HotCueMode => {
+        PerfTarget::HotCueMode => {
             perf.mode = PadMode::HotCue;
             perf.delete_armed = false;
             None
         }
-        Target::BeatJumpMode => {
+        PerfTarget::BeatJumpMode => {
             perf.mode = PadMode::BeatJump;
             perf.delete_armed = false;
             None
         }
-        Target::DeleteCall => {
+        PerfTarget::DeleteCall => {
             if perf.mode == PadMode::HotCue {
                 perf.delete_armed = !perf.delete_armed;
             } else {
@@ -63,14 +76,14 @@ pub fn press(
             }
             None
         }
-        Target::Bank => {
+        PerfTarget::Bank => {
             match perf.mode {
                 PadMode::HotCue => perf.bank = (perf.bank + 1) % BANKS,
                 PadMode::BeatJump => perf.jump_bank = !perf.jump_bank,
             }
             None
         }
-        Target::Pad(i) => {
+        PerfTarget::Pad(i) => {
             let i = usize::from(i);
             match perf.mode {
                 PadMode::HotCue => {
@@ -88,7 +101,7 @@ pub fn press(
                 )),
             }
         }
-        Target::BeatLoop(k) => {
+        PerfTarget::BeatLoop(k) => {
             let beats = BEAT_LOOPS[usize::from(k).min(BEAT_LOOPS.len() - 1)];
             if loop_beats.is_some_and(|b| (b - beats).abs() < 1e-3) {
                 Some(DeckCommand::ReloopExit)
@@ -96,7 +109,6 @@ pub fn press(
                 Some(DeckCommand::BeatLoop(beats))
             }
         }
-        _ => None,
     }
 }
 
@@ -226,7 +238,7 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
     // Top row: phase meters and the way back to the main screen.
     phase(ui, v, 233.0, 367.0, 12.0);
     ui.button(
-        Target::Perform,
+        Target::Chrome(ChromeTarget::Perform),
         Rect::new(828.0, 7.0, 188.0, 77.0),
         "PERFORM",
         None,
@@ -253,7 +265,14 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
         } else {
             PadLook::Empty
         };
-        pad(ui, Target::BeatLoop(k as u8), cell, &label, None, look);
+        pad(
+            ui,
+            Target::Perform(PerfTarget::BeatLoop(k as u8)),
+            cell,
+            &label,
+            None,
+            look,
+        );
     }
 
     cue_column(ui, v, 183.0, 60.0, 60.0);
@@ -265,7 +284,7 @@ fn rail(ui: &mut Ui, perf: PerfState) {
     let t = ui.t;
     let style = t.text.rail_mode;
     ui.button_styled(
-        Target::HotCueMode,
+        Target::Perform(PerfTarget::HotCueMode),
         Rect::new(6.0, 6.0, 88.0, 52.0),
         "HOT CUE",
         None,
@@ -273,7 +292,7 @@ fn rail(ui: &mut Ui, perf: PerfState) {
         style,
     );
     ui.button_styled(
-        Target::BeatJumpMode,
+        Target::Perform(PerfTarget::BeatJumpMode),
         Rect::new(6.0, 62.0, 88.0, 52.0),
         "BEAT JUMP",
         None,
@@ -302,9 +321,15 @@ fn rail(ui: &mut Ui, perf: PerfState) {
             top + t.font.button * lh,
             t.text.small.color(t.color.danger_text).center(),
         );
-        ui.hit(Target::DeleteCall, delete);
+        ui.hit(Target::Perform(PerfTarget::DeleteCall), delete);
     } else {
-        ui.button(Target::DeleteCall, delete, "DELETE", Some("– CALL"), false);
+        ui.button(
+            Target::Perform(PerfTarget::DeleteCall),
+            delete,
+            "DELETE",
+            Some("– CALL"),
+            false,
+        );
     }
     let bank = match perf.mode {
         PadMode::HotCue => {
@@ -316,7 +341,7 @@ fn rail(ui: &mut Ui, perf: PerfState) {
         PadMode::BeatJump => "1 · 4".to_string(),
     };
     ui.button(
-        Target::Bank,
+        Target::Perform(PerfTarget::Bank),
         Rect::new(6.0, 196.0, 88.0, 62.0),
         "BANK",
         Some(&bank),
@@ -327,7 +352,7 @@ fn rail(ui: &mut Ui, perf: PerfState) {
 fn pads(ui: &mut Ui, v: &View, perf: PerfState) {
     row_frame(ui, PAD_ROW);
     for (i, cell) in row_cells(PAD_ROW, PADS).enumerate() {
-        let target = Target::Pad(i as u8);
+        let target = Target::Perform(PerfTarget::Pad(i as u8));
         match perf.mode {
             PadMode::HotCue => {
                 let cue = perf.bank * PADS + i;
@@ -410,52 +435,55 @@ mod tests {
     fn hot_cue_pads_set_call_and_delete_by_bank() {
         let mut p = PerfState::default();
         assert_eq!(
-            cmd(press(&mut p, Target::Pad(2), 0, None)),
+            cmd(press(&mut p, PerfTarget::Pad(2), 0, None)),
             cmd(Some(DeckCommand::HotCue(2)))
         );
-        press(&mut p, Target::Bank, 0, None);
+        press(&mut p, PerfTarget::Bank, 0, None);
         assert_eq!(p.bank, 1);
         assert_eq!(
-            cmd(press(&mut p, Target::Pad(0), 0, None)),
+            cmd(press(&mut p, PerfTarget::Pad(0), 0, None)),
             cmd(Some(DeckCommand::HotCue(4)))
         );
         // Banks wrap.
         for _ in 1..BANKS {
-            press(&mut p, Target::Bank, 0, None);
+            press(&mut p, PerfTarget::Bank, 0, None);
         }
         assert_eq!(p.bank, 0);
         // Delete: only set pads, and it stays armed until DELETE again.
-        press(&mut p, Target::DeleteCall, 0b0100, None);
+        press(&mut p, PerfTarget::DeleteCall, 0b0100, None);
         assert!(p.delete_armed);
-        assert_eq!(cmd(press(&mut p, Target::Pad(0), 0b0100, None)), cmd(None));
         assert_eq!(
-            cmd(press(&mut p, Target::Pad(2), 0b0100, None)),
+            cmd(press(&mut p, PerfTarget::Pad(0), 0b0100, None)),
+            cmd(None)
+        );
+        assert_eq!(
+            cmd(press(&mut p, PerfTarget::Pad(2), 0b0100, None)),
             cmd(Some(DeckCommand::DeleteHotCue(2)))
         );
         assert!(p.delete_armed);
-        press(&mut p, Target::DeleteCall, 0, None);
+        press(&mut p, PerfTarget::DeleteCall, 0, None);
         assert!(!p.delete_armed);
     }
 
     #[test]
     fn beat_jump_pads_and_their_bank() {
         let mut p = PerfState::default();
-        press(&mut p, Target::BeatJumpMode, 0, None);
+        press(&mut p, PerfTarget::BeatJumpMode, 0, None);
         assert_eq!(
-            cmd(press(&mut p, Target::Pad(0), 0, None)),
+            cmd(press(&mut p, PerfTarget::Pad(0), 0, None)),
             cmd(Some(DeckCommand::BeatJump(-4.0)))
         );
         assert_eq!(
-            cmd(press(&mut p, Target::Pad(3), 0, None)),
+            cmd(press(&mut p, PerfTarget::Pad(3), 0, None)),
             cmd(Some(DeckCommand::BeatJump(4.0)))
         );
-        press(&mut p, Target::Bank, 0, None);
+        press(&mut p, PerfTarget::Bank, 0, None);
         assert_eq!(
-            cmd(press(&mut p, Target::Pad(1), 0, None)),
+            cmd(press(&mut p, PerfTarget::Pad(1), 0, None)),
             cmd(Some(DeckCommand::BeatJump(-16.0)))
         );
         // DELETE from beat jump mode goes back to hot cues, armed.
-        press(&mut p, Target::DeleteCall, 0, None);
+        press(&mut p, PerfTarget::DeleteCall, 0, None);
         assert_eq!(p.mode, PadMode::HotCue);
         assert!(p.delete_armed);
     }
@@ -464,15 +492,15 @@ mod tests {
     fn beat_loop_pads_start_a_loop_or_exit_the_active_one() {
         let mut p = PerfState::default();
         assert_eq!(
-            cmd(press(&mut p, Target::BeatLoop(3), 0, None)),
+            cmd(press(&mut p, PerfTarget::BeatLoop(3), 0, None)),
             cmd(Some(DeckCommand::BeatLoop(4.0)))
         );
         assert_eq!(
-            cmd(press(&mut p, Target::BeatLoop(3), 0, Some(4.0))),
+            cmd(press(&mut p, PerfTarget::BeatLoop(3), 0, Some(4.0))),
             cmd(Some(DeckCommand::ReloopExit))
         );
         assert_eq!(
-            cmd(press(&mut p, Target::BeatLoop(0), 0, Some(4.0))),
+            cmd(press(&mut p, PerfTarget::BeatLoop(0), 0, Some(4.0))),
             cmd(Some(DeckCommand::BeatLoop(0.5)))
         );
     }

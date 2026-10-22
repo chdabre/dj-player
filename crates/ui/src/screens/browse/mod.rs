@@ -17,10 +17,14 @@ mod keyboard;
 mod list;
 mod modal;
 mod panels;
+mod state;
+mod view;
 
 #[cfg(test)]
 pub use keyboard::key_count;
 pub use keyboard::{BACKSPACE, CLEAR, DONE, SHIFT, Shift, key_char};
+pub use state::BrowseState;
+pub use view::{OnDeck, info_screen};
 // The parts' layout constants and drawing, for each other (`use super::*`).
 use keyboard::*;
 use list::*;
@@ -29,11 +33,33 @@ use panels::*;
 
 use super::chrome::{lower, rail, rail_panel, tabs};
 use super::deck::{bottom, status};
-use super::{Target, Ui, View};
+use super::{ChromeTarget, Target, Ui, View};
 use crate::kit::Rect;
 use crate::render::scene::{Image, Rgba, Weight};
 use crate::theme::TextStyle;
 use crate::waves::OverviewCache;
+/// The browse screen's touch targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseTarget {
+    /// A shown row of the list (0 = top).
+    Row(u8),
+    /// The list header: up a level.
+    Back,
+    /// Header chips: the sort order, search, scan the stick.
+    Sort,
+    Search,
+    Scan,
+    /// ANALYZE ALL (or STOP while it runs).
+    AnalyzeAll,
+    /// The "scan this stick?" question's answers.
+    ScanYes,
+    ScanNo,
+    /// A key of the on-screen keyboard ([`KEYS`] index).
+    Key(u8),
+    /// A row of a modal over the browse list (its index among all the modal's rows).
+    ModalRow(u16),
+}
+
 /// Rows shown at once.
 pub const ROWS: usize = 7;
 
@@ -153,25 +179,25 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
     ui.section(Rect::new(106.0, 66.0, 915.0, 325.0));
     // The tag list belongs to no source on the rail.
     let lit = if b.library {
-        Target::Library
+        Target::Chrome(ChromeTarget::Library)
     } else if b.tag_list {
-        Target::TagList
+        Target::Chrome(ChromeTarget::TagList)
     } else {
-        Target::Usb
+        Target::Chrome(ChromeTarget::Usb)
     };
     rail(ui, v, lit);
     match &b.info {
         Some(info) => {
-            tabs(ui, Some(Target::Info));
+            tabs(ui, Some(Target::Chrome(ChromeTarget::Info)));
             info_panel(ui, info);
         }
         None => {
             tabs(
                 ui,
                 Some(if b.tag_list {
-                    Target::TagList
+                    Target::Chrome(ChromeTarget::TagList)
                 } else {
-                    Target::Browse
+                    Target::Chrome(ChromeTarget::Browse)
                 }),
             );
             header(ui, b);

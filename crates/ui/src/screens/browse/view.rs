@@ -1,0 +1,244 @@
+//! What the browse and INFO screens show, prepared once per frame from the browser, the
+//! library and the browse state.
+
+use std::path::Path;
+
+use engined::browse::{Browser, Kind, Source, Tags};
+use library::PlaylistKind;
+
+use super::state::BrowseState;
+use super::{BrowseView, InfoView, ModalView, ROWS, Row, RowKind, length};
+use crate::app::engine::LibraryView;
+use crate::app::track::{LoadedTags, track_title};
+use crate::playlists::Modal;
+
+impl BrowseState {
+    /// What the browse screen shows of the browser; `loaded` is the file on the deck.
+    pub fn view(&self, b: &Browser, lib: &LibraryView, loaded: Option<&Path>) -> BrowseView {
+        let l = b.level();
+        let rows = l
+            .entries
+            .iter()
+            .skip(l.top)
+            .take(ROWS)
+            .map(|e| match e.kind {
+                Kind::Folder | Kind::Playlist(_) => Row {
+                    kind: match e.kind {
+                        Kind::Playlist(id) => match b.playlists().and_then(|p| p.get(id)) {
+                            Some(p) if p.kind == PlaylistKind::Folder => RowKind::Folder,
+                            _ => RowKind::List,
+                        },
+                        _ => RowKind::Folder,
+                    },
+                    title: e.name.clone(),
+                    artist: String::new(),
+                    detail: String::new(),
+                    loaded: false,
+                    art: None,
+                    tagged: false,
+                    missing: false,
+                },
+                Kind::Track => {
+                    let tags = b.info(&e.path);
+                    let tags = tags.as_ref();
+                    let detail = [
+                        tags.and_then(|t| t.bpm).map(|b| format!("{b:.1}")),
+                        tags.and_then(|t| t.key.clone()),
+                        tags.and_then(|t| t.duration).map(length),
+                    ];
+                    Row {
+                        kind: RowKind::Track,
+                        title: track_title(&e.path, tags),
+                        artist: tags.and_then(|t| t.artist.clone()).unwrap_or_default(),
+                        detail: detail.into_iter().flatten().collect::<Vec<_>>().join("   "),
+                        loaded: loaded == Some(e.path.as_path()),
+                        art: b.art(&e.path),
+                        tagged: b.is_tagged(&e.path),
+                        missing: e.path.as_os_str().is_empty(),
+                    }
+                }
+            })
+            .collect();
+        let library = b.source() == Source::Library;
+        let top = if library {
+            "LIBRARY".to_string()
+        } else if b.source() == Source::TagList {
+            "TAG LIST".to_string()
+        } else {
+            b.root()
+                .file_name()
+                .map_or("USB".into(), |n| n.to_string_lossy().into_owned())
+        };
+        let mut header = std::iter::once(top.as_str())
+            .chain(b.trail())
+            .collect::<Vec<_>>()
+            .join("  /  ");
+        let query = b.search_query();
+        if let Some(q) = query {
+            header = format!("{header}:  {q}{}", if self.keyboard { "▏" } else { "" });
+        }
+        let empty = match (&l.error, l.entries.is_empty()) {
+            (Some(e), _) => Some(format!("Can't read this folder: {e}")),
+            (None, true) if query.is_some() => Some("Nothing matches".into()),
+            (None, true) if library => Some(
+                "No tracks in the library yet: scan the USB, or load tracks from its folders"
+                    .into(),
+            ),
+            (None, true) => Some("No folders or tracks here".into()),
+            _ => None,
+        };
+        let scan = lib.scan.filter(|&(done, total)| done < total || total == 0);
+        let side = self.side.then(|| info_view(b, library, loaded)).flatten();
+        BrowseView {
+            side,
+            info: None,
+            header,
+            at_root: b.at_root(),
+            library,
+            sort: b.sort_label(),
+            searching: query.is_some(),
+            keyboard: (self.keyboard && query.is_some()) || self.editing.naming(),
+            shift: self.shift,
+            tag_list: b.source() == Source::TagList,
+            modal: self.editing.modal.as_ref().and_then(|m| {
+                m.rows().map(|(title, rows, selected)| ModalView {
+                    title,
+                    rows,
+                    selected,
+                    danger_first: matches!(m, Modal::Confirm { .. }),
+                })
+            }),
+            header_override: match (&self.editing.modal, self.editing.moving) {
+                (Some(Modal::Name { naming, text }), _) => {
+                    Some(format!("{}:  {text}▏", naming.prompt()))
+                }
+                (_, Some(_)) => Some("MOVING  ·  TURN TO MOVE, PUSH TO DROP".into()),
+                _ => None,
+            },
+            scan,
+            can_scan: lib.listing.is_some(),
+            unanalysed: if library {
+                self.unanalysed_count(b, lib.listing)
+            } else {
+                0
+            },
+            analyzing: lib.batch.map(|p| (p.done, p.total, p.stopping)),
+            ask_scan: self.ask_scan,
+            rows,
+            selected: l.cursor.checked_sub(l.top).filter(|&r| r < ROWS),
+            first: l.top,
+            total: l.entries.len(),
+            empty,
+            has_tracks: l.entries.iter().any(|e| e.kind == Kind::Track),
+        }
+    }
+
+    /// The shown rows' tags have all been read, and the library has said what it has (for
+    /// screenshots).
+    pub fn settled(&self, b: &Browser, lib: &LibraryView) -> bool {
+        if (b.source() != Source::Folders && (lib.listing.is_none() || lib.playlists.is_none()))
+            || lib.scanning()
+        {
+            return false;
+        }
+        let l = b.level();
+        let info_ready = !self.side
+            || l.selected()
+                .is_none_or(|e| e.kind == Kind::Folder || b.large_art(&e.path).is_some());
+        info_ready
+            && l.entries
+                .iter()
+                .skip(l.top)
+                .take(ROWS)
+                .all(|e| e.kind == Kind::Folder || b.is_read(&e.path))
+    }
+}
+
+/// The side panel's view of the selected entry.
+fn info_view(b: &Browser, library: bool, loaded: Option<&Path>) -> Option<InfoView> {
+    let l = b.level();
+    let e = l.selected()?;
+    let source = if library { "LIBRARY" } else { "USB" };
+    let position = format!("TRACK {:03}/{:03}", l.cursor + 1, l.entries.len());
+    if e.kind != Kind::Track {
+        return Some(InfoView {
+            source,
+            position,
+            folder: true,
+            fields: vec![("FOLDER", e.name.clone())],
+            ..InfoView::default()
+        });
+    }
+    let tags = b.info(&e.path).unwrap_or_default();
+    Some(InfoView {
+        source,
+        position,
+        folder: false,
+        fields: info_fields(&e.path, &tags),
+        rating: tags.rating,
+        // The list's thumbnail stands in until the large picture is read.
+        art: b.large_art(&e.path).unwrap_or_else(|| b.art(&e.path)),
+        comment: tags.comment.clone(),
+        loaded: loaded == Some(e.path.as_path()),
+    })
+}
+
+/// The loaded track as the INFO screen shows it: its file, its analysis (BPM, key) and its own
+/// tags as read when it loaded.
+pub struct OnDeck<'a> {
+    pub path: &'a Path,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+    pub tags: &'a LoadedTags,
+}
+
+/// The INFO screen's view: the loaded track, from its own tags, the library's listing and
+/// the analysis (ours win).
+pub fn info_screen(b: Option<&Browser>, on_deck: Option<OnDeck>) -> BrowseView {
+    let info = match on_deck {
+        Some(d) => {
+            let lt = d.tags;
+            let mut tags = b
+                .and_then(|b| b.info(d.path))
+                .unwrap_or_else(|| lt.tags.clone());
+            tags.bpm = d.bpm.or(tags.bpm);
+            tags.key = d.key.or(tags.key);
+            tags.duration = tags.duration.or(lt.tags.duration);
+            tags.comment = tags.comment.or_else(|| lt.tags.comment.clone());
+            InfoView {
+                source: "USB",
+                position: "ON DECK".into(),
+                folder: false,
+                fields: info_fields(d.path, &tags),
+                rating: tags.rating,
+                art: lt.art.clone(),
+                comment: tags.comment.clone(),
+                loaded: true,
+            }
+        }
+        None => InfoView {
+            source: "USB",
+            position: "NO TRACK".into(),
+            fields: vec![("TITLE", "No track loaded".into())],
+            ..InfoView::default()
+        },
+    };
+    BrowseView {
+        info: Some(info),
+        ..BrowseView::default()
+    }
+}
+
+/// The info panels' fields of a track.
+fn info_fields(path: &Path, tags: &Tags) -> Vec<(&'static str, String)> {
+    let or_dash = |v: Option<String>| v.unwrap_or_else(|| "–".into());
+    vec![
+        ("TITLE", track_title(path, Some(tags))),
+        ("ARTIST", or_dash(tags.artist.clone())),
+        ("ALBUM", or_dash(tags.album.clone())),
+        ("TIME", or_dash(tags.duration.map(length))),
+        ("BPM", or_dash(tags.bpm.map(|b| format!("{b:.1}")))),
+        ("KEY", or_dash(tags.key.clone())),
+        ("GENRE", or_dash(tags.genre.clone())),
+    ]
+}

@@ -59,10 +59,10 @@ pub(super) fn modal(ui: &mut Ui, m: &ModalView) {
                 row_h,
                 t.text.button.color(t.color.danger_text).center(),
             );
-            ui.hit(Target::ModalRow(k as u16), rect);
+            ui.hit(Target::Browse(BrowseTarget::ModalRow(k as u16)), rect);
         } else {
             ui.button(
-                Target::ModalRow(k as u16),
+                Target::Browse(BrowseTarget::ModalRow(k as u16)),
                 rect,
                 label,
                 None,
@@ -109,14 +109,14 @@ pub(super) fn ask_scan(ui: &mut Ui) {
     }
     let by = y + h - 68.0;
     ui.button(
-        Target::ScanYes,
+        Target::Browse(BrowseTarget::ScanYes),
         Rect::new(x + 24.0, by, 260.0, 48.0),
         "SCAN",
         None,
         true,
     );
     ui.button(
-        Target::ScanNo,
+        Target::Browse(BrowseTarget::ScanNo),
         Rect::new(x + w - 24.0 - 260.0, by, 260.0, 48.0),
         "FOLDERS ONLY",
         None,

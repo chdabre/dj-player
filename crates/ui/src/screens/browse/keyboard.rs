@@ -169,7 +169,7 @@ pub(super) fn keyboard(ui: &mut Ui, shift: Shift) {
                 t.text.button
             };
             ui.button_styled(
-                Target::Key(index),
+                Target::Browse(BrowseTarget::Key(index)),
                 Rect::new(x, y, kw, row_h),
                 &shown,
                 None,

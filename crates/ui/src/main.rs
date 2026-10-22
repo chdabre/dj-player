@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use engine_core::DeckCommand;
 use engine_io::{CpalBackend, StreamRequest};
-use engined::browse::{Browser, Entered, Kind, Sort, Source};
+use engined::browse::{Browser, Sort, Source};
 use engined::{AutoCue, LibraryChoice, Options, Persistence, Player};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -57,22 +57,19 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::app::effects::{Effect, Effects};
-use crate::app::engine::DeckSnapshot;
+use crate::app::engine::{DeckSnapshot, LibraryView};
 use crate::app::keymap::{self, KeyContext, Shortcut};
 use crate::app::surface::Surface;
-use crate::app::track::{Track, track_title};
+use crate::app::track::Track;
 use crate::input::{ControlEvent, Nav};
-use crate::kit::Rect;
-use crate::playlists::{Action, Editing, Modal};
 use crate::render::Gfx;
 use crate::render::scene::Scene;
-use crate::screens::browse::{self, BrowseView, InfoView, ModalView, ROW_H, ROWS, Row, RowKind};
-use crate::screens::deck::OVERVIEW;
-use crate::screens::{HitBox, PerfState, SaveState, ScreenKind, Target, View, perform};
+use crate::screens::browse::{self, OnDeck, ROW_H, ROWS};
+use crate::screens::perform::{self, PerfState};
+use crate::screens::{Cx, HitBox, SaveState, ScreenKind, Screens, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::WaveSettings;
-use library::PlaylistKind;
 use waveform::display::Mode;
 
 #[cfg(debug_assertions)]
@@ -87,7 +84,6 @@ const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [
                      [--search <query>] [--scan] [--info] [--info-screen] [--analyze-all] \
                      [--source usb|library|taglist] [--open <a/b>] [--menu]\n\
                      LIBRARY_DIR=<dir> browses <dir> as a USB stick's root; the file is then optional.";
-const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
 
 struct Args {
     file: Option<PathBuf>,
@@ -413,6 +409,22 @@ fn main() -> ExitCode {
             b.set_source(s);
         }
     }
+    let mut screens = Screens {
+        screen: if args.perform.is_some() {
+            ScreenKind::Performance
+        } else if args.info_screen {
+            ScreenKind::Info
+        } else if args.browse || args.file.is_none() {
+            ScreenKind::Browse
+        } else {
+            ScreenKind::Main
+        },
+        perform: args.perform.unwrap_or_default(),
+        ..Screens::default()
+    };
+    screens.browse.keyboard = args.search.is_some();
+    screens.browse.side = args.info;
+    screens.browse.ask_scan = ask_scan && !args.scan;
     let event_loop = match EventLoop::new() {
         Ok(l) => l,
         Err(e) => {
@@ -428,25 +440,18 @@ fn main() -> ExitCode {
         #[cfg(feature = "standin")]
         shell_scene: Scene::default(),
         last_frame: None,
-        scrub: None,
         deck,
         track,
         player,
         browser,
         // Applied once the library's listing is in (a library search needs it).
         pending_search: args.search.clone(),
-        keyboard: args.search.is_some(),
-        side: args.info,
-        editing: Editing::default(),
+        screens,
         effects: Vec::new(),
         surface: Surface::new(sr),
-        shift: browse::Shift::Off,
         pending_analyze_all: args.analyze_all,
         pending_open: args.open.clone(),
         pending_menu: args.menu,
-        unanalysed_cache: std::cell::RefCell::new(None),
-        ask_scan: ask_scan && !args.scan,
-        list_drag: None,
         wheel: 0.0,
         fullscreen: args.fullscreen,
         screenshot: args.screenshot,
@@ -455,25 +460,13 @@ fn main() -> ExitCode {
         gfx: None,
         theme: args.theme,
         scene: Scene::default(),
-        screen: if args.perform.is_some() {
-            ScreenKind::Performance
-        } else if args.info_screen {
-            ScreenKind::Info
-        } else if args.browse || args.file.is_none() {
-            ScreenKind::Browse
-        } else {
-            ScreenKind::Main
-        },
-        perf: args.perform.unwrap_or_default(),
         wave_settings: WaveSettings {
             mode: args.wave_mode,
             ..WaveSettings::default()
         },
         hits: Vec::new(),
-        pressed: None,
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
-        zoom: 1,
         debug: true,
         stats: FrameStats::default(),
         overlay: String::new(),
@@ -492,13 +485,6 @@ fn main() -> ExitCode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Scrub {
-    last_x: f32,
-    frames_per_px: f64,
-    shown: f64,
-}
-
 /// Who got the pointer when it went down: the device screen or the stand-in shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointerOn {
@@ -506,19 +492,6 @@ enum PointerOn {
     #[cfg_attr(not(feature = "standin"), allow(dead_code))]
     Shell,
 }
-
-/// A finger on the browse list: where it went down (design y, row), how far the list has
-/// scrolled under it, and whether it moved enough to be a drag rather than a tap.
-#[derive(Debug, Clone, Copy)]
-struct ListDrag {
-    y: f32,
-    row: usize,
-    scrolled: isize,
-    moved: bool,
-}
-
-/// Finger travel (design pixels) before a touch on the list counts as a drag.
-const DRAG_SLOP: f32 = 8.0;
 
 struct App {
     player: Player,
@@ -530,29 +503,17 @@ struct App {
     browser: Option<Browser>,
     /// A `--search` query still to start.
     pending_search: Option<String>,
-    /// The search keyboard is up.
-    keyboard: bool,
-    /// The browser's info panel is up beside the list.
-    side: bool,
-    /// Playlist editing on the browse screen: a modal over the list (MENU, ADD TO PLAYLIST,
-    /// naming, a confirmation), or an entry the knob is moving.
-    editing: Editing,
+    /// Which screen is up, each screen's state, and the touch in progress.
+    screens: Screens,
     /// What input asked the engine and the library to do, carried out after each event.
     effects: Effects,
     /// What the player's controls do (fader range, jog, held buttons), whoever presses them.
     surface: Surface,
-    /// The on-screen keyboard's shift.
-    shift: browse::Shift,
     /// `--analyze-all` still to start.
     pending_analyze_all: bool,
     /// `--open` levels still to open, and `--menu` still to show.
     pending_open: Option<String>,
     pending_menu: bool,
-    /// The unanalysed track count, and the listing it was counted from.
-    unanalysed_cache: std::cell::RefCell<Option<(Arc<engined::persist::Listing>, usize)>>,
-    /// Ask whether to scan this stick (it had no library).
-    ask_scan: bool,
-    list_drag: Option<ListDrag>,
     /// Wheel travel not yet turned into whole rows.
     wheel: f64,
     pointer_on: PointerOn,
@@ -568,19 +529,11 @@ struct App {
     gfx: Option<Gfx>,
     theme: Theme,
     scene: Scene,
-    screen: ScreenKind,
-    perf: PerfState,
     wave_settings: WaveSettings,
     hits: Vec<HitBox>,
-    /// Touched target, held until release; the overview tracks the drag.
-    pressed: Option<Target>,
     cursor: (f64, f64),
     modifiers: ModifiersState,
-    zoom: usize,
     debug: bool,
-    /// The hand on the zoom waveform: where the finger was (design x), the frames one design
-    /// pixel covers, and the playhead the finger has moved the track to.
-    scrub: Option<Scrub>,
     stats: FrameStats,
     overlay: String,
     error: Option<String>,
@@ -591,6 +544,19 @@ impl App {
         self.effects.push(Effect::Deck(cmd));
     }
 
+    /// The screens, and what their handlers may use.
+    fn split(&mut self) -> (&mut Screens, Cx<'_>) {
+        let cx = Cx {
+            deck: &self.deck,
+            browser: self.browser.as_mut(),
+            library: LibraryView::read(&self.player),
+            loaded: self.player.loaded().map(|d| d.file()),
+            shown: self.track.last_shown.map(|(_, p)| p),
+            effects: &mut self.effects,
+        };
+        (&mut self.screens, cx)
+    }
+
     /// A control of the player did something (stand-in, keyboard, or the hardware).
     fn control(&mut self, e: ControlEvent) {
         let mut navs = Vec::new();
@@ -599,6 +565,12 @@ impl App {
         for n in navs {
             self.nav(n);
         }
+    }
+
+    /// A browse control: the knob, BACK, TAG TRACK.
+    fn nav(&mut self, n: Nav) {
+        let (screens, mut cx) = self.split();
+        screens.nav(n, &mut cx);
     }
 
     /// Carry out the effects input asked for, in order.
@@ -713,260 +685,28 @@ impl App {
         }
     }
 
+    /// A touch on the device screen at window pixels (`x`, `y`).
     fn press(&mut self, x: f64, y: f64) {
         let Some(gfx) = &self.gfx else { return };
-        let (dx, dy) = gfx.to_design(x, y);
-        let Some(hit) = self.hits.iter().find(|h| h.contains(dx, dy)).copied() else {
+        let at = gfx.to_design(x, y);
+        let Some(hit) = self.hits.iter().find(|h| h.contains(at.0, at.1)).copied() else {
             return;
         };
-        self.pressed = Some(hit.target);
-        let looping = self.deck.looping;
-        match hit.target {
-            Target::Perform => {
-                self.screen = match self.screen {
-                    ScreenKind::Performance => ScreenKind::Main,
-                    _ => ScreenKind::Performance,
-                };
-            }
-            Target::Browse if self.browser.is_some() => {
-                self.screen = match self.screen {
-                    ScreenKind::Browse => ScreenKind::Main,
-                    _ => ScreenKind::Browse,
-                };
-            }
-            Target::BrowseBack => self.nav(Nav::Back),
-            Target::Library | Target::Usb if self.browser.is_some() => {
-                let source = if hit.target == Target::Library {
-                    Source::Library
-                } else {
-                    Source::Folders
-                };
-                if let Some(b) = self.browser.as_mut() {
-                    b.set_source(source);
-                }
-                self.keyboard = false;
-                self.screen = ScreenKind::Browse;
-            }
-            Target::Sort => {
-                if let Some(b) = self.browser.as_mut() {
-                    b.set_sort(b.sort().next());
-                }
-            }
-            Target::Search => self.search(),
-            Target::TagList if self.browser.is_some() => {
-                if let Some(b) = self.browser.as_mut() {
-                    b.set_source(Source::TagList);
-                }
-                self.keyboard = false;
-                self.editing.modal = None;
-                self.screen = ScreenKind::Browse;
-            }
-            Target::Menu if self.screen == ScreenKind::Browse => self.open_menu(),
-            Target::ModalRow(i) => {
-                if let Some(m) = self.editing.modal.as_mut() {
-                    m.select(usize::from(i));
-                }
-                self.modal_push();
-                self.naming_started();
-            }
-            Target::Info => self.toggle_info(),
-            Target::Scan => self.effects.push(Effect::Scan),
-            Target::AnalyzeAll => self.analyze_all(),
-            Target::ScanYes => self.answer_scan(true),
-            Target::ScanNo => self.answer_scan(false),
-            Target::Key(i) => {
-                if let Some(c) = browse::key_char(i) {
-                    if c == browse::SHIFT {
-                        self.shift = self.shift.tap();
-                        return;
-                    }
-                    let (c, shift) = self.shift.apply(c);
-                    self.shift = shift;
-                    if self.editing.naming() {
-                        self.type_name(c);
-                    } else {
-                        self.type_char(c);
-                    }
-                }
-            }
-            Target::Row(row) => {
-                self.list_drag = Some(ListDrag {
-                    y: dy,
-                    row: usize::from(row),
-                    scrolled: 0,
-                    moved: false,
-                });
-            }
-            Target::HotCueMode
-            | Target::BeatJumpMode
-            | Target::DeleteCall
-            | Target::Bank
-            | Target::Pad(_)
-            | Target::BeatLoop(_) => {
-                let (hot, beats) = (self.deck.hot_cues, self.deck.loop_beats());
-                if let Some(cmd) = perform::press(&mut self.perf, hit.target, hot, beats) {
-                    self.send(cmd);
-                }
-            }
-            Target::Slip => self.send(DeckCommand::ToggleSlip),
-            Target::CallPrev if looping => self.send(DeckCommand::LoopResize(0.5)),
-            Target::CallNext if looping => self.send(DeckCommand::LoopResize(2.0)),
-            Target::CallPrev => self.send(DeckCommand::BeatJump(-4.0)),
-            Target::CallNext => self.send(DeckCommand::BeatJump(4.0)),
-            Target::Zoom => self.zoom = (self.zoom + 1) % ZOOM_STEPS.len(),
-            Target::Overview => self.seek_overview(dx),
-            Target::Waveform => {
-                let span = self.deck.zoom_span(ZOOM_STEPS[self.zoom]);
-                let shown = self.track.last_shown.map_or(self.deck.position, |(_, p)| p);
-                self.scrub = Some(Scrub {
-                    last_x: dx,
-                    frames_per_px: span / f64::from(hit.rect.w),
-                    shown,
-                });
-                self.send(DeckCommand::ScratchBegin);
-            }
-            _ => {}
-        }
+        let (screens, mut cx) = self.split();
+        screens.tap(hit, at, &mut cx);
     }
 
     fn drag(&mut self, x: f64, y: f64) {
-        if let (Some(mut scrub), Some(gfx)) = (self.scrub, &self.gfx) {
-            let (dx, _) = gfx.to_design(x, y);
-            // The waveform moves with the finger: dragging left plays forward.
-            let frames = -f64::from(dx - scrub.last_x) * scrub.frames_per_px;
-            let length = self.deck.length;
-            scrub.shown = (scrub.shown + frames).clamp(0.0, length);
-            scrub.last_x = dx;
-            self.scrub = Some(scrub);
-            if frames != 0.0 {
-                self.send(DeckCommand::ScratchBy(frames));
-            }
-            return;
-        }
-        if let (Some(mut d), Some(gfx)) = (self.list_drag, &self.gfx) {
-            let (_, dy) = gfx.to_design(x, y);
-            let travel = dy - d.y;
-            d.moved |= travel.abs() > DRAG_SLOP;
-            if d.moved {
-                // The list moves with the finger: dragging up shows later rows.
-                let want = (-travel / ROW_H).round() as isize;
-                if want != d.scrolled
-                    && let Some(b) = self.browser.as_mut()
-                {
-                    b.scroll_by(want - d.scrolled);
-                    d.scrolled = want;
-                }
-                self.pressed = None;
-            }
-            self.list_drag = Some(d);
-            return;
-        }
-        if self.pressed == Some(Target::Overview)
-            && let Some(gfx) = &self.gfx
-        {
-            let (dx, _) = gfx.to_design(x, y);
-            self.seek_overview(dx);
-        }
+        let Some(gfx) = &self.gfx else { return };
+        let at = gfx.to_design(x, y);
+        let (screens, mut cx) = self.split();
+        screens.drag(at, &mut cx);
     }
 
     /// The finger or button came up.
     fn release(&mut self) {
-        self.pressed = None;
-        if self.scrub.take().is_some() {
-            self.send(DeckCommand::ScratchEnd);
-        }
-        if let Some(d) = self.list_drag.take()
-            && !d.moved
-        {
-            self.tap_row(d.row);
-        }
-    }
-
-    /// A tap on shown row `row`: a folder opens; a track is selected, and loads if it was
-    /// selected already.
-    fn tap_row(&mut self, row: usize) {
-        let Some(b) = self.browser.as_mut() else {
-            return;
-        };
-        let i = b.level().top + row;
-        let Some(entry) = b.level().entries.get(i) else {
-            return;
-        };
-        let open = entry.kind != Kind::Track || b.level().cursor == i;
-        b.select(i);
-        if open {
-            self.enter();
-        }
-    }
-
-    /// Open the selected folder, or load the selected track.
-    fn enter(&mut self) {
-        let Some(b) = self.browser.as_mut() else {
-            return;
-        };
-        if let Entered::Track(path) = b.enter() {
-            self.effects.push(Effect::Load(path));
-        }
-    }
-
-    /// A browse control: knob turn / push, BACK.
-    fn nav(&mut self, n: Nav) {
-        if self.screen == ScreenKind::Info && n == Nav::Back {
-            self.screen = ScreenKind::Main;
-            return;
-        }
-        if n == Nav::Tag || n == Nav::Untag {
-            return self.tag_track(n == Nav::Untag);
-        }
-        if self.browser.is_none() {
-            return;
-        }
-        if self.screen != ScreenKind::Browse {
-            // Pushing the knob (or BROWSE) elsewhere opens the browser.
-            if n == Nav::Push {
-                self.screen = ScreenKind::Browse;
-            }
-            return;
-        }
-        if let Some(m) = self.editing.modal.as_mut() {
-            match n {
-                Nav::Up => m.move_by(-1),
-                Nav::Down => m.move_by(1),
-                Nav::Push => {
-                    self.modal_push();
-                    self.naming_started();
-                }
-                Nav::Back => self.editing.modal = None,
-                Nav::Tag | Nav::Untag => {}
-            }
-            return;
-        }
-        if self.editing.moving.is_some() {
-            match n {
-                Nav::Up => self.move_entry(-1),
-                Nav::Down => self.move_entry(1),
-                _ => self.editing.moving = None,
-            }
-            return;
-        }
-        let Some(b) = self.browser.as_mut() else {
-            return;
-        };
-        match n {
-            Nav::Tag | Nav::Untag => {}
-            Nav::Up => b.move_by(-1),
-            Nav::Down => b.move_by(1),
-            Nav::Push => self.enter(),
-            Nav::Back if self.side => self.side = false,
-            Nav::Back => {
-                if !b.back() {
-                    self.screen = ScreenKind::Main;
-                }
-                if b.search_query().is_none() {
-                    self.keyboard = false;
-                }
-            }
-        }
+        let (screens, mut cx) = self.split();
+        screens.release(&mut cx);
     }
 
     /// Load `path` onto the deck and show the main screen.
@@ -977,9 +717,7 @@ impl App {
         }
         let tags = self.browser.as_ref().and_then(|b| b.info(path));
         self.track = Track::new(path, tags.as_ref(), self.player.format.sample_rate);
-        self.keyboard = false;
-        self.scrub = None;
-        self.screen = ScreenKind::Main;
+        self.screens.loaded();
         eprintln!("loaded {}", path.display());
     }
 
@@ -1000,408 +738,22 @@ impl App {
             return;
         }
         let _ = (x, y);
-        if self.screen == ScreenKind::Browse
-            && let Some(b) = self.browser.as_mut()
-        {
-            b.scroll_by(rows as isize);
-        }
+        let (screens, mut cx) = self.split();
+        screens.wheel(rows, &mut cx);
     }
 
-    /// ANALYZE ALL: analyse every library track without our analysis, in a batch; or stop.
-    fn analyze_all(&mut self) {
-        let effect = if self.player.batch_progress().is_some() {
-            Effect::StopAnalyzeAll
-        } else {
-            Effect::AnalyzeAll(self.unanalysed())
-        };
-        self.effects.push(effect);
-    }
-
-    /// The library's tracks without our analysis, one file each, in path order.
-    fn unanalysed(&self) -> Vec<PathBuf> {
-        let (Some(b), Some(listing)) = (&self.browser, self.player.listing()) else {
-            return Vec::new();
-        };
-        let mut seen = std::collections::HashSet::new();
-        let mut rows: Vec<_> = listing.values().filter(|l| !l.analysed).collect();
-        rows.sort_by(|a, b| a.path.cmp(&b.path));
-        rows.into_iter()
-            .filter(|l| seen.insert(l.track))
-            .map(|l| b.root().join(&l.path))
-            .collect()
-    }
-
-    /// How many library tracks lack our analysis, counted once per listing.
-    fn unanalysed_count(&self) -> usize {
-        let Some(listing) = self.player.listing() else {
-            return 0;
-        };
-        if let Some((l, n)) = &*self.unanalysed_cache.borrow()
-            && Arc::ptr_eq(l, listing)
-        {
-            return *n;
-        }
-        let n = self.unanalysed().len();
-        *self.unanalysed_cache.borrow_mut() = Some((Arc::clone(listing), n));
-        n
-    }
-
-    /// The answer to "scan this stick?": a scan shows the library filling in.
-    fn answer_scan(&mut self, scan: bool) {
-        self.ask_scan = false;
-        if scan {
-            self.effects.push(Effect::Scan);
-            if let Some(b) = self.browser.as_mut() {
-                b.set_source(Source::Library);
-            }
-        }
-    }
-
-    /// INFO: in the browser, the selected track's details beside the list (or not); on
-    /// any other screen, the INFO screen of the loaded track (or back to the main screen).
-    fn toggle_info(&mut self) {
-        match self.screen {
-            ScreenKind::Browse => {
-                self.side = !self.side;
-                if self.side {
-                    self.keyboard = false;
-                }
-            }
-            ScreenKind::Info => self.screen = ScreenKind::Main,
-            _ => self.screen = ScreenKind::Info,
-        }
-    }
-
-    /// SEARCH: start a search with the keyboard up, or show / hide the keyboard of the one
-    /// under way.
-    fn search(&mut self) {
-        let Some(b) = self.browser.as_mut() else {
-            return;
-        };
-        self.screen = ScreenKind::Browse;
-        self.side = false;
-        if b.search_query().is_some() {
-            self.keyboard = !self.keyboard;
-        } else {
-            b.search_begin();
-            self.keyboard = true;
-        }
-    }
-
-    /// TAG TRACK: the selected track (on the browse screen) or the loaded one onto the tag
-    /// list; `remove` (a long press) takes it off.
-    fn tag_track(&mut self, remove: bool) {
-        let loaded = self.player.loaded().map(|d| d.file().to_path_buf());
-        let browsing = self.screen == ScreenKind::Browse;
-        let Some(path) = playlists::tag_target(self.browser.as_ref(), browsing, loaded) else {
-            return;
-        };
-        let tagged = self
-            .browser
-            .as_ref()
-            .map(|b| b.tag_entries(&path))
-            .unwrap_or_default();
-        match (remove, tagged.is_empty()) {
-            (true, false) => self.act(Action::Untag(tagged)),
-            (false, true) => self.act(Action::Tag(vec![path])),
-            // Already tagged, or nothing to remove.
-            _ => {}
-        }
-    }
-
-    /// MENU: the actions on the selection, as a modal.
-    fn open_menu(&mut self) {
-        let Some(b) = self.browser.as_ref() else {
-            return;
-        };
-        if !self.editing.open_menu(b) {
-            eprintln!("menu: nothing to do here");
-            return;
-        }
-        self.keyboard = false;
-    }
-
-    /// The modal's push (or a touch on one of its rows).
-    fn modal_push(&mut self) {
-        self.editing.push(self.browser.as_mut(), &mut self.effects);
-    }
-
-    /// Carry out a MENU action (or TAG TRACK's).
-    fn act(&mut self, a: Action) {
-        self.editing
-            .act(a, self.browser.as_mut(), &mut self.effects);
-    }
-
-    /// A name to type: the keyboard starts with a capital for an empty one.
-    fn naming_started(&mut self) {
-        self.shift = if self.editing.naming_empty() {
-            browse::Shift::Once
-        } else {
-            browse::Shift::Off
-        };
-    }
-
-    /// A key typed into a name (on-screen keyboard or a real one); DONE names it.
-    fn type_name(&mut self, c: char) {
-        self.editing.type_name(c, &mut self.effects);
-    }
-
-    /// MOVE: the moving entry one place up (`-1`) or down, the cursor with it.
-    fn move_entry(&mut self, delta: isize) {
-        if let Some(b) = self.browser.as_mut() {
-            self.editing.move_entry(delta, b, &mut self.effects);
-        }
-    }
-
-    /// A key typed into the search (on-screen keyboard or a real one).
-    fn type_char(&mut self, c: char) {
-        let Some(b) = self.browser.as_mut() else {
-            return;
-        };
-        let Some(q) = b.search_query() else {
-            return;
-        };
-        let mut q = q.to_string();
-        match c {
-            browse::BACKSPACE => {
-                q.pop();
-            }
-            browse::CLEAR => q.clear(),
-            browse::DONE => self.keyboard = false,
-            c if !c.is_control() => q.push(c),
-            _ => {}
-        }
-        b.set_query(&q);
-    }
-
-    /// What the browse screen shows of the browser.
-    fn browse_view(&self) -> Option<BrowseView> {
-        let b = self.browser.as_ref()?;
-        let l = b.level();
-        let loaded = self.player.loaded().map(|d| d.file());
-        let rows = l
-            .entries
-            .iter()
-            .skip(l.top)
-            .take(ROWS)
-            .map(|e| match e.kind {
-                Kind::Folder | Kind::Playlist(_) => Row {
-                    kind: match e.kind {
-                        Kind::Playlist(id) => match b.playlists().and_then(|p| p.get(id)) {
-                            Some(p) if p.kind == PlaylistKind::Folder => RowKind::Folder,
-                            _ => RowKind::List,
-                        },
-                        _ => RowKind::Folder,
-                    },
-                    title: e.name.clone(),
-                    artist: String::new(),
-                    detail: String::new(),
-                    loaded: false,
-                    art: None,
-                    tagged: false,
-                    missing: false,
-                },
-                Kind::Track => {
-                    let tags = b.info(&e.path);
-                    let tags = tags.as_ref();
-                    let detail = [
-                        tags.and_then(|t| t.bpm).map(|b| format!("{b:.1}")),
-                        tags.and_then(|t| t.key.clone()),
-                        tags.and_then(|t| t.duration).map(browse::length),
-                    ];
-                    Row {
-                        kind: RowKind::Track,
-                        title: track_title(&e.path, tags),
-                        artist: tags.and_then(|t| t.artist.clone()).unwrap_or_default(),
-                        detail: detail.into_iter().flatten().collect::<Vec<_>>().join("   "),
-                        loaded: loaded == Some(e.path.as_path()),
-                        art: b.art(&e.path),
-                        tagged: b.is_tagged(&e.path),
-                        missing: e.path.as_os_str().is_empty(),
-                    }
-                }
-            })
-            .collect();
-        let library = b.source() == Source::Library;
-        let top = if library {
-            "LIBRARY".to_string()
-        } else if b.source() == Source::TagList {
-            "TAG LIST".to_string()
-        } else {
-            b.root()
-                .file_name()
-                .map_or("USB".into(), |n| n.to_string_lossy().into_owned())
-        };
-        let mut header = std::iter::once(top.as_str())
-            .chain(b.trail())
-            .collect::<Vec<_>>()
-            .join("  /  ");
-        let query = b.search_query();
-        if let Some(q) = query {
-            header = format!("{header}:  {q}{}", if self.keyboard { "▏" } else { "" });
-        }
-        let empty = match (&l.error, l.entries.is_empty()) {
-            (Some(e), _) => Some(format!("Can't read this folder: {e}")),
-            (None, true) if query.is_some() => Some("Nothing matches".into()),
-            (None, true) if library => Some(
-                "No tracks in the library yet: scan the USB, or load tracks from its folders"
-                    .into(),
-            ),
-            (None, true) => Some("No folders or tracks here".into()),
-            _ => None,
-        };
-        let scan = self
-            .player
-            .scan_progress()
-            .filter(|&(done, total)| done < total || total == 0);
-        let side = self.side.then(|| self.info_view(b, library)).flatten();
-        Some(BrowseView {
-            side,
-            info: None,
-            header,
-            at_root: b.at_root(),
-            library,
-            sort: b.sort_label(),
-            searching: query.is_some(),
-            keyboard: (self.keyboard && query.is_some()) || self.editing.naming(),
-            shift: self.shift,
-            tag_list: b.source() == Source::TagList,
-            modal: self.editing.modal.as_ref().and_then(|m| {
-                m.rows().map(|(title, rows, selected)| ModalView {
-                    title,
-                    rows,
-                    selected,
-                    danger_first: matches!(m, Modal::Confirm { .. }),
-                })
-            }),
-            header_override: match (&self.editing.modal, self.editing.moving) {
-                (Some(Modal::Name { naming, text }), _) => {
-                    Some(format!("{}:  {text}▏", naming.prompt()))
-                }
-                (_, Some(_)) => Some("MOVING  ·  TURN TO MOVE, PUSH TO DROP".into()),
-                _ => None,
-            },
-            scan,
-            can_scan: self.player.listing().is_some(),
-            unanalysed: if library { self.unanalysed_count() } else { 0 },
-            analyzing: self
-                .player
-                .batch_progress()
-                .map(|p| (p.done, p.total, p.stopping)),
-            ask_scan: self.ask_scan,
-            rows,
-            selected: l.cursor.checked_sub(l.top).filter(|&r| r < ROWS),
-            first: l.top,
-            total: l.entries.len(),
-            empty,
-            has_tracks: l.entries.iter().any(|e| e.kind == Kind::Track),
-        })
-    }
-
-    /// The info panel's view of the selected entry.
-    fn info_view(&self, b: &Browser, library: bool) -> Option<InfoView> {
-        let l = b.level();
-        let e = l.selected()?;
-        let source = if library { "LIBRARY" } else { "USB" };
-        let position = format!("TRACK {:03}/{:03}", l.cursor + 1, l.entries.len());
-        if e.kind != Kind::Track {
-            return Some(InfoView {
-                source,
-                position,
-                folder: true,
-                fields: vec![("FOLDER", e.name.clone())],
-                ..InfoView::default()
-            });
-        }
-        let tags = b.info(&e.path).unwrap_or_default();
-        Some(InfoView {
-            source,
-            position,
-            folder: false,
-            fields: info_fields(&e.path, &tags),
-            rating: tags.rating,
-            // The list's thumbnail stands in until the large picture is read.
-            art: b.large_art(&e.path).unwrap_or_else(|| b.art(&e.path)),
-            comment: tags.comment.clone(),
-            loaded: self.player.loaded().map(|d| d.file()) == Some(e.path.as_path()),
-        })
-    }
-
-    /// The INFO screen's view: the loaded track, from its own tags, the library's listing
-    /// and the analysis (ours win).
-    fn info_screen_view(&self) -> BrowseView {
-        let loaded = self.player.loaded();
-        let info = match (loaded, &self.track.tags) {
-            (Some(d), Some(lt)) => {
-                let path = d.file();
-                let mut tags = self
-                    .browser
-                    .as_ref()
-                    .and_then(|b| b.info(path))
-                    .unwrap_or_else(|| lt.tags.clone());
-                if let Some(a) = &d.analysed {
-                    tags.bpm = a.bpm.or(tags.bpm);
-                    tags.key = a.key.clone().or(tags.key);
-                }
-                tags.duration = tags.duration.or(lt.tags.duration);
-                tags.comment = tags.comment.or_else(|| lt.tags.comment.clone());
-                InfoView {
-                    source: "USB",
-                    position: "ON DECK".into(),
-                    folder: false,
-                    fields: info_fields(path, &tags),
-                    rating: tags.rating,
-                    art: lt.art.clone(),
-                    comment: tags.comment.clone(),
-                    loaded: true,
-                }
-            }
-            _ => InfoView {
-                source: "USB",
-                position: "NO TRACK".into(),
-                fields: vec![("TITLE", "No track loaded".into())],
-                ..InfoView::default()
-            },
-        };
-        BrowseView {
-            info: Some(info),
-            ..BrowseView::default()
-        }
-    }
-
-    /// The shown rows' tags have all been read, and a scan asked for is done (for
-    /// screenshots).
+    /// The browse screen shows everything it waits for, and the CLI's own requests are done
+    /// (for screenshots).
     fn browse_settled(&self) -> bool {
         let Some(b) = &self.browser else {
             return true;
         };
-        if self.pending_search.is_some()
-            || (b.source() != Source::Folders
-                && (self.player.listing().is_none() || self.player.playlists().is_none()))
-            || self.pending_open.is_some()
-            || self
-                .player
-                .scan_progress()
-                .is_some_and(|(done, total)| done < total || total == 0)
-        {
-            return false;
-        }
-        let l = b.level();
-        let info_ready = !self.side
-            || l.selected()
-                .is_none_or(|e| e.kind == Kind::Folder || b.large_art(&e.path).is_some());
-        info_ready
-            && l.entries
-                .iter()
-                .skip(l.top)
-                .take(ROWS)
-                .all(|e| e.kind == Kind::Folder || b.is_read(&e.path))
-    }
-
-    fn seek_overview(&mut self, x: f32) {
-        let Rect { x: x0, w, .. } = OVERVIEW;
-        let f = f64::from(((x - x0) / w).clamp(0.0, 1.0));
-        self.send(DeckCommand::Seek(f * self.deck.length));
+        self.pending_search.is_none()
+            && self.pending_open.is_none()
+            && self
+                .screens
+                .browse
+                .settled(b, &LibraryView::read(&self.player))
     }
 
     /// A key of the dev keyboard. Text fields (naming, the search) take the keys first; the
@@ -1412,37 +764,40 @@ impl App {
         }
         let key = keymap::KeyPress::from(key);
         let pressed = key.pressed;
-        let browsing = self.screen == ScreenKind::Browse;
-        if browsing && self.ask_scan {
+        let screen = self.screens.screen;
+        let browsing = screen == ScreenKind::Browse;
+        let (screens, mut cx) = self.split();
+        let b = &mut screens.browse;
+        if browsing && b.ask_scan {
             if pressed {
                 match &key.key {
-                    Key::Named(NamedKey::Enter) => self.answer_scan(true),
-                    Key::Named(NamedKey::Escape) => self.answer_scan(false),
+                    Key::Named(NamedKey::Enter) => b.answer_scan(true, &mut cx),
+                    Key::Named(NamedKey::Escape) => b.answer_scan(false, &mut cx),
                     _ => {}
                 }
             }
             return;
         }
         // While naming, the keyboard types the name: Enter names it, Esc gives up.
-        if browsing && self.editing.naming() {
+        if browsing && b.editing.naming() {
             if !pressed {
                 return;
             }
             if key.key == Key::Named(NamedKey::Escape) {
-                self.editing.modal = None;
+                b.editing.modal = None;
             }
             for c in keymap::typed(&key) {
-                self.type_name(c);
+                b.type_name(c, &mut cx);
             }
             return;
         }
         // While the search keyboard is up, the keys type; Enter and Esc still browse.
-        if browsing && self.keyboard {
+        if browsing && b.keyboard {
             let chars = keymap::typed(&key);
             if !chars.is_empty() && chars != [browse::DONE] {
                 if pressed {
                     for c in chars {
-                        self.type_char(c);
+                        b.type_char(c, &mut cx);
                     }
                 }
                 return;
@@ -1450,7 +805,7 @@ impl App {
         }
         let ctx = KeyContext {
             browsing,
-            info: self.screen == ScreenKind::Info,
+            info: screen == ScreenKind::Info,
             shift: self.modifiers.shift_key(),
         };
         let Some(shortcut) = keymap::shortcut(&key, ctx) else {
@@ -1460,23 +815,16 @@ impl App {
             Shortcut::Control(e) => self.control(e),
             Shortcut::Deck(d) => self.send(d.command(self.deck.sample_rate)),
             Shortcut::Nav(n) => self.nav(n),
-            Shortcut::Perform => {
-                self.screen = match self.screen {
-                    ScreenKind::Performance => ScreenKind::Main,
-                    _ => ScreenKind::Performance,
-                };
-            }
+            Shortcut::Perform => self.screens.toggle_perform(),
             Shortcut::ToggleBrowse => {
-                if self.browser.is_some() {
-                    self.screen = if browsing {
-                        ScreenKind::Main
-                    } else {
-                        ScreenKind::Browse
-                    };
-                }
+                let (screens, cx) = self.split();
+                screens.toggle_browse(&cx);
             }
-            Shortcut::Search => self.search(),
-            Shortcut::Info => self.toggle_info(),
+            Shortcut::Search => {
+                let (screens, mut cx) = self.split();
+                screens.search(&mut cx);
+            }
+            Shortcut::Info => self.screens.toggle_info(),
             Shortcut::Debug => self.debug = !self.debug,
             Shortcut::Memory => eprintln!("{}", self.player.memory()),
             Shortcut::WaveMode => {
@@ -1513,10 +861,8 @@ impl App {
         let sr = self.deck.sample_rate;
         let speed = self.deck.speed();
         let mut position = self.track.clock.update(now, self.deck.position, speed);
-        if let Some(scrub) = self.scrub {
-            // Under the finger the picture follows the hand at once; the audio trails it by the
-            // scratch spring's few milliseconds.
-            position = scrub.shown;
+        if let Some(shown) = self.screens.deck.scrubbed() {
+            position = shown;
         }
         if let Some((t, p)) = self.track.last_shown
             && speed != 0.0
@@ -1565,32 +911,49 @@ impl App {
             }
             b.refresh();
         }
+        let (screens, mut cx) = self.split();
         if pending_analyze {
-            self.analyze_all();
+            screens.browse.analyze_all(&mut cx);
         }
         if pending_menu {
-            self.open_menu();
+            screens.browse.open_menu(&mut cx);
         }
         // Before the screen is built, so it shows what they started (a scan, ANALYZE ALL).
         self.apply_effects();
         // Judged before the scene is built, so a screenshot shows everything it waited for.
         let ready = self.player.loaded().is_none_or(|d| {
             d.analysed.is_some() && d.source.is_complete() && self.track.wave_complete
-        }) && (self.screen != ScreenKind::Browse || self.browse_settled());
-        let browse = match self.screen {
-            ScreenKind::Browse => self.browse_view(),
-            ScreenKind::Info => Some(self.info_screen_view()),
+        }) && (self.screens.screen != ScreenKind::Browse || self.browse_settled());
+        let library = LibraryView::read(&self.player);
+        let loaded = self.player.loaded();
+        let browse = match self.screens.screen {
+            ScreenKind::Browse => self.browser.as_ref().map(|b| {
+                self.screens
+                    .browse
+                    .view(b, &library, loaded.map(|d| d.file()))
+            }),
+            ScreenKind::Info => Some(browse::info_screen(
+                self.browser.as_ref(),
+                loaded
+                    .zip(self.track.tags.as_ref())
+                    .map(|(d, tags)| OnDeck {
+                        path: d.file(),
+                        bpm: d.analysed.as_ref().and_then(|a| a.bpm),
+                        key: d.analysed.as_ref().and_then(|a| a.key.clone()),
+                        tags,
+                    }),
+            )),
             _ => None,
         };
         let view = View {
             deck: &self.deck,
             title: &self.track.title,
             position,
-            zoom_beats: ZOOM_STEPS[self.zoom],
-            pressed: self.pressed,
+            zoom_beats: self.screens.deck.zoom_beats(),
+            pressed: self.screens.pressed,
             debug: self.debug.then_some(self.overlay.as_str()),
-            screen: self.screen,
-            perf: self.perf,
+            screen: self.screens.screen,
+            perf: self.screens.perform,
             save: self.player.persistence().map(|p| match p {
                 Persistence::Saved => SaveState::Saved,
                 Persistence::Pending => SaveState::Saving,
@@ -1654,20 +1017,6 @@ impl App {
         }
         self.run_for.is_some_and(|d| self.started.elapsed() >= d)
     }
-}
-
-/// The info panels' fields of a track.
-fn info_fields(path: &Path, tags: &engined::browse::Tags) -> Vec<(&'static str, String)> {
-    let or_dash = |v: Option<String>| v.unwrap_or_else(|| "–".into());
-    vec![
-        ("TITLE", track_title(path, Some(tags))),
-        ("ARTIST", or_dash(tags.artist.clone())),
-        ("ALBUM", or_dash(tags.album.clone())),
-        ("TIME", or_dash(tags.duration.map(browse::length))),
-        ("BPM", or_dash(tags.bpm.map(|b| format!("{b:.1}")))),
-        ("KEY", or_dash(tags.key.clone())),
-        ("GENRE", or_dash(tags.genre.clone())),
-    ]
 }
 
 fn write_png(
