@@ -1,0 +1,18 @@
+[package]
+name = "rekordbox"
+description = "Read-only readers for Rekordbox exports (the XML collection now; the USB export later)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# A small export for other crates' tests.
+testing = []
+
+[dependencies]
+quick-xml.workspace = true
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ engine-stretch = { path = "crates/engine-stretch" }
 engine-analysis = { path = "crates/engine-analysis" }
 waveform = { path = "crates/waveform", default-features = false }
 library = { path = "crates/library" }
+rekordbox = { path = "crates/rekordbox" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"

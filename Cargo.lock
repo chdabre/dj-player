@@ -1040,7 +1040,7 @@ name = "engine-analysis"
 version = "0.1.0"
 dependencies = [
  "engine-media",
- "quick-xml 0.42.0",
+ "rekordbox",
  "rustfft",
  "serde_json",
  "stratum-dsp",
@@ -2890,6 +2890,13 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rekordbox"
+version = "0.1.0"
+dependencies = [
+ "quick-xml 0.42.0",
+]
 
 [[package]]
 name = "renderdoc-sys"

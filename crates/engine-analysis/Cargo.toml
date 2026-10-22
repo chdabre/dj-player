@@ -24,11 +24,14 @@ essentia = []
 
 [dependencies]
 engine-media.workspace = true
-quick-xml.workspace = true
+rekordbox.workspace = true
 rustfft.workspace = true
 tract-onnx = { workspace = true, optional = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 stratum-dsp = { workspace = true, optional = true }
+
+[dev-dependencies]
+rekordbox = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

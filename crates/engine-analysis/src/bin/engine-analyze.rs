@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use engine_analysis::rekordbox::XmlTrack;
+use engine_analysis::rekordbox::{XmlTrack, XmlTrackExt};
 use engine_analysis::score::{TrackScore, Truth, report, score_track};
 use engine_analysis::{
     Analysis, BpmRange, CancelFlag, FeatureSet, Key, Settings, TrackAudio, analyzers_with, load,

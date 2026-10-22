@@ -1,19 +1,7 @@
-//! Ground truth from a Rekordbox export: its values as a [`Truth`], and corrections to them
-//! checked by ear.
+//! Corrections to a Rekordbox export's ground truth, checked by ear (its values as a
+//! [`super::Truth`] come from [`crate::rekordbox::XmlTrackExt::truth`]).
 
-use super::Truth;
 use crate::rekordbox::XmlTrack;
-
-impl XmlTrack {
-    /// Reference values for scoring.
-    pub fn truth(&self, until: f64) -> Truth {
-        Truth {
-            tempo: self.average_bpm,
-            beatgrid: self.beatgrid(until),
-            key: self.key,
-        }
-    }
-}
 
 /// Corrections to Rekordbox's analysis, checked by ear: a ground truth is only as good as
 /// the grids in it.
@@ -98,8 +86,8 @@ impl Overrides {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rekordbox::TEST_XML as XML;
     use crate::rekordbox::read_collection;
+    use rekordbox::TEST_XML as XML;
 
     #[test]
     fn overrides_exclude_retempo_and_shift() {

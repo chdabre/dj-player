@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::model::Key;
-
 /// One grid anchor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TempoMarker {
@@ -30,9 +28,9 @@ pub struct XmlTrack {
     pub kind: String,
     pub location: PathBuf,
     pub average_bpm: Option<f64>,
-    pub key: Option<Key>,
-    /// The key text as Rekordbox wrote it, when it did not parse.
-    pub unparsed_key: Option<String>,
+    /// The key as Rekordbox wrote it (`Tonality`, e.g. "Abm" or "8A"), trimmed; empty if it
+    /// has none.
+    pub tonality: String,
     pub tempo: Vec<TempoMarker>,
 }
 
@@ -141,8 +139,6 @@ fn track(e: &BytesStart) -> Result<XmlTrack, String> {
         .parse::<f64>()
         .ok()
         .filter(|b| *b > 0.0);
-    let tonality = get(&a, "Tonality").trim();
-    let key = Key::parse(tonality);
     Ok(XmlTrack {
         id: get(&a, "TrackID").into(),
         name: get(&a, "Name").into(),
@@ -150,8 +146,7 @@ fn track(e: &BytesStart) -> Result<XmlTrack, String> {
         kind: get(&a, "Kind").into(),
         location: location_path(get(&a, "Location")),
         average_bpm,
-        key,
-        unparsed_key: (key.is_none() && !tonality.is_empty()).then(|| tonality.into()),
+        tonality: get(&a, "Tonality").trim().into(),
         tempo: Vec::new(),
     })
 }
@@ -207,19 +202,18 @@ fn location_path(url: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rekordbox::TEST_XML as XML;
+    use crate::TEST_XML as XML;
 
     #[test]
     fn reads_tracks_keys_and_locations() {
         let t = read_collection(XML).unwrap();
         assert_eq!(t.len(), 3, "playlist entries are not tracks");
         assert_eq!(t[0].average_bpm, None);
-        assert!(t[0].tempo.is_empty() && t[0].beatgrid(10.0).is_none());
+        assert!(t[0].tempo.is_empty() && t[0].beats(10.0).is_none());
         assert_eq!(t[1].name, "Rock & Roll");
-        assert_eq!(t[1].key, Some(Key::minor(8)));
+        assert_eq!(t[1].tonality, "Abm");
         assert_eq!(t[1].location, PathBuf::from("/Users/x/Demo Track 2 é.mp3"));
-        assert_eq!(t[2].key, None);
-        assert_eq!(t[2].unparsed_key.as_deref(), Some("X"));
+        assert_eq!(t[2].tonality, "X");
     }
 
     #[test]

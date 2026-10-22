@@ -1,11 +1,19 @@
-//! Expanding grid anchors into a [`Beatgrid`], and moving them between timelines.
+//! Expanding grid anchors into beats, and moving them between timelines.
 
-use super::XmlTrack;
-use crate::model::{Beat, Beatgrid};
+use crate::XmlTrack;
+
+/// One beat of a Rekordbox grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Beat {
+    /// Seconds from the start of the track, on Rekordbox's timeline.
+    pub time: f64,
+    /// Position in the bar, 1 = downbeat.
+    pub bar_pos: u8,
+}
 
 impl XmlTrack {
-    /// The beatgrid up to `until` seconds (the track length), if Rekordbox analysed it.
-    pub fn beatgrid(&self, until: f64) -> Option<Beatgrid> {
+    /// Every beat up to `until` seconds (the track length), if Rekordbox analysed the grid.
+    pub fn beats(&self, until: f64) -> Option<Vec<Beat>> {
         if self.tempo.is_empty() {
             return None;
         }
@@ -31,11 +39,11 @@ impl XmlTrack {
                 });
             }
         }
-        Some(Beatgrid { beats })
+        Some(beats)
     }
 
     /// Move every time (grid anchors) by `seconds`; negative moves earlier. Use
-    /// `-timeline_offset(..)` to bring Rekordbox times onto our timeline.
+    /// `-`[`crate::timeline_offset`] to bring Rekordbox times onto our timeline.
     pub fn shift(&mut self, seconds: f64) {
         for m in &mut self.tempo {
             m.start += seconds;
@@ -45,26 +53,25 @@ impl XmlTrack {
 
 #[cfg(test)]
 mod tests {
-    use crate::rekordbox::TEST_XML as XML;
-    use crate::rekordbox::read_collection;
+    use crate::{TEST_XML as XML, read_collection};
 
     #[test]
     fn expands_anchors_into_beats() {
         let t = read_collection(XML).unwrap();
-        let g = t[1].beatgrid(50.0).unwrap();
+        let g = t[1].beats(50.0).unwrap();
         // 0.025 .. 48.026 at 0.5 s: 96 beats; then 48.026 (1), 48.525 (2), then on to 50 s.
-        assert_eq!(g.beats[0].time, 0.025);
-        assert_eq!(g.beats[95].time, 0.025 + 95.0 * 0.5);
-        assert_eq!(g.beats[96].time, 48.026);
-        assert_eq!(g.beats[96].bar_pos, 1);
-        assert_eq!(g.beats[97].time, 48.525);
-        assert_eq!(g.beats[97].bar_pos, 2);
-        assert_eq!(g.beats[98].bar_pos, 3);
-        assert!(g.beats.last().unwrap().time < 50.0);
-        assert!(g.beats.windows(2).all(|w| w[1].time > w[0].time));
+        assert_eq!(g[0].time, 0.025);
+        assert_eq!(g[95].time, 0.025 + 95.0 * 0.5);
+        assert_eq!(g[96].time, 48.026);
+        assert_eq!(g[96].bar_pos, 1);
+        assert_eq!(g[97].time, 48.525);
+        assert_eq!(g[97].bar_pos, 2);
+        assert_eq!(g[98].bar_pos, 3);
+        assert!(g.last().unwrap().time < 50.0);
+        assert!(g.windows(2).all(|w| w[1].time > w[0].time));
 
-        let waltz = t[2].beatgrid(5.0).unwrap();
-        let pos: Vec<u8> = waltz.beats.iter().map(|b| b.bar_pos).collect();
+        let waltz = t[2].beats(5.0).unwrap();
+        let pos: Vec<u8> = waltz.iter().map(|b| b.bar_pos).collect();
         assert_eq!(pos, [2, 3, 1, 2, 3, 1]);
     }
 }
