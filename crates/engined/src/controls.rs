@@ -1,14 +1,30 @@
 //! What the player's physical controls do: the deck buttons, the tempo fader and its range,
 //! the jog (scratch on the plate in vinyl mode, pitch bend on the ring), SEARCH scrubbing while
 //! held, the browse knob, BACK, and TAG TRACK with its long press. One [`Surface`] takes the
-//! [`ControlEvent`]s of the stand-in, the dev keyboard or the hardware alike, and turns them
-//! into deck [`Effect`]s and browse [`Nav`]s.
+//! [`ControlEvent`]s of the UI's stand-in, its dev keyboard or the hardware alike, and turns
+//! them into deck commands and browse [`Nav`]s for the screen.
+//!
+//! It lives with the engine, not the UI, so the jog's latency is bounded by the engine
+//! rather than the UI's frames (`docs/research/engine.md`, "Controller path").
 
 use engine_core::{DeckCommand, HOT_CUES};
+use surface::{Control, ControlEvent, Nav, SECONDS_PER_TURN};
 
-use super::effects::Effect;
-use super::engine::DeckSnapshot;
-use crate::input::{Control, ControlEvent, Jog, Nav, SECONDS_PER_TURN};
+/// What the surface reads of the deck when a control acts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeckNow {
+    pub rate: f64,
+    pub quantize_on: bool,
+}
+
+/// A hand on the jog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Jog {
+    /// Scratching with the top plate.
+    Scratch,
+    /// Bending with the ring from the rate `base`.
+    Bend { base: f64 },
+}
 
 /// Tempo fader ranges (fraction of the rate either way) and their labels; WIDE is ±100 %.
 pub const RANGES: [(f64, &str); 4] = [(0.06, "±6"), (0.10, "±10"), (0.16, "±16"), (1.0, "WIDE")];
@@ -58,12 +74,10 @@ impl Surface {
         RANGES[self.range]
     }
 
-    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
     pub fn vinyl(&self) -> bool {
         self.vinyl
     }
 
-    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
     pub fn jog(&self) -> Option<Jog> {
         self.jog
     }
@@ -72,20 +86,18 @@ impl Surface {
     pub fn event(
         &mut self,
         e: ControlEvent,
-        deck: &DeckSnapshot,
-        fx: &mut Vec<Effect>,
+        deck: &DeckNow,
+        out: &mut Vec<DeckCommand>,
         nav: &mut Vec<Nav>,
     ) {
-        let mut send = |c| fx.push(Effect::Deck(c));
+        let mut send = |c| out.push(c);
         match e {
             ControlEvent::Down { control, alt } => match control {
                 Control::Cue => send(DeckCommand::CuePress),
                 Control::Play => send(DeckCommand::TogglePlay),
                 Control::Rev => send(DeckCommand::ToggleReverse),
                 Control::Quantize => {
-                    send(DeckCommand::SetQuantize(
-                        (deck.quantize <= 0.0).then_some(1.0),
-                    ));
+                    send(DeckCommand::SetQuantize((!deck.quantize_on).then_some(1.0)));
                 }
                 Control::Keylock => send(DeckCommand::ToggleKeylock),
                 Control::LoopIn => send(DeckCommand::LoopIn),
@@ -175,15 +187,15 @@ impl Surface {
 
     /// Once per frame, `dt` seconds after the last: held SEARCH scrubs, a jog bend follows the
     /// jog's speed and relaxes when it stops, and a held TAG TRACK counts towards its long press.
-    pub fn tick(&mut self, dt: f64, fx: &mut Vec<Effect>) {
+    pub fn tick(&mut self, dt: f64, out: &mut Vec<DeckCommand>) {
         let dt = dt.clamp(0.0, 0.1);
         if let Some(held) = &mut self.tag_held {
             *held += dt;
         }
         if let Some(dir) = self.search {
-            fx.push(Effect::Deck(DeckCommand::ScratchBy(
+            out.push(DeckCommand::ScratchBy(
                 dir * SEARCH_RATE * dt * self.sample_rate,
-            )));
+            ));
         }
         if let Some(Jog::Bend { base }) = self.jog
             && dt > 0.0
@@ -195,7 +207,7 @@ impl Surface {
             let bend = self.bend + (target - self.bend) * k;
             if (bend - self.bend).abs() > 1e-5 {
                 self.bend = bend;
-                fx.push(Effect::Deck(DeckCommand::SetRate(base * (1.0 + bend))));
+                out.push(DeckCommand::SetRate(base * (1.0 + bend)));
             }
         }
     }
@@ -207,12 +219,15 @@ mod tests {
 
     const SR: u32 = 48_000;
 
-    fn deck() -> DeckSnapshot {
-        DeckSnapshot::empty(f64::from(SR))
+    fn deck() -> DeckNow {
+        DeckNow {
+            rate: 1.0,
+            quantize_on: false,
+        }
     }
 
     /// Run `events` on `s`: the effects (as text) and the navs.
-    fn run(s: &mut Surface, d: &DeckSnapshot, events: &[ControlEvent]) -> (String, Vec<Nav>) {
+    fn run(s: &mut Surface, d: &DeckNow, events: &[ControlEvent]) -> (String, Vec<Nav>) {
         let (mut fx, mut nav) = (Vec::new(), Vec::new());
         for &e in events {
             s.event(e, d, &mut fx, &mut nav);
@@ -221,8 +236,7 @@ mod tests {
     }
 
     fn deck_cmds(c: &[DeckCommand]) -> String {
-        let fx: Vec<Effect> = c.iter().cloned().map(Effect::Deck).collect();
-        format!("{fx:?}")
+        format!("{:?}", c.to_vec())
     }
 
     #[test]
@@ -343,9 +357,9 @@ mod tests {
         let frames = 0.25 * SECONDS_PER_TURN * f64::from(SR);
         match fx.as_slice() {
             [
-                Effect::Deck(DeckCommand::ScratchBegin),
-                Effect::Deck(DeckCommand::ScratchBy(f)),
-                Effect::Deck(DeckCommand::ScratchEnd),
+                DeckCommand::ScratchBegin,
+                DeckCommand::ScratchBy(f),
+                DeckCommand::ScratchEnd,
             ] => assert!((f - frames).abs() < 1.0, "{f}"),
             other => panic!("{other:?}"),
         }
@@ -369,7 +383,7 @@ mod tests {
     #[test]
     fn the_ring_bends_and_letting_go_restores_the_rate() {
         let mut s = Surface::new(SR);
-        let d = DeckSnapshot {
+        let d = DeckNow {
             rate: 1.02,
             ..deck()
         };
@@ -389,7 +403,7 @@ mod tests {
         assert!(fx.is_empty());
         s.tick(0.05, &mut fx);
         match fx.as_slice() {
-            [Effect::Deck(DeckCommand::SetRate(r))] => assert!(*r > 1.02, "{r}"),
+            [DeckCommand::SetRate(r)] => assert!(*r > 1.02, "{r}"),
             other => panic!("{other:?}"),
         }
         fx.clear();
@@ -412,9 +426,9 @@ mod tests {
         s.event(ControlEvent::Up(Control::SearchFwd), &d, &mut fx, &mut nav);
         match fx.as_slice() {
             [
-                Effect::Deck(DeckCommand::ScratchBegin),
-                Effect::Deck(DeckCommand::ScratchBy(f)),
-                Effect::Deck(DeckCommand::ScratchEnd),
+                DeckCommand::ScratchBegin,
+                DeckCommand::ScratchBy(f),
+                DeckCommand::ScratchEnd,
             ] => assert!((f - 4.0 * 0.01 * f64::from(SR)).abs() < 1e-6),
             other => panic!("{other:?}"),
         }

@@ -8,7 +8,7 @@
 //! build leaves it out, and the RP2040 control surface sends the same control events instead.
 //!
 //! The shell only knows where its controls are: a pointer on them becomes [`ControlEvent`]s,
-//! and what those do is `app/surface.rs`, shared with the dev keyboard and the hardware.
+//! and what those do is `engined::controls`, shared with the dev keyboard and the hardware.
 //!
 //! - **Buttons:** CUE (hold to preview), PLAY/PAUSE, REV, QUANTIZE, KEYLOCK, loop IN / OUT /
 //!   RELOOP, hot cue pads A–H (shift or right click deletes), track search |◀◀ (back to the

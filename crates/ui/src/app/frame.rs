@@ -45,7 +45,7 @@ impl App {
             .last_frame
             .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         self.last_frame = Some(now);
-        self.surface.tick(dt, &mut self.effects);
+        self.player.tick_controls(dt);
         // Held controls act before the deck is read, as a press would.
         self.apply_effects();
         self.deck = DeckSnapshot::read(&self.player);
@@ -260,9 +260,9 @@ impl App {
             hot_cues: d.hot_cues,
             rate: d.rate,
             position: d.position / d.sample_rate,
-            range: self.surface.range(),
-            vinyl: self.surface.vinyl(),
-            jog: self.surface.jog(),
+            range: self.player.controls().range(),
+            vinyl: self.player.controls().vinyl(),
+            jog: self.player.controls().jog(),
         }
     }
 }

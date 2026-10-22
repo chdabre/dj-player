@@ -1096,6 +1096,7 @@ dependencies = [
  "hound",
  "image",
  "library",
+ "surface",
  "waveform",
 ]
 
@@ -3344,6 +3345,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "surface"
+version = "0.1.0"
+
+[[package]]
 name = "swash"
 version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4146,6 +4151,7 @@ dependencies = [
  "library",
  "png",
  "pollster",
+ "surface",
  "waveform",
  "wgpu",
  "winit",

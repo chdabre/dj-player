@@ -14,6 +14,7 @@ mod analysis;
 pub mod batch;
 pub mod browse;
 mod config;
+pub mod controls;
 mod player;
 pub mod stick;
 pub mod store;

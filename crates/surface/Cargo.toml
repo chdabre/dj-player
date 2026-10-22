@@ -1,0 +1,11 @@
+[package]
+name = "surface"
+description = "The player's control vocabulary: buttons, knob, fader and jog, shared by the engine, the UI and the RP2040 control surface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true

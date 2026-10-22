@@ -1,6 +1,7 @@
 //! The [`Player`]: the output stream and engine, the deck's track, and the library worker
 //! and background jobs that feed it.
 
+mod controls;
 mod cues;
 mod options;
 mod track;
@@ -57,6 +58,8 @@ pub struct Player {
     batch_progress: Option<BatchProgress>,
     /// Set while the deck's own track decodes or analyses: the batch job waits.
     deck_busy: Arc<AtomicBool>,
+    /// What the player's controls do ([`Player::control`]).
+    controls: crate::controls::Surface,
 }
 
 impl Player {
@@ -114,6 +117,7 @@ impl Player {
             batch: None,
             batch_progress: None,
             deck_busy: Arc::new(AtomicBool::new(false)),
+            controls: crate::controls::Surface::new(format.sample_rate),
         })
     }
 

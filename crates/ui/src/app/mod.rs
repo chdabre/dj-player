@@ -1,7 +1,8 @@
 //! The application around the screens: the window and its events (`platform.rs`), the
 //! frame (`frame.rs`), screenshots (`capture.rs`), the engine link (`engine.rs`), what the UI
-//! holds about the loaded track (`track.rs`), effects (`effects.rs`), the control surface
-//! (`surface.rs`) and the dev keyboard (`keymap.rs`). [`App`] owns all of it.
+//! holds about the loaded track (`track.rs`), effects (`effects.rs`) and the dev keyboard
+//! (`keymap.rs`); what the controls do is the player's (`engined::controls`). [`App`] owns
+//! all of it.
 
 mod capture;
 pub mod effects;
@@ -9,7 +10,6 @@ pub mod engine;
 mod frame;
 pub mod keymap;
 mod platform;
-pub mod surface;
 pub mod track;
 
 use std::path::{Path, PathBuf};
@@ -35,7 +35,6 @@ use crate::theme::Theme;
 use crate::waves::WaveSettings;
 use effects::{Effect, Effects};
 use engine::{DeckSnapshot, LibraryView};
-use surface::Surface;
 use track::Track;
 
 /// Who got the pointer when it went down: the device screen or the stand-in shell.
@@ -61,7 +60,6 @@ pub struct App {
     /// What input asked the engine and the library to do, carried out after each event.
     effects: Effects,
     /// What the player's controls do (fader range, jog, held buttons), whoever presses them.
-    surface: Surface,
     /// `--analyze-all` still to start.
     pending_analyze_all: bool,
     /// `--open` levels still to open, and `--menu` still to show.
@@ -131,7 +129,6 @@ impl App {
             pending_search: args.search.clone(),
             screens,
             effects: Vec::new(),
-            surface: Surface::new(sr),
             pending_analyze_all: args.analyze_all,
             pending_open: args.open.clone(),
             pending_menu: args.menu,
@@ -187,10 +184,7 @@ impl App {
 
     /// A control of the player did something (stand-in, keyboard, or the hardware).
     fn control(&mut self, e: ControlEvent) {
-        let mut navs = Vec::new();
-        self.surface
-            .event(e, &self.deck, &mut self.effects, &mut navs);
-        for n in navs {
+        for n in self.player.control(e) {
             self.nav(n);
         }
     }

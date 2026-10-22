@@ -15,6 +15,7 @@ engine-analysis.workspace = true
 waveform = { workspace = true, default-features = false }
 assert_no_alloc.workspace = true
 library.workspace = true
+surface.workspace = true
 crossterm.workspace = true
 image.workspace = true
 
