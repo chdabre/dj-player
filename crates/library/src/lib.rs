@@ -13,23 +13,24 @@
 //!   an exact duplicate is another location of the same track; a tag-edited copy merges by
 //!   its audio hash into the track seen first; a different encode is a separate track.
 
-pub mod db;
+mod db;
 pub mod hash;
-pub mod ids;
+mod ids;
 mod library;
-pub mod model;
-pub mod position;
+mod model;
+mod position;
+mod time;
 
 pub use hash::{AUDIO_HASH_VERSION, AudioHash, ContentHasher, FileHash, track_id};
 pub use ids::{BadId, BlobId, DeviceId, EntryId, LibraryId, PlaylistId, TrackId, TrackRef};
 pub use library::{
     Edit, Found, Library, MountError, MountOptions, MountStats, Persistence, ReadError, WriteError,
-    rfc3339, system_ms,
 };
 pub use model::{
     AnalysisRef, Cue, CueKind, FileIdentity, HOT_CUES, HotCue, Listed, Playlist, PlaylistEntry,
     PlaylistKind, Track, TrackTags, WaveformRef,
 };
+pub use time::{rfc3339, system_ms};
 
 /// A file's path as the library stores it: `/` separators and Unicode NFC, so the same
 /// name written by macOS (NFD) and anything else compares equal.

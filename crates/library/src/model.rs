@@ -82,7 +82,7 @@ pub struct Playlist {
     pub parent: Option<crate::PlaylistId>,
     pub kind: PlaylistKind,
     pub name: String,
-    /// Its place among its siblings (a fractional position, see [`crate::position`]).
+    /// Its place among its siblings (a fractional position: strings that sort in list order).
     pub position: String,
     /// Tracks in it (0 for a folder).
     pub entries: usize,

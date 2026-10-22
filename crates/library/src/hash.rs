@@ -13,7 +13,7 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-use crate::ids::{TrackId, hex, unhex};
+use crate::ids::{TrackId, hex};
 
 /// Dropbox's block size for `content_hash`.
 pub const BLOCK: usize = 4 * 1024 * 1024;
@@ -27,10 +27,6 @@ impl FileHash {
         let mut h = ContentHasher::new();
         h.update(bytes);
         h.finish()
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        unhex(s).map(Self)
     }
 }
 
@@ -130,10 +126,6 @@ impl AudioHash {
 
     pub fn is_current(&self) -> bool {
         self.v == AUDIO_HASH_VERSION
-    }
-
-    pub fn hash_hex(&self) -> String {
-        hex(&self.hash)
     }
 }
 
