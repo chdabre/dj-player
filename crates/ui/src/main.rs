@@ -951,7 +951,7 @@ impl App {
         let shell_view = self.shell_view();
         #[cfg(feature = "standin")]
         if let Some(s) = self.standin.as_mut() {
-            s.build(&shell_view, &mut self.shell_scene);
+            s.build(&shell_view, &self.theme, &mut self.shell_scene);
         }
         let build = build_start.elapsed();
         #[cfg(feature = "standin")]

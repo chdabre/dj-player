@@ -19,13 +19,16 @@
 //!   bends too.
 //! - **Tempo fader:** drag; up is slower, as on the reference. TEMPO cycles ±6 / ±10 / ±16 / WIDE.
 //!
-//! The shell has its own colours: it is a debug tool, not part of the device theme.
+//! The shell has its own colours (`theme.shell`) and type sizes: it is a debug tool, not part
+//! of the device's look.
 
 use engine_core::HOT_CUES;
 
 use crate::app::surface::{Jog, SECONDS_PER_TURN};
 use crate::input::{Control, ControlEvent};
-use crate::render::scene::{Align, Rgba, Scene, Text, Weight};
+use crate::kit::{HitBox, Hits, Rect};
+use crate::render::scene::{Align, Layer, Rgba, Scene, Text, Weight};
+use crate::theme::{ShellColors, Theme};
 
 /// The shell's design size.
 pub const SIZE: (f32, f32) = (1512.0, 950.0);
@@ -39,48 +42,6 @@ const PLATE_RADIUS: f32 = 125.0;
 const FADER_CENTER_Y: f32 = 685.0;
 const FADER_TRAVEL: f32 = 211.0;
 const FADER: (f32, f32, f32, f32) = (1352.0, 440.0, 76.0, 490.0);
-
-// Colours of the stand-in (not the device theme).
-const BODY: Rgba = Rgba::hex(0x141619);
-const PANEL: Rgba = Rgba::hex(0x0b0c0e);
-const PANEL_EDGE: Rgba = Rgba::hex(0x26292e);
-const EDGE: Rgba = Rgba::hex(0x3a3d42);
-const EDGE_LIGHT: Rgba = Rgba::hex(0x5f6369);
-const BUTTON_TOP: Rgba = Rgba::hex(0x2a2d32);
-const BUTTON_BOTTOM: Rgba = Rgba::hex(0x1d1f23);
-const BUTTON_DOWN: Rgba = Rgba::hex(0x3a3e45);
-const TEXT: Rgba = Rgba::hex(0xe6e6e6);
-const LABEL: Rgba = Rgba::hex(0xc9ccd1);
-const SUB: Rgba = Rgba::hex(0x8f939a);
-const KEY_FILL: Rgba = Rgba::hex(0x1a1c20);
-const KEY_TEXT: Rgba = Rgba::hex(0x7cb4ff);
-const AMBER: Rgba = Rgba::hex(0xe0a33a);
-const AMBER_TEXT: Rgba = Rgba::hex(0xf2c06a);
-const AMBER_DIM: Rgba = Rgba::hex(0x5a4420);
-const GREEN: Rgba = Rgba::hex(0x3fbf6a);
-const GREEN_TEXT: Rgba = Rgba::hex(0x7ee0a0);
-const GREEN_DIM: Rgba = Rgba::hex(0x1d4a2c);
-const RED_EDGE: Rgba = Rgba::hex(0x8a3040);
-const RED_FILL: Rgba = Rgba::hex(0x3a141b);
-const RED_LIT: Rgba = Rgba::hex(0x7a2232);
-const RED_TEXT: Rgba = Rgba::hex(0xffb3bf);
-const BLUE: Rgba = Rgba::hex(0x2b7fff);
-const BLUE_FILL: Rgba = Rgba::hex(0x0b2350);
-const BLUE_TEXT: Rgba = Rgba::hex(0x7cb4ff);
-const KNOB: Rgba = Rgba::hex(0xb9bcc1);
-const JOG_RING: Rgba = Rgba::hex(0x24272b);
-const JOG_PLATE: Rgba = Rgba::hex(0x121316);
-const BLACK: Rgba = Rgba::hex(0x000000);
-const PAD_COLORS: [Rgba; 8] = [
-    Rgba::hex(0xe8667a),
-    Rgba::hex(0xe0a33a),
-    Rgba::hex(0x5ab8ec),
-    Rgba::hex(0x6cc08b),
-    Rgba::hex(0xa78bfa),
-    Rgba::hex(0xf0762a),
-    Rgba::hex(0x3fb8ae),
-    Rgba::hex(0xe878c8),
-];
 
 /// What the shell shows of the deck.
 #[derive(Debug, Clone, Copy, Default)]
@@ -133,12 +94,6 @@ pub enum Part {
     Jog,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Hit {
-    control: Part,
-    rect: (f32, f32, f32, f32),
-}
-
 /// What the pointer holds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Held {
@@ -161,7 +116,7 @@ const KNOB_STEP: f32 = 18.0;
 /// The stand-in's state: where its controls were drawn, and what the pointer holds.
 pub struct Standin {
     held: Option<Held>,
-    hits: Vec<Hit>,
+    hits: Hits<Part>,
 }
 
 fn angle_of(x: f32, y: f32) -> f32 {
@@ -214,7 +169,7 @@ impl Standin {
     pub fn new() -> Self {
         Self {
             held: None,
-            hits: Vec::new(),
+            hits: Hits::default(),
         }
     }
 
@@ -233,13 +188,7 @@ impl Standin {
         if (dx * dx + dy * dy).sqrt() <= JOG_RADIUS {
             return Some(Part::Jog);
         }
-        self.hits
-            .iter()
-            .find(|h| {
-                let (hx, hy, hw, hh) = h.rect;
-                x >= hx && x < hx + hw && y >= hy && y < hy + hh
-            })
-            .map(|h| h.control)
+        self.hits.find(x, y).map(|h| h.target)
     }
 
     /// A press at shell design pixels (`x`, `y`); `alt` = shift or the right button.
@@ -318,13 +267,15 @@ impl Standin {
         }
     }
 
-    /// Lay out the shell into `scene`.
-    pub fn build(&mut self, v: &ShellView, scene: &mut Scene) {
+    /// Lay out the shell into `scene`, in the theme's shell colours.
+    pub fn build(&mut self, v: &ShellView, theme: &Theme, scene: &mut Scene) {
+        let pal = &theme.shell;
         scene.clear();
-        scene.background = BODY;
+        scene.background = pal.body;
         let mut d = Draw {
             scene,
-            hits: Vec::new(),
+            hits: Hits::default(),
+            c: pal,
         };
 
         // Panels: left column, display, bottom band, right column.
@@ -334,15 +285,16 @@ impl Standin {
             (235.0, 622.0, 1041.0, 322.0),
             (1280.0, 6.0, 226.0, 938.0),
         ] {
-            d.scene.rounded(x, y, w, h, 10.0, PANEL, 1.0, PANEL_EDGE);
+            d.scene
+                .rounded(x, y, w, h, 10.0, pal.panel, 1.0, pal.panel_edge);
         }
         // The display's bezel; the device screen is copied over the inside.
         d.scene
-            .rounded(236.0, 8.0, 1036.0, 608.0, 6.0, BLACK, 1.0, EDGE);
+            .rounded(236.0, 8.0, 1036.0, 608.0, 6.0, pal.black, 1.0, pal.edge);
 
         // ----- Left column (centred on x = 121) -----
-        d.label("TIME MODE", 121.0, 24.0, LABEL, 15.0, Align::Center);
-        d.label("– AUTO CUE", 121.0, 42.0, SUB, 12.0, Align::Center);
+        d.label("TIME MODE", 121.0, 24.0, pal.label, 15.0, Align::Center);
+        d.label("– AUTO CUE", 121.0, 42.0, pal.sub, 12.0, Align::Center);
         d.round(
             Part::TimeMode,
             105.0,
@@ -351,7 +303,7 @@ impl Standin {
             self.is_down(Part::TimeMode),
         );
         d.key("t", 145.0, 69.0);
-        d.label("QUANTIZE", 121.0, 114.0, LABEL, 15.0, Align::Center);
+        d.label("QUANTIZE", 121.0, 114.0, pal.label, 15.0, Align::Center);
         d.round(
             Part::Quantize,
             105.0,
@@ -359,22 +311,22 @@ impl Standin {
             32.0,
             self.is_down(Part::Quantize),
         );
-        d.led(116.0, 147.0, if v.quantize { AMBER } else { EDGE });
+        d.led(116.0, 147.0, if v.quantize { pal.amber } else { pal.edge });
         d.key("z", 145.0, 143.0);
         d.rule(31.0, 192.0, 180.0);
-        d.label("DIRECTION", 121.0, 210.0, LABEL, 15.0, Align::Center);
-        let rev_fill = if v.reverse { RED_LIT } else { RED_FILL };
+        d.label("DIRECTION", 121.0, 210.0, pal.label, 15.0, Align::Center);
+        let rev_fill = if v.reverse { pal.red_lit } else { pal.red_fill };
         d.rect_button(
             Part::Rev,
             (71.0, 232.0, 100.0, 40.0),
             "REV",
             rev_fill,
-            RED_EDGE,
-            RED_TEXT,
+            pal.red_edge,
+            pal.red_text,
             self.is_down(Part::Rev),
         );
         d.key("r", 179.0, 242.0);
-        d.label("TRACK SEARCH", 121.0, 296.0, LABEL, 15.0, Align::Center);
+        d.label("TRACK SEARCH", 121.0, 296.0, pal.label, 15.0, Align::Center);
         d.round_label(
             Part::TrackBack,
             66.0,
@@ -391,7 +343,7 @@ impl Standin {
             "▶▶|",
             self.is_down(Part::TrackNext),
         );
-        d.label("SEARCH", 121.0, 392.0, LABEL, 15.0, Align::Center);
+        d.label("SEARCH", 121.0, 392.0, pal.label, 15.0, Align::Center);
         d.round_label(
             Part::SearchBack,
             66.0,
@@ -411,26 +363,26 @@ impl Standin {
         d.key("← →", 106.0, 474.0);
         d.rule(31.0, 520.0, 180.0);
         // CUE and PLAY, with their rings lit by state.
-        let cue_ring = if v.playing { AMBER_DIM } else { AMBER };
+        let cue_ring = if v.playing { pal.amber_dim } else { pal.amber };
         d.big(
             Part::Cue,
             69.0,
             566.0,
             "CUE",
             cue_ring,
-            AMBER_TEXT,
+            pal.amber_text,
             self.is_down(Part::Cue),
         );
         d.key("c", 184.0, 608.0);
-        d.label("PLAY / PAUSE", 121.0, 706.0, LABEL, 15.0, Align::Center);
-        let play_ring = if v.playing { GREEN } else { GREEN_DIM };
+        d.label("PLAY / PAUSE", 121.0, 706.0, pal.label, 15.0, Align::Center);
+        let play_ring = if v.playing { pal.green } else { pal.green_dim };
         d.big(
             Part::Play,
             69.0,
             734.0,
             "▶ ‖",
             play_ring,
-            GREEN_TEXT,
+            pal.green_text,
             self.is_down(Part::Play),
         );
         d.key("space", 184.0, 776.0);
@@ -440,44 +392,59 @@ impl Standin {
             Part::Back,
             (1290.0, 40.0, 100.0, 42.0),
             "BACK",
-            BUTTON_TOP,
-            EDGE,
-            TEXT,
+            pal.button_top,
+            pal.edge,
+            pal.text,
             self.is_down(Part::Back),
         );
         d.rect_button(
             Part::TagTrack,
             (1396.0, 40.0, 100.0, 42.0),
             "TAG TRACK",
-            BUTTON_TOP,
-            EDGE,
-            TEXT,
+            pal.button_top,
+            pal.edge,
+            pal.text,
             self.is_down(Part::TagTrack),
         );
         d.key("esc", 1290.0, 88.0);
         d.key("x  ⇧x", 1396.0, 88.0);
-        d.scene
-            .rounded(1312.0, 110.0, 152.0, 186.0, 14.0, BUTTON_BOTTOM, 1.0, EDGE);
-        d.label("▲", 1388.0, 116.0, SUB, 12.0, Align::Center);
+        d.scene.rounded(
+            1312.0,
+            110.0,
+            152.0,
+            186.0,
+            14.0,
+            pal.button_bottom,
+            1.0,
+            pal.edge,
+        );
+        d.label("▲", 1388.0, 116.0, pal.sub, 12.0, Align::Center);
         let knob_fill = if self.is_down(Part::Browse) {
-            BUTTON_DOWN
+            pal.button_down
         } else {
-            BUTTON_TOP
+            pal.button_top
         };
         d.scene.rounded(
-            1332.0, 146.0, 112.0, 112.0, 56.0, knob_fill, 2.0, EDGE_LIGHT,
+            1332.0,
+            146.0,
+            112.0,
+            112.0,
+            56.0,
+            knob_fill,
+            2.0,
+            pal.edge_light,
         );
         d.scene
-            .rounded(1358.0, 172.0, 60.0, 60.0, 30.0, KNOB, 0.0, KNOB);
+            .rounded(1358.0, 172.0, 60.0, 60.0, 30.0, pal.knob, 0.0, pal.knob);
         d.hit(Part::Browse, (1332.0, 146.0, 112.0, 112.0));
         d.hit(Part::BrowseUp, (1312.0, 110.0, 152.0, 36.0));
         d.hit(Part::BrowseDown, (1312.0, 258.0, 152.0, 38.0));
-        d.label("▼", 1388.0, 268.0, SUB, 12.0, Align::Center);
+        d.label("▼", 1388.0, 268.0, pal.sub, 12.0, Align::Center);
         d.label(
             "BROWSE · TURN: SCROLL · PUSH: LOAD",
             1388.0,
             302.0,
-            SUB,
+            pal.sub,
             12.0,
             Align::Center,
         );
@@ -487,48 +454,41 @@ impl Standin {
             Part::F1,
             (1290.0, 350.0, 100.0, 40.0),
             "F1",
-            BUTTON_TOP,
-            EDGE,
-            TEXT,
+            pal.button_top,
+            pal.edge,
+            pal.text,
             self.is_down(Part::F1),
         );
         d.rect_button(
             Part::F2,
             (1396.0, 350.0, 100.0, 40.0),
             "F2",
-            BUTTON_TOP,
-            EDGE,
-            TEXT,
+            pal.button_top,
+            pal.edge,
+            pal.text,
             self.is_down(Part::F2),
         );
         d.rule(1290.0, 408.0, 206.0);
-        d.label("TEMPO", 1390.0, 418.0, LABEL, 15.0, Align::Center);
+        d.label("TEMPO", 1390.0, 418.0, pal.label, 15.0, Align::Center);
         let (fx, fy, fw, fh) = FADER;
-        d.scene.rounded(fx, fy, fw, fh, 6.0, PANEL, 1.0, EDGE);
-        d.scene.fill(1388.0, 456.0, 4.0, 458.0, BLACK);
-        d.label("–", 1336.0, 452.0, SUB, 12.0, Align::Left);
-        d.label("0", 1334.0, 678.0, SUB, 12.0, Align::Left);
-        d.scene.fill(1352.0, 685.0, 12.0, 2.0, TEXT);
-        d.label("+", 1335.0, 902.0, SUB, 12.0, Align::Left);
+        d.scene
+            .rounded(fx, fy, fw, fh, 6.0, pal.panel, 1.0, pal.edge);
+        d.scene.fill(1388.0, 456.0, 4.0, 458.0, pal.black);
+        d.label("–", 1336.0, 452.0, pal.sub, 12.0, Align::Left);
+        d.label("0", 1334.0, 678.0, pal.sub, 12.0, Align::Left);
+        d.scene.fill(1352.0, 685.0, 12.0, 2.0, pal.text);
+        d.label("+", 1335.0, 902.0, pal.sub, 12.0, Align::Left);
         // The cap follows the deck's rate on this range (pitch bends move it too).
         let v_rate = ((v.rate - 1.0) / v.range.0).clamp(-1.0, 1.0) as f32;
         let cap_y = FADER_CENTER_Y + v_rate * FADER_TRAVEL - 18.0;
         let cap = if self.is_down(Part::Fader) {
-            BUTTON_DOWN
+            pal.button_down
         } else {
-            Rgba::hex(0x4a4e55)
+            pal.fader_cap
         };
-        d.scene.rounded(
-            1362.0,
-            cap_y,
-            56.0,
-            36.0,
-            4.0,
-            cap,
-            1.0,
-            Rgba::hex(0x7a7e84),
-        );
-        d.scene.fill(1362.0, cap_y + 17.0, 56.0, 2.0, TEXT);
+        d.scene
+            .rounded(1362.0, cap_y, 56.0, 36.0, 4.0, cap, 1.0, pal.fader_cap_edge);
+        d.scene.fill(1362.0, cap_y + 17.0, 56.0, 2.0, pal.text);
         d.hit(Part::Fader, FADER);
         d.key("+ / −", 1438.0, 666.0);
         d.key("0", 1438.0, 690.0);
@@ -536,18 +496,18 @@ impl Standin {
             &format!("{:+.2} %", (v.rate - 1.0) * 100.0),
             1390.0,
             932.0,
-            SUB,
+            pal.sub,
             12.0,
             Align::Center,
         );
 
         // ----- Bottom band: loop, pads, jog, jog mode / tempo / keylock -----
-        d.label("IN / 4BEAT", 282.0, 632.0, SUB, 12.0, Align::Center);
-        d.label("OUT", 352.0, 632.0, SUB, 12.0, Align::Center);
-        d.label("RELOOP / EXIT", 440.0, 632.0, SUB, 12.0, Align::Center);
-        d.scene.fill(310.0, 680.0, 14.0, 2.0, EDGE_LIGHT);
-        d.scene.fill(380.0, 680.0, 40.0, 2.0, EDGE_LIGHT);
-        let loop_fill = if v.looping { AMBER_TEXT } else { AMBER };
+        d.label("IN / 4BEAT", 282.0, 632.0, pal.sub, 12.0, Align::Center);
+        d.label("OUT", 352.0, 632.0, pal.sub, 12.0, Align::Center);
+        d.label("RELOOP / EXIT", 440.0, 632.0, pal.sub, 12.0, Align::Center);
+        d.scene.fill(310.0, 680.0, 14.0, 2.0, pal.edge_light);
+        d.scene.fill(380.0, 680.0, 40.0, 2.0, pal.edge_light);
+        let loop_fill = if v.looping { pal.amber_text } else { pal.amber };
         d.amber(
             Part::LoopIn,
             254.0,
@@ -577,15 +537,15 @@ impl Standin {
             322.0,
             184.0,
             8.0,
-            Rgba::hex(0x0e1420),
+            pal.pads_panel,
             1.0,
-            Rgba::hex(0x22457a),
+            pal.pads_panel_edge,
         );
         d.label(
             "HOT CUE A–H · OUR PADS",
             254.0,
             756.0,
-            SUB,
+            pal.sub,
             12.0,
             Align::Left,
         );
@@ -594,53 +554,53 @@ impl Standin {
             let (col, row) = (f32::from(i % 4), f32::from(i / 4));
             let (x, y) = (254.0 + col * 76.0, 780.0 + row * 74.0);
             let set = usize::from(i) < HOT_CUES && v.hot_cues & (1 << i) != 0;
-            let c = PAD_COLORS[usize::from(i)];
+            let c = pal.pads[usize::from(i)];
             let fill = if self.is_down(Part::Pad(i)) {
-                BUTTON_DOWN
+                pal.button_down
             } else if set {
-                Rgba::hex(0x1f1d22)
+                pal.pad_set
             } else {
-                KEY_FILL
+                pal.key_fill
             };
-            d.scene.rounded(x, y, 68.0, 66.0, 6.0, fill, 1.0, EDGE);
+            d.scene.rounded(x, y, 68.0, 66.0, 6.0, fill, 1.0, pal.edge);
             if set {
                 d.scene
                     .rounded(x, y, 68.0, 66.0, 6.0, c.alpha(0.05), 0.0, c);
                 d.scene.rounded(x, y, 68.0, 4.0, 2.0, c, 0.0, c);
             }
             let letter = ((b'A' + i) as char).to_string();
-            d.label(&letter, x + 34.0, y + 21.0, TEXT, 20.0, Align::Center);
+            d.label(&letter, x + 34.0, y + 21.0, pal.text, 20.0, Align::Center);
             d.hit(Part::Pad(i), (x, y, 68.0, 66.0));
         }
 
         // Jog: ring, top plate, centre display, and a marker that turns with the track.
         let (cx, cy) = JOG_CENTER;
         let ring = if matches!(v.jog, Some(Jog::Bend { .. })) {
-            Rgba::hex(0x30343a)
+            pal.jog_ring_active
         } else {
-            JOG_RING
+            pal.jog_ring
         };
-        d.circle(cx, cy, JOG_RADIUS, ring, 2.0, EDGE);
+        d.circle(cx, cy, JOG_RADIUS, ring, 2.0, pal.edge);
         let plate = if matches!(v.jog, Some(Jog::Scratch)) {
-            Rgba::hex(0x1a1c20)
+            pal.jog_plate_active
         } else {
-            JOG_PLATE
+            pal.jog_plate
         };
-        d.circle(cx, cy, PLATE_RADIUS, plate, 2.0, EDGE_LIGHT);
-        d.circle(cx, cy, 46.0, BLACK, 3.0, BLUE);
+        d.circle(cx, cy, PLATE_RADIUS, plate, 2.0, pal.edge_light);
+        d.circle(cx, cy, 46.0, pal.black, 3.0, pal.blue);
         let vinyl = if v.vinyl { "VINYL" } else { "CDJ" };
-        d.label(vinyl, cx, cy - 9.0, TEXT, 13.0, Align::Center);
+        d.label(vinyl, cx, cy - 9.0, pal.text, 13.0, Align::Center);
         let turn = (v.position / SECONDS_PER_TURN).fract() as f32 * std::f32::consts::TAU;
         let (mx, my) = (cx + 104.0 * turn.sin(), cy - 104.0 * turn.cos());
-        d.circle(mx, my, 6.0, Rgba::hex(0xe8667a), 0.0, BLACK);
-        d.label("– REV", 574.0, 918.0, SUB, 12.0, Align::Left);
-        d.label("FWD +", 862.0, 918.0, SUB, 12.0, Align::Left);
+        d.circle(mx, my, 6.0, pal.jog_marker, 0.0, pal.black);
+        d.label("– REV", 574.0, 918.0, pal.sub, 12.0, Align::Left);
+        d.label("FWD +", 862.0, 918.0, pal.sub, 12.0, Align::Left);
 
-        d.label("JOG MODE", 924.0, 658.0, LABEL, 15.0, Align::Left);
+        d.label("JOG MODE", 924.0, 658.0, pal.label, 15.0, Align::Left);
         let (jf, je, jt) = if v.vinyl {
-            (BLUE_FILL, BLUE, BLUE_TEXT)
+            (pal.blue_fill, pal.blue, pal.blue_text)
         } else {
-            (BUTTON_TOP, EDGE, SUB)
+            (pal.button_top, pal.edge, pal.sub)
         };
         d.rect_button(
             Part::JogMode,
@@ -656,7 +616,7 @@ impl Standin {
             &format!("TEMPO  {}", v.range.1),
             924.0,
             732.0,
-            LABEL,
+            pal.label,
             15.0,
             Align::Left,
         );
@@ -664,7 +624,7 @@ impl Standin {
             "±6 / ±10 / ±16 / WIDE",
             924.0,
             750.0,
-            SUB,
+            pal.sub,
             12.0,
             Align::Left,
         );
@@ -676,7 +636,7 @@ impl Standin {
             self.is_down(Part::TempoRange),
         );
         d.key("g", 1166.0, 737.0);
-        d.label("KEYLOCK", 924.0, 812.0, LABEL, 15.0, Align::Left);
+        d.label("KEYLOCK", 924.0, 812.0, pal.label, 15.0, Align::Left);
         d.round(
             Part::Keylock,
             1212.0,
@@ -684,15 +644,15 @@ impl Standin {
             32.0,
             self.is_down(Part::Keylock),
         );
-        d.led(1223.0, 815.0, if v.keylock { AMBER } else { EDGE });
+        d.led(1223.0, 815.0, if v.keylock { pal.amber } else { pal.edge });
         d.key("k", 1166.0, 810.0);
         d.rule(924.0, 880.0, 326.0);
-        d.label("JOG", 924.0, 890.0, LABEL, 15.0, Align::Left);
+        d.label("JOG", 924.0, 890.0, pal.label, 15.0, Align::Left);
         d.label(
             "TOP: SCRATCH · RING: PITCH BEND",
             964.0,
             892.0,
-            SUB,
+            pal.sub,
             12.0,
             Align::Left,
         );
@@ -706,13 +666,18 @@ impl Standin {
 /// Drawing helpers for the shell.
 struct Draw<'s> {
     scene: &'s mut Scene,
-    hits: Vec<Hit>,
+    hits: Hits<Part>,
+    c: &'s ShellColors,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl Draw<'_> {
-    fn hit(&mut self, control: Part, rect: (f32, f32, f32, f32)) {
-        self.hits.push(Hit { control, rect });
+    fn hit(&mut self, part: Part, (x, y, w, h): (f32, f32, f32, f32)) {
+        self.hits.push(HitBox {
+            target: part,
+            rect: Rect::new(x, y, w, h),
+            layer: Layer::Base,
+        });
     }
 
     fn label(&mut self, s: &str, x: f32, y: f32, color: Rgba, size: f32, align: Align) {
@@ -737,8 +702,15 @@ impl Draw<'_> {
     fn key(&mut self, s: &str, x: f32, y: f32) {
         let w = 12.0 + 6.5 * s.chars().count() as f32;
         self.scene
-            .rounded(x, y, w, 19.0, 4.0, KEY_FILL, 1.0, EDGE_LIGHT);
-        self.label(s, x + w * 0.5, y + 1.5, KEY_TEXT, 12.0, Align::Center);
+            .rounded(x, y, w, 19.0, 4.0, self.c.key_fill, 1.0, self.c.edge_light);
+        self.label(
+            s,
+            x + w * 0.5,
+            y + 1.5,
+            self.c.key_text,
+            12.0,
+            Align::Center,
+        );
     }
 
     fn led(&mut self, x: f32, y: f32, color: Rgba) {
@@ -746,7 +718,7 @@ impl Draw<'_> {
     }
 
     fn rule(&mut self, x: f32, y: f32, w: f32) {
-        self.scene.fill(x, y, w, 1.0, PANEL_EDGE);
+        self.scene.fill(x, y, w, 1.0, self.c.panel_edge);
     }
 
     fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Rgba, border: f32, edge: Rgba) {
@@ -755,25 +727,37 @@ impl Draw<'_> {
     }
 
     fn round(&mut self, control: Part, x: f32, y: f32, d: f32, down: bool) {
-        let fill = if down { BUTTON_DOWN } else { BUTTON_TOP };
-        self.scene.rounded(x, y, d, d, d * 0.5, fill, 1.0, EDGE);
+        let fill = if down {
+            self.c.button_down
+        } else {
+            self.c.button_top
+        };
+        self.scene
+            .rounded(x, y, d, d, d * 0.5, fill, 1.0, self.c.edge);
         self.hit(control, (x, y, d, d));
     }
 
     fn round_label(&mut self, control: Part, x: f32, y: f32, d: f32, s: &str, down: bool) {
         self.round(control, x, y, d, down);
-        self.label(s, x + d * 0.5, y + d * 0.5 - 8.0, TEXT, 13.0, Align::Center);
-    }
-
-    fn amber(&mut self, control: Part, x: f32, y: f32, d: f32, s: &str, fill: Rgba, down: bool) {
-        let fill = if down { AMBER_TEXT } else { fill };
-        self.scene
-            .rounded(x, y, d, d, d * 0.5, fill, 1.0, Rgba::hex(0x7a5a22));
         self.label(
             s,
             x + d * 0.5,
             y + d * 0.5 - 8.0,
-            Rgba::hex(0x1a1205),
+            self.c.text,
+            13.0,
+            Align::Center,
+        );
+    }
+
+    fn amber(&mut self, control: Part, x: f32, y: f32, d: f32, s: &str, fill: Rgba, down: bool) {
+        let fill = if down { self.c.amber_text } else { fill };
+        self.scene
+            .rounded(x, y, d, d, d * 0.5, fill, 1.0, self.c.amber_edge);
+        self.label(
+            s,
+            x + d * 0.5,
+            y + d * 0.5 - 8.0,
+            self.c.on_amber,
             13.0,
             Align::Center,
         );
@@ -783,7 +767,11 @@ impl Draw<'_> {
     /// CUE or PLAY: a big round button with a coloured ring.
     fn big(&mut self, control: Part, x: f32, y: f32, s: &str, ring: Rgba, text: Rgba, down: bool) {
         let d = 104.0;
-        let fill = if down { BUTTON_DOWN } else { BUTTON_TOP };
+        let fill = if down {
+            self.c.button_down
+        } else {
+            self.c.button_top
+        };
         self.scene.rounded(x, y, d, d, d * 0.5, fill, 4.0, ring);
         self.label(
             s,
@@ -806,7 +794,7 @@ impl Draw<'_> {
         text: Rgba,
         down: bool,
     ) {
-        let fill = if down { BUTTON_DOWN } else { fill };
+        let fill = if down { self.c.button_down } else { fill };
         self.scene.rounded(x, y, w, h, 6.0, fill, 1.0, edge);
         self.label(
             s,
@@ -826,7 +814,11 @@ mod tests {
 
     fn shell() -> Standin {
         let mut s = Standin::new();
-        s.build(&ShellView::default(), &mut Scene::default());
+        s.build(
+            &ShellView::default(),
+            &Theme::default(),
+            &mut Scene::default(),
+        );
         s
     }
 

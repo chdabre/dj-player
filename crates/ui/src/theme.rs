@@ -22,6 +22,9 @@ pub struct Theme {
     pub text: TextStyles,
     pub shape: Shape,
     pub waveform: WaveformTokens,
+    /// The hardware stand-in's colours (a debug shell around the device screen, not part of
+    /// the device's look).
+    pub shell: ShellColors,
 }
 
 /// Colours by role.
@@ -239,6 +242,57 @@ impl TextStyles {
     }
 }
 
+/// The hardware stand-in: a dark body with grey caps, and the reference player's amber
+/// (CUE, loops), green (PLAY), red (REV) and blue (displays, keylock).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShellColors {
+    pub body: Rgba,
+    pub panel: Rgba,
+    pub panel_edge: Rgba,
+    pub edge: Rgba,
+    pub edge_light: Rgba,
+    pub button_top: Rgba,
+    pub button_bottom: Rgba,
+    pub button_down: Rgba,
+    pub text: Rgba,
+    pub label: Rgba,
+    pub sub: Rgba,
+    /// Key caps showing the dev keyboard's shortcuts.
+    pub key_fill: Rgba,
+    pub key_text: Rgba,
+    pub amber: Rgba,
+    pub amber_text: Rgba,
+    pub amber_dim: Rgba,
+    pub amber_edge: Rgba,
+    /// Text on an amber button.
+    pub on_amber: Rgba,
+    pub green: Rgba,
+    pub green_text: Rgba,
+    pub green_dim: Rgba,
+    pub red_edge: Rgba,
+    pub red_fill: Rgba,
+    pub red_lit: Rgba,
+    pub red_text: Rgba,
+    pub blue: Rgba,
+    pub blue_fill: Rgba,
+    pub blue_text: Rgba,
+    pub knob: Rgba,
+    pub fader_cap: Rgba,
+    pub fader_cap_edge: Rgba,
+    /// The hot cue pads' panel, a set pad, and each pad's colour.
+    pub pads_panel: Rgba,
+    pub pads_panel_edge: Rgba,
+    pub pad_set: Rgba,
+    pub pads: [Rgba; 8],
+    pub jog_ring: Rgba,
+    pub jog_ring_active: Rgba,
+    pub jog_plate: Rgba,
+    pub jog_plate_active: Rgba,
+    /// The mark on the jog that turns with the track.
+    pub jog_marker: Rgba,
+    pub black: Rgba,
+}
+
 /// Corner radii and line widths.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shape {
@@ -407,6 +461,58 @@ impl Theme {
                 loading: dim.alpha(0.5),
                 slip_shadow: accent.alpha(0.8),
             },
+            shell: ShellColors {
+                body: Rgba::hex(0x141619),
+                panel: Rgba::hex(0x0b0c0e),
+                panel_edge: Rgba::hex(0x26292e),
+                edge: Rgba::hex(0x3a3d42),
+                edge_light: Rgba::hex(0x5f6369),
+                button_top: Rgba::hex(0x2a2d32),
+                button_bottom: Rgba::hex(0x1d1f23),
+                button_down: Rgba::hex(0x3a3e45),
+                text: Rgba::hex(0xe6e6e6),
+                label: Rgba::hex(0xc9ccd1),
+                sub: Rgba::hex(0x8f939a),
+                key_fill: Rgba::hex(0x1a1c20),
+                key_text: Rgba::hex(0x7cb4ff),
+                amber: Rgba::hex(0xe0a33a),
+                amber_text: Rgba::hex(0xf2c06a),
+                amber_dim: Rgba::hex(0x5a4420),
+                amber_edge: Rgba::hex(0x7a5a22),
+                on_amber: Rgba::hex(0x1a1205),
+                green: Rgba::hex(0x3fbf6a),
+                green_text: Rgba::hex(0x7ee0a0),
+                green_dim: Rgba::hex(0x1d4a2c),
+                red_edge: Rgba::hex(0x8a3040),
+                red_fill: Rgba::hex(0x3a141b),
+                red_lit: Rgba::hex(0x7a2232),
+                red_text: Rgba::hex(0xffb3bf),
+                blue: Rgba::hex(0x2b7fff),
+                blue_fill: Rgba::hex(0x0b2350),
+                blue_text: Rgba::hex(0x7cb4ff),
+                knob: Rgba::hex(0xb9bcc1),
+                fader_cap: Rgba::hex(0x4a4e55),
+                fader_cap_edge: Rgba::hex(0x7a7e84),
+                pads_panel: Rgba::hex(0x0e1420),
+                pads_panel_edge: Rgba::hex(0x22457a),
+                pad_set: Rgba::hex(0x1f1d22),
+                pads: [
+                    Rgba::hex(0xe8667a),
+                    Rgba::hex(0xe0a33a),
+                    Rgba::hex(0x5ab8ec),
+                    Rgba::hex(0x6cc08b),
+                    Rgba::hex(0xa78bfa),
+                    Rgba::hex(0xf0762a),
+                    Rgba::hex(0x3fb8ae),
+                    Rgba::hex(0xe878c8),
+                ],
+                jog_ring: Rgba::hex(0x24272b),
+                jog_ring_active: Rgba::hex(0x30343a),
+                jog_plate: Rgba::hex(0x121316),
+                jog_plate_active: Rgba::hex(0x1a1c20),
+                jog_marker: Rgba::hex(0xe8667a),
+                black: Rgba::hex(0x000000),
+            },
         }
     }
 
@@ -463,6 +569,7 @@ mod tests {
                 "screens/browse/modal.rs",
                 include_str!("screens/browse/modal.rs"),
             ),
+            ("standin.rs", include_str!("standin.rs")),
             ("kit/mod.rs", include_str!("kit/mod.rs")),
             ("kit/rect.rs", include_str!("kit/rect.rs")),
             ("render/mod.rs", include_str!("render/mod.rs")),
