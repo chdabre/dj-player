@@ -92,15 +92,18 @@ enum Request {
         name: String,
         files: Vec<PathBuf>,
     },
+    /// The deck let go of the track it loaded under this serial.
+    Close(u64),
     Scan,
     Analysed {
+        serial: u64,
         bpm: Option<f64>,
         key: Option<String>,
     },
     Edit(Edit),
-    AudioHash(AudioHash),
-    Waveform(Box<Waveform>),
-    Analysis(Vec<FreshAnalysis>),
+    AudioHash(u64, AudioHash),
+    Waveform(u64, Box<Waveform>),
+    Analysis(u64, Vec<FreshAnalysis>),
 }
 
 pub enum Reply {
@@ -158,11 +161,17 @@ impl LibraryWorker {
         Ok(w)
     }
 
-    /// The deck loaded `file`: find or make its record, answered by a [`Reply::Loaded`] (or
+    /// A deck loaded `file`: find or make its record, answered by a [`Reply::Loaded`] (or
     /// [`Reply::Unrecorded`]) with this `serial`. Audio hash, waveform and analysis requests
-    /// from now on are for this track.
+    /// with this serial are for this track until [`LibraryWorker::close`].
     pub fn open(&self, serial: u64, file: PathBuf) {
         self.send(Request::Open { serial, file });
+    }
+
+    /// The deck let go of the track it loaded under `serial`: later requests for it are
+    /// dropped.
+    pub fn close(&self, serial: u64) {
+        self.send(Request::Close(serial));
     }
 
     pub fn try_recv(&self) -> Option<Reply> {
@@ -180,12 +189,14 @@ impl LibraryWorker {
         self.send(Request::Edit(e));
     }
 
-    pub fn audio_hash(&self, h: AudioHash) {
-        self.send(Request::AudioHash(h));
+    /// The audio hash of the track loaded under `serial`.
+    pub fn audio_hash(&self, serial: u64, h: AudioHash) {
+        self.send(Request::AudioHash(serial, h));
     }
 
-    pub fn waveform(&self, w: Waveform) {
-        self.send(Request::Waveform(Box::new(w)));
+    /// The waveform of the track loaded under `serial`.
+    pub fn waveform(&self, serial: u64, w: Waveform) {
+        self.send(Request::Waveform(serial, Box::new(w)));
     }
 
     /// Scan every audio file under the stick's root: records and tags, a file at a time
@@ -217,20 +228,20 @@ impl LibraryWorker {
         });
     }
 
-    /// Store a batch result with its file's record; the loaded track stays the one requests
-    /// without a file go to.
+    /// Store a batch result with its file's record (the open tracks stay open).
     pub fn store(&self, result: BatchResult) {
         self.send(Request::Store(Box::new(result)));
     }
 
-    /// The loaded track's analysed BPM and key, for the tag cache.
-    pub fn analysed(&self, bpm: Option<f64>, key: Option<String>) {
-        self.send(Request::Analysed { bpm, key });
+    /// The analysed BPM and key of the track loaded under `serial`, for the tag cache.
+    pub fn analysed(&self, serial: u64, bpm: Option<f64>, key: Option<String>) {
+        self.send(Request::Analysed { serial, bpm, key });
     }
 
-    pub fn analysis(&self, fresh: Vec<FreshAnalysis>) {
+    /// Fresh analysis results of the track loaded under `serial`.
+    pub fn analysis(&self, serial: u64, fresh: Vec<FreshAnalysis>) {
         if !fresh.is_empty() {
-            self.send(Request::Analysis(fresh));
+            self.send(Request::Analysis(serial, fresh));
         }
     }
 }

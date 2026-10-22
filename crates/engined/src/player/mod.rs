@@ -141,6 +141,9 @@ impl Player {
             .send_deck(DECK, DeckCommand::Load(Arc::clone(&loading.source)))?;
         self.loads += 1;
         if let Some(lib) = &self.library {
+            if let Some(previous) = &self.loaded {
+                lib.close(previous.serial);
+            }
             lib.open(self.loads, file.to_path_buf());
         }
         // Dropping the previous track stops its decode and analysis where they are.
@@ -406,10 +409,10 @@ impl Player {
                 if let Some(lib) = &self.library
                     && d.lib.track.is_some()
                 {
-                    lib.analysis(std::mem::take(&mut done.fresh));
-                    lib.analysed(done.bpm, done.key.clone());
+                    lib.analysis(d.serial, std::mem::take(&mut done.fresh));
+                    lib.analysed(d.serial, done.bpm, done.key.clone());
                     if let Some(h) = done.audio_hash {
-                        lib.audio_hash(h);
+                        lib.audio_hash(d.serial, h);
                     }
                 }
                 d.analysed = Some(done);
@@ -426,7 +429,7 @@ impl Player {
             && let Some(lib) = &self.library
             && let Some(w) = d.waveform.finished()
         {
-            lib.waveform(w);
+            lib.waveform(d.serial, w);
             d.lib.waveform_stored = true;
         }
     }

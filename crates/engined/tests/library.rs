@@ -83,14 +83,18 @@ fn edits_waveform_and_analysis_come_back_on_the_next_load() {
     assert!(saved, "the edit was committed");
 
     let wf = waveform::compute::compute(&vec![0.25; 2 * 44_100], 44_100, &Default::default());
-    w.waveform(wf.clone());
-    w.analysis(vec![FreshAnalysis {
-        name: "gridfit".into(),
-        version: "1".into(),
-        params: "p".into(),
-        blob: b"{}".to_vec(),
-    }]);
-    w.audio_hash(library::AudioHash::of_pcm(&[0.0, 0.5]));
+    // spawn_as opens the file under serial 0.
+    w.waveform(0, wf.clone());
+    w.analysis(
+        0,
+        vec![FreshAnalysis {
+            name: "gridfit".into(),
+            version: "1".into(),
+            params: "p".into(),
+            blob: b"{}".to_vec(),
+        }],
+    );
+    w.audio_hash(0, library::AudioHash::of_pcm(&[0.0, 0.5]));
     drop(w); // waits for the final flush
 
     // The same file loaded again, on another player.
@@ -185,9 +189,9 @@ fn one_worker_loads_track_after_track() {
     assert_eq!(lb.serial, 2);
     assert_ne!(lb.track, la.track);
     assert!(lb.record.hot_cues.iter().all(Option::is_none));
-    // Requests without a track id go to the track opened last.
+    // Requests name the load they are for.
     let wf = waveform::compute::compute(&vec![0.25; 2 * 44_100], 44_100, &Default::default());
-    w.waveform(wf);
+    w.waveform(2, wf);
 
     w.open(3, a.clone());
     let again = wait_answer(&w).unwrap();
@@ -203,6 +207,41 @@ fn one_worker_loads_track_after_track() {
     assert_eq!(wait_answer(&w).unwrap_err().0, 5);
     w.open(6, a);
     assert_eq!(wait_answer(&w).unwrap().track, la.track);
+}
+
+#[test]
+fn two_open_tracks_each_get_their_own_requests_until_closed() {
+    let dir = temp_dir("two-open");
+    let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+    write_wav(&a, 440.0);
+    write_wav(&b, 660.0);
+    let w = LibraryWorker::start(
+        Some(DeviceId::random()),
+        LibraryChoice::Folder(dir.join("DJPLAYER")),
+    )
+    .unwrap();
+    // Two decks: a under serial 1, b under serial 2, both open at once.
+    w.open(1, a.clone());
+    let la = wait_answer(&w).unwrap();
+    w.open(2, b.clone());
+    let lb = wait_answer(&w).unwrap();
+    let wf = waveform::compute::compute(&vec![0.25; 2 * 44_100], 44_100, &Default::default());
+    // The request for a, sent after b was opened, still goes to a.
+    w.waveform(1, wf.clone());
+    // b is let go: its request is dropped.
+    w.close(2);
+    w.waveform(2, wf);
+    w.open(3, a);
+    let again = wait_answer(&w).unwrap();
+    assert_eq!(again.track, la.track);
+    assert!(again.waveform.is_some(), "the waveform went to a");
+    w.open(4, b);
+    let b_again = wait_answer(&w).unwrap();
+    assert_eq!(b_again.track, lb.track);
+    assert!(
+        b_again.waveform.is_none(),
+        "b was closed before its waveform came"
+    );
 }
 
 #[test]

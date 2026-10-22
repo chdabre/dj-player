@@ -22,8 +22,8 @@ const FLUSH_AFTER: Duration = Duration::from_secs(1);
 /// How often a running scan reports progress and publishes the listing.
 const SCAN_REPORT: Duration = Duration::from_millis(500);
 
-/// The track requests apply to: the last one opened.
-struct Current {
+/// A track a deck has loaded: requests name it by its load serial.
+struct Open {
     track: TrackId,
     serial: u64,
 }
@@ -92,7 +92,8 @@ struct Worker<'a> {
     /// Mounted now for a chosen folder (or RAM), so the browser can list it before anything
     /// loads; on the first open for the automatic choice: it needs a file to find its stick.
     loc: Option<Located>,
-    current: Option<Current>,
+    /// The tracks on the decks, until each is closed.
+    open: Vec<Open>,
     scan: Option<Scan>,
     /// Files still to add to playlists, in order, and when the playlists were last sent.
     adding: VecDeque<(PlaylistId, PathBuf)>,
@@ -128,7 +129,7 @@ impl<'a> Worker<'a> {
                 last: None,
             },
             loc: None,
-            current: None,
+            open: Vec::new(),
             scan: None,
             adding: VecDeque::new(),
             adding_sent: Instant::now(),
@@ -281,14 +282,14 @@ impl<'a> Worker<'a> {
             }
         }
         let loc = self.loc.as_mut().expect("just mounted");
-        self.current = None;
         match open(loc, file, &say) {
             Ok((track, new_location)) => {
                 let tags_changed = refresh_tags(&mut loc.lib, track, file, &say);
                 let _ =
                     self.replies
                         .send(Reply::Loaded(Box::new(loaded(&mut loc.lib, track, serial))));
-                self.current = Some(Current { track, serial });
+                self.open.retain(|o| o.serial != serial);
+                self.open.push(Open { track, serial });
                 report(&mut loc.lib, &say, &mut self.status);
                 // After an unclean close: the record is out, so the check doesn't hold up
                 // the load.
@@ -339,12 +340,16 @@ impl<'a> Worker<'a> {
                 self.new_playlist(id, parent, name, files);
                 true
             }
-            Request::Analysed { bpm, key } => self.analysed(bpm, key),
-            Request::AudioHash(h) => self.audio_hash(h),
-            Request::Waveform(w) => self.waveform(&w),
-            Request::Analysis(fresh) => self.analysis(fresh),
+            Request::Close(serial) => {
+                self.open.retain(|o| o.serial != serial);
+                false
+            }
+            Request::Analysed { serial, bpm, key } => self.analysed(serial, bpm, key),
+            Request::AudioHash(serial, h) => self.audio_hash(serial, h),
+            Request::Waveform(serial, w) => self.waveform(serial, &w),
+            Request::Analysis(serial, fresh) => self.analysis(serial, fresh),
         };
-        // A request for the current track while there is none is dropped unreported.
+        // A request for a track that is not open is dropped unreported.
         if handled {
             self.report();
         }
@@ -442,22 +447,31 @@ impl<'a> Worker<'a> {
         self.mark_dirty();
     }
 
-    /// The current track's analysed BPM and key, for the tag cache; false without one.
-    fn analysed(&mut self, bpm: Option<f64>, key: Option<String>) -> bool {
-        let (Some(loc), Some(cur)) = (self.loc.as_mut(), &self.current) else {
+    /// The track open under `serial`, and the library; `None` if either is missing.
+    fn track(&mut self, serial: u64) -> Option<(&mut Located, &mut Open)> {
+        let loc = self.loc.as_mut()?;
+        let open = self.open.iter_mut().find(|o| o.serial == serial)?;
+        Some((loc, open))
+    }
+
+    /// An open track's analysed BPM and key, for the tag cache; false if it is not open.
+    fn analysed(&mut self, serial: u64, bpm: Option<f64>, key: Option<String>) -> bool {
+        let replies = self.replies;
+        let Some((loc, cur)) = self.track(serial) else {
             return false;
         };
-        if store_bpm_key(&mut loc.lib, cur.track, bpm, key, &sayer(self.replies)) {
+        if store_bpm_key(&mut loc.lib, cur.track, bpm, key, &sayer(replies)) {
             self.listing_stale = true;
             self.mark_dirty();
         }
         true
     }
 
-    /// The current track's audio hash; a track with the same audio takes its place.
-    fn audio_hash(&mut self, h: AudioHash) -> bool {
-        let say = sayer(self.replies);
-        let (Some(loc), Some(cur)) = (self.loc.as_mut(), self.current.as_mut()) else {
+    /// An open track's audio hash; a track with the same audio takes its place.
+    fn audio_hash(&mut self, serial: u64, h: AudioHash) -> bool {
+        let replies = self.replies;
+        let say = sayer(replies);
+        let Some((loc, cur)) = self.track(serial) else {
             return false;
         };
         let survivor = match loc.lib.set_audio_hash(cur.track, h) {
@@ -472,31 +486,33 @@ impl<'a> Worker<'a> {
                 "library: same audio as track {survivor}: merged into it"
             ));
             cur.track = survivor;
-            self.listing_stale = true;
-            let _ = self.replies.send(Reply::Loaded(Box::new(loaded(
+            let _ = replies.send(Reply::Loaded(Box::new(loaded(
                 &mut loc.lib,
                 cur.track,
                 cur.serial,
             ))));
+            self.listing_stale = true;
         }
         self.mark_dirty();
         true
     }
 
-    fn waveform(&mut self, w: &Waveform) -> bool {
-        let (Some(loc), Some(cur)) = (self.loc.as_mut(), &self.current) else {
+    fn waveform(&mut self, serial: u64, w: &Waveform) -> bool {
+        let replies = self.replies;
+        let Some((loc, cur)) = self.track(serial) else {
             return false;
         };
-        store_waveform(&mut loc.lib, cur.track, w, &sayer(self.replies));
+        store_waveform(&mut loc.lib, cur.track, w, &sayer(replies));
         loc.lib.flush();
         true
     }
 
-    fn analysis(&mut self, fresh: Vec<FreshAnalysis>) -> bool {
-        let (Some(loc), Some(cur)) = (self.loc.as_mut(), &self.current) else {
+    fn analysis(&mut self, serial: u64, fresh: Vec<FreshAnalysis>) -> bool {
+        let replies = self.replies;
+        let Some((loc, cur)) = self.track(serial) else {
             return false;
         };
-        store_analysis(&mut loc.lib, cur.track, fresh, &sayer(self.replies));
+        store_analysis(&mut loc.lib, cur.track, fresh, &sayer(replies));
         loc.lib.flush();
         true
     }
