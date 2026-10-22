@@ -8,7 +8,7 @@
 //! ([`crate::persist::LibraryWorker::store`]).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -30,6 +30,69 @@ pub enum BatchEvent {
     Finished {
         stopped: bool,
     },
+}
+
+/// How far ANALYZE ALL is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchProgress {
+    /// Files finished (analysed or failed) of `total`.
+    pub done: usize,
+    pub total: usize,
+    pub failed: usize,
+    /// The file under way.
+    pub current: Option<String>,
+    /// Asked to stop; finishing the file under way.
+    pub stopping: bool,
+}
+
+impl BatchProgress {
+    /// Count `event` in, with a line to show where it is worth one; a finished file's
+    /// result comes back to be stored.
+    pub(crate) fn note(
+        &mut self,
+        event: BatchEvent,
+        lines: &mut Vec<String>,
+    ) -> Option<Box<BatchResult>> {
+        match event {
+            BatchEvent::Started(_, file) => self.current = Some(file_name(&file)),
+            BatchEvent::Done(r) => {
+                self.done += 1;
+                lines.push(format!(
+                    "analyze all {}/{}: {}: {}, key {}",
+                    self.done,
+                    self.total,
+                    file_name(&r.file),
+                    r.bpm.map_or("no tempo".into(), |b| format!("{b:.2} BPM")),
+                    r.key.as_deref().unwrap_or("?"),
+                ));
+                return Some(r);
+            }
+            BatchEvent::Failed(file, e) => {
+                self.done += 1;
+                self.failed += 1;
+                lines.push(format!("analyze all: {}: {e}", file_name(&file)));
+            }
+            BatchEvent::Finished { stopped } => {
+                lines.push(format!(
+                    "analyze all {}: {} of {} done{}",
+                    if stopped { "stopped" } else { "finished" },
+                    self.done - self.failed,
+                    self.total,
+                    if self.failed > 0 {
+                        format!(", {} failed", self.failed)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+        }
+        None
+    }
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 /// A running batch job.
@@ -109,14 +172,14 @@ impl Drop for Batch {
 
 /// Decode `file` once and compute everything the library stores for it.
 fn analyse_file(
-    file: &std::path::Path,
+    file: &Path,
     stop: &engine_media::Cancel,
     settings: engine_analysis::Settings,
     engine_rate: u32,
 ) -> Result<BatchResult, String> {
     let info = engine_media::probe(file).map_err(|e| e.to_string())?;
     let mut audio = Some(engine_analysis::load_until(file, stop).map_err(|e| e.to_string())?);
-    let analysed = crate::analyze_with(
+    let analysed = crate::analysis::analyze_with(
         file,
         &mut audio,
         stop,

@@ -5,7 +5,7 @@
 //! per second. Cues, hot cues, the waveform and analysis persist in the library (`--library`).
 
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -128,29 +128,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut player = Player::open_with(&backend, &args.request, &file, args.options)?;
     let format = player.format;
-    let loaded = player.loaded().expect("just loaded");
-    let (info, source) = (loaded.info.clone(), Arc::clone(&loaded.source));
-    println!(
-        "{} output: {} Hz, {} channels, buffer {}",
-        backend.host_name(),
-        format.sample_rate,
-        format.channels,
-        args.request
-            .buffer_frames
-            .map_or("default".to_string(), |n| format!("{n} frames")),
-    );
-    println!(
-        "loading {} ({} Hz, {} ch{})",
-        file.display(),
-        info.file_sample_rate,
-        info.file_channels,
-        if info.file_sample_rate == format.sample_rate {
-            ""
-        } else {
-            ", resampling"
-        },
-    );
-    println!("{}", player.device_name());
+    let source = Arc::clone(&player.loaded().expect("just loaded").source);
+    print_start(&backend, &args.request, &player, &file);
 
     let interactive = std::io::stdin().is_terminal() && terminal::enable_raw_mode().is_ok();
     let _raw = interactive.then_some(RawModeGuard);
@@ -172,22 +151,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             if event::poll(Duration::from_millis(20))?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
+                && !act(&mut player, controls.command(key))
             {
-                match controls.command(key) {
-                    Action::Quit => break,
-                    Action::Memory => out(&player.memory()),
-                    Action::Send(cmd) => {
-                        if !player.send(cmd) {
-                            out("command ring full, key dropped");
-                        }
-                    }
-                    Action::Tap(press, release) => {
-                        if !player.send(press) || !player.send(release) {
-                            out("command ring full, key dropped");
-                        }
-                    }
-                    Action::None => {}
-                }
+                break;
             }
         } else {
             std::thread::sleep(Duration::from_millis(20));
@@ -210,6 +176,53 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The output format and the track being loaded.
+fn print_start(backend: &CpalBackend, request: &StreamRequest, player: &Player, file: &Path) {
+    let format = player.format;
+    let info = &player.loaded().expect("just loaded").info;
+    println!(
+        "{} output: {} Hz, {} channels, buffer {}",
+        backend.host_name(),
+        format.sample_rate,
+        format.channels,
+        request
+            .buffer_frames
+            .map_or("default".to_string(), |n| format!("{n} frames")),
+    );
+    println!(
+        "loading {} ({} Hz, {} ch{})",
+        file.display(),
+        info.file_sample_rate,
+        info.file_channels,
+        if info.file_sample_rate == format.sample_rate {
+            ""
+        } else {
+            ", resampling"
+        },
+    );
+    println!("{}", player.device_name());
+}
+
+/// Carry out a key's action; false to quit.
+fn act(player: &mut Player, action: Action) -> bool {
+    match action {
+        Action::Quit => return false,
+        Action::Memory => out(&player.memory()),
+        Action::Send(cmd) => {
+            if !player.send(cmd) {
+                out("command ring full, key dropped");
+            }
+        }
+        Action::Tap(press, release) => {
+            if !player.send(press) || !player.send(release) {
+                out("command ring full, key dropped");
+            }
+        }
+        Action::None => {}
+    }
+    true
+}
+
 /// Print a line that also works in raw mode.
 fn out(line: &str) {
     let mut stdout = std::io::stdout().lock();
@@ -217,76 +230,13 @@ fn out(line: &str) {
     let _ = stdout.flush();
 }
 
+/// The once-a-second status line.
 fn report(state: &DeckState, meter: &LoadMeter, source: &Source, rate: u32) {
     let load = meter.take();
     let sr = f64::from(rate);
-    let flags = [
-        if state.playing.load(Ordering::Relaxed) {
-            "PLAY"
-        } else {
-            "PAUSE"
-        },
-        if state.reverse.load(Ordering::Relaxed) {
-            "REV"
-        } else {
-            "FWD"
-        },
-        match (
-            state.slip_enabled.load(Ordering::Relaxed),
-            state.slip_active.load(Ordering::Relaxed),
-        ) {
-            (false, _) => "slip off",
-            (true, false) => "slip on",
-            (true, true) => "SLIPPING",
-        },
-        match (
-            state.keylock_enabled.load(Ordering::Relaxed),
-            state.stretching.load(Ordering::Relaxed),
-        ) {
-            (false, _) => "keylock off",
-            (true, true) => "keylock on",
-            // Paused, reversing or at a rate the stretcher does not play: resampler.
-            (true, false) => "keylock bypassed",
-        },
-    ];
-    let track_bpm = state.track_bpm.load();
-    let tempo = if track_bpm > 0.0 {
-        let beat = state.beat.load();
-        format!(
-            "  {:.2} BPM  bar {:.0}.{}",
-            track_bpm * state.rate.load(),
-            (beat / 4.0).floor() + 1.0,
-            beat.rem_euclid(4.0).floor() as u32 + 1
-        )
-    } else {
-        String::new()
-    };
-    let hot = state.hot_cues.load(Ordering::Relaxed);
-    let pads: String = (0..8)
-        .map(|i| {
-            if hot & (1 << i) != 0 {
-                (b'A' + i) as char
-            } else {
-                '.'
-            }
-        })
-        .take(4)
-        .collect();
-    let extras = format!(
-        "  Q{}  {}  hot {pads}",
-        match state.quantize.load() {
-            q if q > 0.0 => format!(" {q}"),
-            _ => " off".into(),
-        },
-        if state.looping.load(Ordering::Relaxed) {
-            format!(
-                "LOOP {}",
-                clock((state.loop_end.load() - state.loop_start.load()) / sr)
-            )
-        } else {
-            "no loop".into()
-        },
-    );
+    let flags = flags(state);
+    let tempo = tempo(state);
+    let extras = extras(state, sr);
     let mut line = format!(
         "{} / {}  rate {:+.2} %{tempo}  {} {} {} {}{extras}  load avg {:4.1} % peak {:4.1} % ({} cb)",
         clock(state.position.load() / sr),
@@ -315,6 +265,85 @@ fn report(state: &DeckState, meter: &LoadMeter, source: &Source, rate: u32) {
         line += &format!("  STARVED {starved} blocks");
     }
     out(&line);
+}
+
+/// Play, direction, slip and keylock.
+fn flags(state: &DeckState) -> [&'static str; 4] {
+    [
+        if state.playing.load(Ordering::Relaxed) {
+            "PLAY"
+        } else {
+            "PAUSE"
+        },
+        if state.reverse.load(Ordering::Relaxed) {
+            "REV"
+        } else {
+            "FWD"
+        },
+        match (
+            state.slip_enabled.load(Ordering::Relaxed),
+            state.slip_active.load(Ordering::Relaxed),
+        ) {
+            (false, _) => "slip off",
+            (true, false) => "slip on",
+            (true, true) => "SLIPPING",
+        },
+        match (
+            state.keylock_enabled.load(Ordering::Relaxed),
+            state.stretching.load(Ordering::Relaxed),
+        ) {
+            (false, _) => "keylock off",
+            (true, true) => "keylock on",
+            // Paused, reversing or at a rate the stretcher does not play: resampler.
+            (true, false) => "keylock bypassed",
+        },
+    ]
+}
+
+/// The tempo and bar position, once the track has a grid.
+fn tempo(state: &DeckState) -> String {
+    let track_bpm = state.track_bpm.load();
+    if track_bpm > 0.0 {
+        let beat = state.beat.load();
+        format!(
+            "  {:.2} BPM  bar {:.0}.{}",
+            track_bpm * state.rate.load(),
+            (beat / 4.0).floor() + 1.0,
+            beat.rem_euclid(4.0).floor() as u32 + 1
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Quantize, the loop and the hot cue pads.
+fn extras(state: &DeckState, sr: f64) -> String {
+    let hot = state.hot_cues.load(Ordering::Relaxed);
+    let pads: String = (0..8)
+        .map(|i| {
+            if hot & (1 << i) != 0 {
+                (b'A' + i) as char
+            } else {
+                '.'
+            }
+        })
+        .take(4)
+        .collect();
+    format!(
+        "  Q{}  {}  hot {pads}",
+        match state.quantize.load() {
+            q if q > 0.0 => format!(" {q}"),
+            _ => " off".into(),
+        },
+        if state.looping.load(Ordering::Relaxed) {
+            format!(
+                "LOOP {}",
+                clock((state.loop_end.load() - state.loop_start.load()) / sr)
+            )
+        } else {
+            "no loop".into()
+        },
+    )
 }
 
 fn clock(seconds: f64) -> String {
