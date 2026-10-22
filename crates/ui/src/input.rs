@@ -63,6 +63,18 @@ impl ControlEvent {
     }
 }
 
+/// Seconds of track one turn of the jog's plate scratches (a 33⅓ record).
+pub const SECONDS_PER_TURN: f64 = 1.8;
+
+/// A hand on the jog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Jog {
+    /// Scratching with the top plate.
+    Scratch,
+    /// Bending with the ring from the rate `base`.
+    Bend { base: f64 },
+}
+
 /// What the browse controls (knob, BACK, TAG TRACK) ask of the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nav {

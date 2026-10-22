@@ -8,12 +8,10 @@ use engine_core::{DeckCommand, HOT_CUES};
 
 use super::effects::Effect;
 use super::engine::DeckSnapshot;
-use crate::input::{Control, ControlEvent, Nav};
+use crate::input::{Control, ControlEvent, Jog, Nav, SECONDS_PER_TURN};
 
 /// Tempo fader ranges (fraction of the rate either way) and their labels; WIDE is ±100 %.
 pub const RANGES: [(f64, &str); 4] = [(0.06, "±6"), (0.10, "±10"), (0.16, "±16"), (1.0, "WIDE")];
-/// Seconds of track one turn of the plate scratches (a 33⅓ record).
-pub const SECONDS_PER_TURN: f64 = 1.8;
 /// SEARCH held: track seconds per second.
 const SEARCH_RATE: f64 = 4.0;
 /// Pitch bend per jog turn per second, and its limit (fractions of the rate).
@@ -23,15 +21,6 @@ const MAX_BEND: f64 = 0.25;
 const BEND_RELAX_S: f64 = 0.08;
 /// TAG TRACK held this long removes the track from the tag list.
 const TAG_HOLD_S: f64 = 0.6;
-
-/// A hand on the jog.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Jog {
-    /// Scratching with the top plate.
-    Scratch,
-    /// Bending with the ring from the rate `base`.
-    Bend { base: f64 },
-}
 
 /// The controls' own state: settings on the surface and what is held.
 pub struct Surface {

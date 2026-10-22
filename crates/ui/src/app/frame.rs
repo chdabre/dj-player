@@ -158,7 +158,10 @@ impl App {
         let shell = self.standin.as_ref().map(|_| render::ShellFrame {
             scene: &self.shell_scene,
             size: standin::SIZE,
-            display: standin::DISPLAY,
+            display: {
+                let d = standin::DISPLAY;
+                (d.x, d.y, d.w, d.h)
+            },
         });
         #[cfg(not(feature = "standin"))]
         let shell: Option<render::ShellFrame> = None;
