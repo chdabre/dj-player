@@ -9,7 +9,7 @@ mod rect;
 
 pub use rect::Rect;
 
-use crate::scene::{Rgba, Scene, Text};
+use crate::render::scene::{Rgba, Scene, Text};
 use crate::theme::{TextStyle, Theme};
 
 /// A touch target and where it is.

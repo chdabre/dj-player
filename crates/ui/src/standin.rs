@@ -3,7 +3,7 @@
 //! Layout from the canvas artboard "8 · Hardware stand-in" (1512×950, after the reference
 //! player's control layout).
 //!
-//! It is a separate layer (`gfx::ShellFrame`): the device screen is rendered on its own and
+//! It is a separate layer (`render::ShellFrame`): the device screen is rendered on its own and
 //! placed into [`DISPLAY`]. Everything here is behind the `standin` cargo feature; a device
 //! build leaves it out, and the RP2040 control surface sends the same deck commands instead.
 //!
@@ -21,7 +21,7 @@
 use engine_core::{DeckCommand, HOT_CUES};
 
 use crate::browse::Nav;
-use crate::scene::{Align, Rgba, Scene, Text, Weight};
+use crate::render::scene::{Align, Rgba, Scene, Text, Weight};
 
 /// The shell's design size.
 pub const SIZE: (f32, f32) = (1512.0, 950.0);

@@ -25,11 +25,10 @@
 
 mod browse;
 mod clock;
-mod gfx;
 mod kit;
 mod perform;
 mod playlists;
-mod scene;
+mod render;
 mod screen;
 #[cfg(feature = "standin")]
 mod standin;
@@ -58,10 +57,10 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::browse::{BrowseView, InfoView, ModalView, Nav, ROW_H, ROWS, Row, RowKind};
 use crate::clock::PlayheadClock;
-use crate::gfx::Gfx;
 use crate::kit::Rect;
 use crate::playlists::{Action, Modal, Naming};
-use crate::scene::Scene;
+use crate::render::Gfx;
+use crate::render::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
@@ -1920,13 +1919,13 @@ impl App {
         }
         let build = build_start.elapsed();
         #[cfg(feature = "standin")]
-        let shell = self.standin.as_ref().map(|_| gfx::ShellFrame {
+        let shell = self.standin.as_ref().map(|_| render::ShellFrame {
             scene: &self.shell_scene,
             size: standin::SIZE,
             display: standin::DISPLAY,
         });
         #[cfg(not(feature = "standin"))]
-        let shell: Option<gfx::ShellFrame> = None;
+        let shell: Option<render::ShellFrame> = None;
 
         let Some(gfx) = &mut self.gfx else {
             return false;
@@ -2037,7 +2036,7 @@ impl App {
         if self.standin.is_some() {
             return LogicalSize::new(standin::SIZE.0, standin::SIZE.1);
         }
-        LogicalSize::new(gfx::DESIGN_W, gfx::DESIGN_H)
+        LogicalSize::new(render::DESIGN_W, render::DESIGN_H)
     }
 }
 

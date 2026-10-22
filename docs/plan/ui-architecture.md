@@ -2,7 +2,7 @@
 
 How `crates/ui` is laid out so that new screens, dialogs and controls can be added without growing one file. It keeps what already works: immediate-mode drawing into a `Scene` once per frame, layouts that are pure functions of a view (tested for fit and overlap, screenshotted with `--screenshot`), and colours and sizes taken from the theme. What changes is where state lives, how input finds its handler, and how the drawing code is split up.
 
-**Status:** step 1 done (`kit/` with `Ui`, `HitBox`, `Rect` and the shared widgets; text styles in the theme). The rest is a proposal. The migration steps at the end are each small enough for one commit and keep the app working.
+**Status:** steps 1–2 done: `kit/` (`Ui`, `HitBox`, `Rect`, the shared widgets, text styles in the theme) and `render/` (one module per pipeline). The rest is a proposal.
 
 ## What hurts today
 
@@ -213,8 +213,8 @@ pub enum Effect {
 
 Each step is one commit and passes `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on its own. The app behaves the same after each step.
 
-1. **`Rect` and text styles.** *(Done.)* Add `kit/rect.rs` and the theme's `TextStyle`s; move the `Ui` helpers from `screen.rs` into `kit/`. Change call sites mechanically. `Ui` and `HitBox` are generic over the target type; `screen.rs` aliases them to `Target` until step 5. The scene's own primitive is now `Quad`. `scene.fill` / `rounded` still take loose coordinates (they move with the renderer in step 2), and the stand-in keeps its tuples until step 8.
-2. **Split the renderer.** `gfx.rs` + `scene.rs` → `render/`, with no change in behaviour.
+1. **`Rect` and text styles.** *(Done.)* Add `kit/rect.rs` and the theme's `TextStyle`s; move the `Ui` helpers from `screen.rs` into `kit/`. Change call sites mechanically. `Ui` and `HitBox` are generic over the target type; `screen.rs` aliases them to `Target` until step 5. The scene's own primitive is now `Quad`. `scene.fill` / `rounded` keep loose coordinates: the scene is the renderer's input, and computed coordinates read better there. The stand-in keeps its tuples until step 8.
+2. **Split the renderer.** *(Done.)* `gfx.rs` + `scene.rs` → `render/`, with no change in behaviour: `rects.rs`, `waves.rs`, `images.rs` and `text.rs` each own their pipeline, buffers and upload; `offscreen.rs` holds the stand-in's device-screen texture and screenshot readback; `mod.rs` keeps `Gfx` (surface, frame composition) and one `quad_pipeline` helper for all four pipelines.
 3. **`DeckSnapshot` and `LoadedTrack`.** Read the atomics once in `app/engine.rs`. `View` takes the snapshot, and `load()` replaces the track in one step. The duplicate `loop_beats` goes.
 4. **`Effect`.** Handlers push effects; `App` executes them. Then move `act`, `modal_push`, `named` and `type_name` out of `App` into `playlists.rs` as functions that return effects.
 5. **`Input`, `keymap.rs` and the router.** The stand-in emits `Input`; `key()` becomes a table. Add the `Layer` trait with screens as layers, and route touch through nested `Target`s.

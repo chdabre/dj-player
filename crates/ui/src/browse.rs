@@ -14,7 +14,7 @@ use std::sync::Arc;
 use engined::browse::Thumb;
 
 use crate::kit::Rect;
-use crate::scene::{Image, Rgba, Weight};
+use crate::render::scene::{Image, Rgba, Weight};
 use crate::screen::{Target, Ui, View, bottom, rail, status, tabs};
 use crate::theme::TextStyle;
 use crate::waves::OverviewCache;

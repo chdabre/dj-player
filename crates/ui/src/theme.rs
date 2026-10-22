@@ -11,7 +11,7 @@
 //! next to the colours of what the UI draws around it (grid, cue, loop, playhead), so one
 //! theme drives the screen and the waveform shader.
 
-use crate::scene::{Align, Rgba, Weight};
+use crate::render::scene::{Align, Rgba, Weight};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
@@ -438,7 +438,12 @@ mod tests {
         for (file, src) in [
             ("screen.rs", include_str!("screen.rs")),
             ("main.rs", include_str!("main.rs")),
-            ("gfx.rs", include_str!("gfx.rs")),
+            ("render/mod.rs", include_str!("render/mod.rs")),
+            ("render/rects.rs", include_str!("render/rects.rs")),
+            ("render/waves.rs", include_str!("render/waves.rs")),
+            ("render/images.rs", include_str!("render/images.rs")),
+            ("render/text.rs", include_str!("render/text.rs")),
+            ("render/offscreen.rs", include_str!("render/offscreen.rs")),
             ("perform.rs", include_str!("perform.rs")),
             ("browse.rs", include_str!("browse.rs")),
             ("kit/mod.rs", include_str!("kit/mod.rs")),

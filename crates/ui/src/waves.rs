@@ -1,6 +1,6 @@
 //! Waveform columns for the zoom and overview, built on the CPU with the waveform crate's own
 //! display logic (`waveform::display::column`), so every mode, gain and theme matches the
-//! reference renderer. The GPU only draws them (`gfx.rs`, the waveform pipeline).
+//! reference renderer. The GPU only draws them (`render/waves.rs`).
 //!
 //! **Zoom:** column `j` always covers `[j, j + 1)·s` seconds of the track (`s` = seconds per
 //! design pixel), as in `waveform::render::render_zoom`, so a column keeps its value while

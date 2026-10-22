@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::gfx::FrameTiming;
+use crate::render::FrameTiming;
 
 #[derive(Debug, Default)]
 pub struct FrameStats {

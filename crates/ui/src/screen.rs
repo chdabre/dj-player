@@ -10,7 +10,7 @@
 use engine_core::DeckGrid;
 
 use crate::kit::{self, Rect};
-use crate::scene::{Gradient, Rgba, Scene};
+use crate::render::scene::{Gradient, Rgba, Scene};
 use crate::theme::Theme;
 use crate::waves::{OverviewCache, WaveDraw, WaveSettings};
 

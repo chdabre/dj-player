@@ -12,7 +12,7 @@
 use engine_core::{BEAT_LOOPS, DeckCommand, FALLBACK_BPM, HOT_CUES};
 
 use crate::kit::Rect;
-use crate::scene::Rgba;
+use crate::render::scene::Rgba;
 use crate::screen::{
     PadMode, PerfState, Target, Ui, View, bottom, cue_column, hot_cue_color, hot_cue_letter, phase,
     rail_bottom, status, zoom,
