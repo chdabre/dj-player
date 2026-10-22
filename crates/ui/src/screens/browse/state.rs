@@ -11,7 +11,10 @@ use engined::browse::{Browser, Entered, Kind, Source};
 use engined::persist::Listing;
 
 use super::{BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, Shift, key_char};
+use winit::keyboard::{Key, NamedKey};
+
 use crate::app::effects::Effect;
+use crate::app::keymap::{self, KeyPress};
 use crate::input::Nav;
 use crate::playlists::{self, Action, Editing};
 use crate::screens::{Cx, ScreenKind, Show};
@@ -27,6 +30,18 @@ struct ListDrag {
     row: usize,
     scrolled: isize,
     moved: bool,
+}
+
+/// What has the browse screen's input, top first: the question, a name being typed, a modal,
+/// an entry being moved, the search field, or the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    AskScan,
+    Naming,
+    Modal,
+    Moving,
+    Search,
+    List,
 }
 
 #[derive(Default)]
@@ -48,6 +63,66 @@ pub struct BrowseState {
 }
 
 impl BrowseState {
+    /// What has the input now.
+    pub fn focus(&self) -> Focus {
+        if self.ask_scan {
+            Focus::AskScan
+        } else if self.editing.naming() {
+            Focus::Naming
+        } else if self.editing.modal.is_some() {
+            Focus::Modal
+        } else if self.editing.moving.is_some() {
+            Focus::Moving
+        } else if self.keyboard {
+            Focus::Search
+        } else {
+            Focus::List
+        }
+    }
+
+    /// A key of a real keyboard, before the shortcuts: true if the focus took it. The
+    /// question takes Enter (scan) and Esc; a name takes the keys, Enter names it and Esc gives
+    /// up; the search takes characters, but Enter and Esc still browse.
+    pub fn key(&mut self, key: &KeyPress, cx: &mut Cx) -> bool {
+        let esc = key.key == Key::Named(NamedKey::Escape);
+        match self.focus() {
+            Focus::AskScan => {
+                if key.pressed {
+                    match &key.key {
+                        Key::Named(NamedKey::Enter) => self.answer_scan(true, cx),
+                        Key::Named(NamedKey::Escape) => self.answer_scan(false, cx),
+                        _ => {}
+                    }
+                }
+                true
+            }
+            Focus::Naming => {
+                if key.pressed {
+                    if esc {
+                        self.editing.modal = None;
+                    }
+                    for c in keymap::typed(key) {
+                        self.type_name(c, cx);
+                    }
+                }
+                true
+            }
+            Focus::Search => {
+                let chars = keymap::typed(key);
+                if chars.is_empty() || chars == [DONE] {
+                    return false;
+                }
+                if key.pressed {
+                    for c in chars {
+                        self.type_char(c, cx);
+                    }
+                }
+                true
+            }
+            Focus::Modal | Focus::Moving | Focus::List => false,
+        }
+    }
+
     /// A touch on one of the browse screen's targets at design y `y` (BACK is the router's).
     pub fn tap(&mut self, t: BrowseTarget, y: f32, cx: &mut Cx) {
         match t {
@@ -70,7 +145,7 @@ impl BrowseState {
             BrowseTarget::AnalyzeAll => self.analyze_all(cx),
             BrowseTarget::ScanYes => self.answer_scan(true, cx),
             BrowseTarget::ScanNo => self.answer_scan(false, cx),
-            BrowseTarget::Key(i) => self.key(i, cx),
+            BrowseTarget::Key(i) => self.screen_key(i, cx),
             BrowseTarget::Row(row) => {
                 self.list_drag = Some(ListDrag {
                     y,
@@ -111,26 +186,38 @@ impl BrowseState {
         }
     }
 
-    /// The knob, BACK and TAG TRACK on the browse screen.
+    /// The knob and BACK on the browse screen, by focus.
     pub fn nav(&mut self, n: Nav, cx: &mut Cx) -> Show {
-        if let Some(m) = self.editing.modal.as_mut() {
-            match n {
-                Nav::Up => m.move_by(-1),
-                Nav::Down => m.move_by(1),
-                Nav::Push => self.modal_push(cx),
-                Nav::Back => self.editing.modal = None,
-                Nav::Tag | Nav::Untag => {}
+        match self.focus() {
+            // The knob answers: push scans, BACK does not.
+            Focus::AskScan => match n {
+                Nav::Push => self.answer_scan(true, cx),
+                Nav::Back => self.answer_scan(false, cx),
+                _ => {}
+            },
+            Focus::Naming | Focus::Modal => {
+                if let Some(m) = self.editing.modal.as_mut() {
+                    match n {
+                        Nav::Up => m.move_by(-1),
+                        Nav::Down => m.move_by(1),
+                        Nav::Push => self.modal_push(cx),
+                        Nav::Back => self.editing.modal = None,
+                        Nav::Tag | Nav::Untag => {}
+                    }
+                }
             }
-            return None;
-        }
-        if self.editing.moving.is_some() {
-            match n {
+            Focus::Moving => match n {
                 Nav::Up => self.move_entry(-1, cx),
                 Nav::Down => self.move_entry(1, cx),
                 _ => self.editing.moving = None,
-            }
-            return None;
+            },
+            Focus::Search | Focus::List => return self.list_nav(n, cx),
         }
+        None
+    }
+
+    /// The knob and BACK on the list.
+    fn list_nav(&mut self, n: Nav, cx: &mut Cx) -> Show {
         let b = cx.browser.as_deref_mut()?;
         match n {
             Nav::Tag | Nav::Untag => {}
@@ -202,7 +289,7 @@ impl BrowseState {
     }
 
     /// A key of the on-screen keyboard: into the name being typed, or the search.
-    fn key(&mut self, i: u8, cx: &mut Cx) {
+    fn screen_key(&mut self, i: u8, cx: &mut Cx) {
         let Some(c) = key_char(i) else {
             return;
         };

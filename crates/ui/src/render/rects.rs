@@ -1,7 +1,9 @@
 //! Rounded rectangles: an instanced quad with a signed-distance fragment shader, for fills,
 //! borders and vertical gradients.
 
-use super::scene::{Gradient, Scene};
+use std::ops::Range;
+
+use super::scene::{Gradient, LAYERS, Scene};
 use super::{color, quad_pipeline};
 
 const SHADER: &str = r#"
@@ -127,7 +129,9 @@ pub(super) struct RectBatch {
     capacity: u64,
     bytes: Vec<u8>,
     /// Instances written by the last [`RectBatch::upload`].
-    pub(super) count: u64,
+    count: u64,
+    /// Each plane's instances among them.
+    pub(super) planes: [Range<u32>; LAYERS],
 }
 
 impl RectBatch {
@@ -138,10 +142,12 @@ impl RectBatch {
             capacity,
             bytes: Vec::new(),
             count: 0,
+            planes: Default::default(),
         }
     }
 
-    /// Write `scene`'s rectangles (colours converted for an sRGB target if `srgb`).
+    /// Write `scene`'s rectangles, plane after plane (colours converted for an sRGB target if
+    /// `srgb`).
     pub(super) fn upload(
         &mut self,
         device: &wgpu::Device,
@@ -150,7 +156,13 @@ impl RectBatch {
         srgb: bool,
     ) {
         self.bytes.clear();
-        for r in &scene.rects {
+        let mut start = 0;
+        for (plane, range) in scene.planes.iter().zip(&mut self.planes) {
+            let end = start + plane.rects.len() as u32;
+            *range = start..end;
+            start = end;
+        }
+        for r in scene.planes.iter().flat_map(|p| &p.rects) {
             let fill = color(srgb, r.fill);
             let stroke = color(srgb, r.stroke);
             let (kind, fill2) = match r.gradient {
@@ -167,7 +179,7 @@ impl RectBatch {
                 self.bytes.extend_from_slice(&v.to_ne_bytes());
             }
         }
-        self.count = scene.rects.len() as u64;
+        self.count = u64::from(start);
         if self.count > self.capacity {
             self.capacity = self.count.next_power_of_two();
             self.buffer = buffer(device, self.capacity);

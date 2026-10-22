@@ -3,9 +3,10 @@
 //! and dropped after a while unused.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use super::quad_pipeline;
-use super::scene::Scene;
+use super::scene::{Image, LAYERS, Scene};
 
 const SHADER: &str = r#"
 struct View { xform: vec4<f32>, size: vec4<f32> };
@@ -133,7 +134,7 @@ impl Images {
     }
 
     /// Make textures for the scene's pictures not on the GPU yet, drop those unused for a
-    /// while, and write the instances; returns how many pictures to draw.
+    /// while, and write the instances, plane after plane; returns each plane's instances.
     pub(super) fn upload(
         &mut self,
         device: &wgpu::Device,
@@ -141,12 +142,19 @@ impl Images {
         sampler: &wgpu::Sampler,
         srgb: bool,
         scene: &Scene,
-    ) -> usize {
+    ) -> [Range<u32>; LAYERS] {
         self.frame_no += 1;
         let now = self.frame_no;
-        let n = scene.images.len().min(MAX_IMAGES);
+        let mut planes: [Range<u32>; LAYERS] = Default::default();
+        let mut start = 0;
+        for (plane, range) in scene.planes.iter().zip(&mut planes) {
+            let end = (start + plane.images.len() as u32).min(MAX_IMAGES as u32);
+            *range = start..end;
+            start = end;
+        }
+        let n = start as usize;
         let mut bytes: Vec<u8> = Vec::with_capacity(n * INSTANCE_BYTES as usize);
-        for img in scene.images.iter().take(n) {
+        for img in pictures(scene).take(n) {
             let pic = &img.picture;
             if let Some(t) = self.textures.get_mut(&pic.id) {
                 t.used = now;
@@ -212,25 +220,34 @@ impl Images {
         if n > 0 {
             queue.write_buffer(&self.instances, 0, &bytes);
         }
-        n
+        planes
     }
 
-    /// Draw the first `n` of `scene`'s pictures (as uploaded).
+    /// Draw `scene`'s pictures `range` (as uploaded).
     pub(super) fn draw(
         &self,
         pass: &mut wgpu::RenderPass,
         view_bind: &wgpu::BindGroup,
         scene: &Scene,
-        n: usize,
+        range: Range<u32>,
     ) {
+        if range.is_empty() {
+            return;
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, view_bind, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
-        for (k, img) in scene.images.iter().take(n).enumerate() {
+        let (skip, take) = (range.start as usize, range.len());
+        for (k, img) in pictures(scene).enumerate().skip(skip).take(take) {
             if let Some(t) = self.textures.get(&img.picture.id) {
                 pass.set_bind_group(1, &t.bind, &[]);
                 pass.draw(0..4, k as u32..k as u32 + 1);
             }
         }
     }
+}
+
+/// Every picture of the scene, plane after plane.
+fn pictures(scene: &Scene) -> impl Iterator<Item = &Image> {
+    scene.planes.iter().flat_map(|p| &p.images)
 }

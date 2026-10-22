@@ -38,7 +38,7 @@ pub(super) fn info_panel(ui: &mut Ui, i: &InfoView) {
     let (ax, ay) = (113.0, 111.0);
     let side = 384.0 - ay;
     match &i.art {
-        Some(art) => ui.scene.images.push(Image {
+        Some(art) => ui.scene.image(Image {
             picture: Arc::clone(art),
             x: ax,
             y: ay,
@@ -182,7 +182,7 @@ pub(super) fn side_panel(ui: &mut Ui, i: &InfoView) {
     let side = 104.0;
     let ay = LIST_Y + 8.0;
     match &i.art {
-        Some(art) => ui.scene.images.push(Image {
+        Some(art) => ui.scene.image(Image {
             picture: Arc::clone(art),
             x: x0,
             y: ay,

@@ -29,8 +29,7 @@ impl Rect {
         x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
     }
 
-    /// The two share some area (touching edges don't count). The layout tests check this.
-    #[cfg(test)]
+    /// The two share some area (touching edges don't count).
     pub fn overlaps(self, o: Rect) -> bool {
         self.x < o.right() && o.x < self.right() && self.y < o.bottom() && o.y < self.bottom()
     }

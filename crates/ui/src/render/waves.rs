@@ -5,7 +5,7 @@
 //! column's segments in sRGB values, as the CPU reference does.
 
 use super::quad_pipeline;
-use super::scene::Scene;
+use super::scene::{Layer, Scene};
 
 const SHADER: &str = r#"
 struct View { xform: vec4<f32>, size: vec4<f32> };  // size.z: 1 = sRGB surface
@@ -184,12 +184,13 @@ impl Waves {
     /// Write the scene's waveform columns into the column texture and their instances;
     /// returns how many waveforms to draw.
     pub(super) fn upload(&mut self, queue: &wgpu::Queue, scene: &Scene) -> usize {
-        if scene.waves.len() > MAX_WAVES {
+        let all = &scene.planes[Layer::Base as usize].waves;
+        if all.len() > MAX_WAVES {
             eprintln!("only {MAX_WAVES} waveforms per frame; dropping the rest");
         }
-        let waves = scene.waves.len().min(MAX_WAVES);
+        let waves = all.len().min(MAX_WAVES);
         self.bytes.clear();
-        for (k, (_, wave)) in scene.waves.iter().take(waves).enumerate() {
+        for (k, (_, wave)) in all.iter().take(waves).enumerate() {
             let n = wave.columns.len().min(COLUMNS as usize);
             let row = k as u32 * ROWS;
             let align = match wave.align {

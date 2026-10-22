@@ -59,6 +59,8 @@ pub enum ScreenKind {
 
 /// A touch target on the device screen.
 pub type HitBox = kit::HitBox<Target>;
+/// The device screen's touch targets.
+pub type Hits = kit::Hits<Target>;
 
 /// Everything the screen shows: the deck as of this frame, and the UI's own state.
 pub struct View<'a> {
@@ -281,36 +283,26 @@ impl Screens {
 }
 
 /// Lay out the screen into `scene`; returns the touch targets.
-pub fn build(
-    view: &View,
-    theme: &Theme,
-    overview: &mut OverviewCache,
-    scene: &mut Scene,
-) -> Vec<HitBox> {
+pub fn build(view: &View, theme: &Theme, overview: &mut OverviewCache, scene: &mut Scene) -> Hits {
     scene.clear();
     scene.background = theme.color.background;
-    let mut ui = Ui {
-        t: theme,
-        scene,
-        hits: Vec::new(),
-        pressed: view.pressed,
-    };
+    let mut ui = Ui::new(theme, scene, view.pressed);
 
     if view.screen == ScreenKind::Performance {
         perform::build(&mut ui, view, overview);
         debug_line(&mut ui, view);
-        return ui.hits;
+        return ui.into_hits();
     }
     if matches!(view.screen, ScreenKind::Browse | ScreenKind::Info)
         && let Some(b) = view.browse
     {
         // No timing overlay here: it would cover the list.
         browse::build(&mut ui, view, b, overview);
-        return ui.hits;
+        return ui.into_hits();
     }
     main::build(&mut ui, view, overview);
     debug_line(&mut ui, view);
-    ui.hits
+    ui.into_hits()
 }
 
 /// The frame timing overlay, if on.
@@ -514,14 +506,16 @@ mod tests {
                 &mut OverviewCache::default(),
                 &mut scene,
             );
-            for r in &scene.rects {
+            for r in scene.rects() {
                 assert!(
                     r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
                     "{r:?}"
                 );
             }
-            for (i, a) in hits.iter().enumerate() {
-                for c in &hits[i + 1..] {
+            // What can be touched never overlaps (a modal's scrim blocks what is under it).
+            let reachable: Vec<_> = hits.iter().filter(|h| !hits.blocked(h)).collect();
+            for (i, a) in reachable.iter().enumerate() {
+                for c in &reachable[i + 1..] {
                     let overlap = a.rect.overlaps(c.rect);
                     assert!(!overlap, "{:?} overlaps {:?}", a.target, c.target);
                 }
@@ -539,13 +533,23 @@ mod tests {
                 );
             }
             let has = |t: Target| hits.iter().any(|h| h.target == t);
-            let rows = hits
+            let rows: Vec<_> = hits
                 .iter()
                 .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::Row(_))))
-                .count();
+                .collect();
             let listing = b.info.is_none();
-            let covered = b.ask_scan || b.modal.is_some() || !listing;
-            assert_eq!(rows, if covered { 0 } else { ROWS });
+            assert_eq!(rows.len(), if listing { ROWS } else { 0 });
+            // Under a modal or the question the rows stay, dimmed, and take no touch.
+            let covered = b.ask_scan || b.modal.is_some();
+            assert!(rows.iter().all(|h| hits.blocked(h) == covered));
+            if covered {
+                let mid = (500.0, 120.0);
+                let found = hits.find(mid.0, mid.1).map(|h| h.target);
+                assert!(
+                    !matches!(found, Some(Target::Browse(BrowseTarget::Row(_)))),
+                    "{found:?}"
+                );
+            }
             if let Some(m) = &b.modal {
                 // Inside the list area, clear of the status band.
                 for h in hits
@@ -563,7 +567,7 @@ mod tests {
                 assert!(hits.iter().any(|h| h.target == sel));
             }
             if let Some(h) = &b.header_override {
-                assert!(scene.texts.iter().any(|t| &t.text == h));
+                assert!(scene.texts().any(|t| &t.text == h));
             }
             assert_eq!(
                 has(Target::Browse(BrowseTarget::Back)),
@@ -580,7 +584,7 @@ mod tests {
                 && (b.unanalysed > 0 || b.analyzing.is_some());
             assert_eq!(has(Target::Browse(BrowseTarget::AnalyzeAll)), analyze);
             if b.analyzing.is_some() {
-                assert!(scene.texts.iter().any(|t| t.text == "ANALYZING 3 / 12"));
+                assert!(scene.texts().any(|t| t.text == "ANALYZING 3 / 12"));
             }
             let keys = hits
                 .iter()
@@ -601,8 +605,7 @@ mod tests {
             assert!(hits.iter().any(|h| h.target == tab));
             // The title column's divider: only with tracks (or beside the info panel).
             let divider = scene
-                .rects
-                .iter()
+                .rects()
                 .any(|r| r.x == 559.0 && r.y == 103.0 && r.w == 1.0);
             if b.info.is_none() && !b.ask_scan {
                 assert_eq!(divider, b.has_tracks || b.side.is_some());
@@ -615,26 +618,24 @@ mod tests {
                 {
                     assert!(h.rect.right() <= 560.0, "{h:?}");
                 }
-                assert!(!scene.texts.iter().any(|t| t.text == "128.0   8A   5:12"));
-                assert!(scene.texts.iter().any(|t| t.text == "★★★☆☆"));
-                assert!(scene.texts.iter().any(|t| t.text == "uk garage"));
+                assert!(!scene.texts().any(|t| t.text == "128.0   8A   5:12"));
+                assert!(scene.texts().any(|t| t.text == "★★★☆☆"));
+                assert!(scene.texts().any(|t| t.text == "uk garage"));
             }
             if let Some(info) = &b.info {
-                let stars = scene.texts.iter().any(|t| t.text == "★★★☆☆");
+                let stars = scene.texts().any(|t| t.text == "★★★☆☆");
                 assert!(stars, "the rating shows as stars");
                 let title = &info.fields[0].1;
                 assert!(
                     scene
-                        .texts
-                        .iter()
+                        .texts()
                         .any(|t| &t.text == title && t.max_width.is_some())
                 );
             }
             // Row text is ellipsized to its column.
             assert!(
                 scene
-                    .texts
-                    .iter()
+                    .texts()
                     .filter(|t| t.text.starts_with("A title"))
                     .all(|t| t.max_width.is_some())
             );
@@ -653,7 +654,7 @@ mod tests {
             &mut OverviewCache::default(),
             &mut scene,
         );
-        for r in &scene.rects {
+        for r in scene.rects() {
             assert!(
                 r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
                 "{r:?}"
@@ -710,7 +711,7 @@ mod tests {
                 &mut OverviewCache::default(),
                 &mut scene,
             );
-            for r in &scene.rects {
+            for r in scene.rects() {
                 assert!(
                     r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.5 && r.y + r.h <= 600.0,
                     "{perf:?}: {r:?}"
@@ -756,7 +757,7 @@ mod tests {
             &mut OverviewCache::default(),
             &mut scene,
         );
-        assert!(scene.texts.iter().any(|t| t.text == "--.-"));
+        assert!(scene.texts().any(|t| t.text == "--.-"));
     }
 
     // ----- Input: what taps, drags and the browse controls do -----
@@ -781,7 +782,11 @@ mod tests {
     }
 
     fn hit(target: Target, rect: Rect) -> HitBox {
-        HitBox { target, rect }
+        HitBox {
+            target,
+            rect,
+            layer: crate::render::scene::Layer::Base,
+        }
     }
 
     fn said(fx: &[Effect]) -> Vec<String> {
@@ -935,6 +940,60 @@ mod tests {
             said(&fx),
             [format!("{:?}", Effect::Load(dir.join("03.mp3")))]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key(k: winit::keyboard::Key) -> crate::app::keymap::KeyPress {
+        crate::app::keymap::KeyPress {
+            key: k,
+            code: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA),
+            pressed: true,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn the_question_has_the_focus_the_knob_answers_it() {
+        use crate::screens::browse::Focus;
+        let d = deck(None);
+        let (mut b, dir) = stick("question");
+        let mut fx = Vec::new();
+        let mut s = Screens {
+            screen: ScreenKind::Browse,
+            ..Screens::default()
+        };
+        s.browse.ask_scan = true;
+        assert_eq!(s.browse.focus(), Focus::AskScan);
+        // Turning does not move the list under it; a push scans.
+        s.nav(Nav::Down, &mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(b.level().cursor, 0);
+        s.nav(Nav::Push, &mut cx(&d, Some(&mut b), &mut fx));
+        assert!(!s.browse.ask_scan);
+        assert_eq!(said(&fx), [format!("{:?}", Effect::Scan)]);
+        assert_eq!(b.source(), engined::browse::Source::Library);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_search_field_types_but_enter_and_esc_still_browse() {
+        use crate::screens::browse::Focus;
+        use winit::keyboard::{Key, NamedKey, SmolStr};
+        let d = deck(None);
+        let (mut b, dir) = stick("search");
+        let mut fx = Vec::new();
+        let mut s = Screens::default();
+        s.search(&mut cx(&d, Some(&mut b), &mut fx));
+        assert_eq!(
+            (s.screen, s.browse.focus()),
+            (ScreenKind::Browse, Focus::Search)
+        );
+        let c = key(Key::Character(SmolStr::new("c")));
+        assert!(s.browse.key(&c, &mut cx(&d, Some(&mut b), &mut fx)));
+        assert_eq!(b.search_query(), Some("c"), "c types; it does not cue");
+        for k in [Key::Named(NamedKey::Enter), Key::Named(NamedKey::Escape)] {
+            assert!(!s.browse.key(&key(k), &mut cx(&d, Some(&mut b), &mut fx)));
+        }
+        assert!(fx.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

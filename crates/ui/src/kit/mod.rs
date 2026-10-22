@@ -4,19 +4,26 @@
 //!
 //! Drawing is immediate: a screen calls widgets each frame, and each widget adds its shapes to
 //! the [`Scene`] and its touch target to [`Ui::hits`]. `T` is the caller's target type.
+//!
+//! **Layers.** What is drawn in [`Ui::on`]`(Layer::Overlay, …)` covers the base layer, text
+//! included, and its touch targets come first. A [`Ui::scrim`] (or [`Ui::block`]) stops touches
+//! from reaching the layers under it, so a modal needs no help from what it covers.
 
 mod rect;
 
 pub use rect::Rect;
 
-use crate::render::scene::{Rgba, Scene, Text};
+use std::ops::{Deref, DerefMut};
+
+use crate::render::scene::{Layer, Rgba, Scene, Text};
 use crate::theme::{TextStyle, Theme};
 
-/// A touch target and where it is.
+/// A touch target, where it is, and the layer it was drawn on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HitBox<T> {
     pub target: T,
     pub rect: Rect,
+    pub layer: Layer,
 }
 
 impl<T> HitBox<T> {
@@ -25,13 +32,84 @@ impl<T> HitBox<T> {
     }
 }
 
+/// One frame's touch targets, in drawing order, and the areas that keep touches from the
+/// layers under them.
+#[derive(Debug, Clone)]
+pub struct Hits<T> {
+    boxes: Vec<HitBox<T>>,
+    blocks: Vec<(Rect, Layer)>,
+}
+
+impl<T> Default for Hits<T> {
+    fn default() -> Self {
+        Self {
+            boxes: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+}
+
+impl<T: Copy> Hits<T> {
+    /// What a touch at (`x`, `y`) lands on: the target on the highest layer there that no
+    /// block above it covers (the first drawn, among one layer's).
+    pub fn find(&self, x: f32, y: f32) -> Option<HitBox<T>> {
+        self.boxes
+            .iter()
+            .filter(|h| h.contains(x, y) && !self.blocked(h))
+            .fold(None, |best: Option<&HitBox<T>>, h| match best {
+                Some(b) if b.layer >= h.layer => Some(b),
+                _ => Some(h),
+            })
+            .copied()
+    }
+
+    /// `h` sits under a block of a higher layer (everywhere a touch would reach it, it is
+    /// covered: blocks are at least as big as what they cover, in practice).
+    pub fn blocked(&self, h: &HitBox<T>) -> bool {
+        self.blocks
+            .iter()
+            .any(|(r, layer)| *layer > h.layer && r.overlaps(h.rect))
+    }
+}
+
+impl<T> Deref for Hits<T> {
+    type Target = Vec<HitBox<T>>;
+    fn deref(&self) -> &Self::Target {
+        &self.boxes
+    }
+}
+
+impl<T> DerefMut for Hits<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.boxes
+    }
+}
+
 /// One frame's drawing: the theme to draw with, the scene to fill, the touch targets so far,
 /// and the target the finger is on (drawn pressed).
 pub struct Ui<'s, T> {
     pub t: &'s Theme,
     pub scene: &'s mut Scene,
-    pub hits: Vec<HitBox<T>>,
+    pub hits: Hits<T>,
     pub pressed: Option<T>,
+    layer: Layer,
+}
+
+impl<'s, T> Ui<'s, T> {
+    pub fn new(t: &'s Theme, scene: &'s mut Scene, pressed: Option<T>) -> Self {
+        Self {
+            t,
+            scene,
+            hits: Hits::default(),
+            pressed,
+            layer: Layer::Base,
+        }
+    }
+
+    /// The touch targets drawn.
+    pub fn into_hits(self) -> Hits<T> {
+        self.hits
+    }
 }
 
 impl<T: Copy + PartialEq> Ui<'_, T> {
@@ -73,7 +151,33 @@ impl<T: Copy + PartialEq> Ui<'_, T> {
 
     /// `target` can be touched in `r`.
     pub fn hit(&mut self, target: T, r: Rect) {
-        self.hits.push(HitBox { target, rect: r });
+        let layer = self.layer;
+        self.hits.push(HitBox {
+            target,
+            rect: r,
+            layer,
+        });
+    }
+
+    /// Draw `f` on `layer`: over the base layer, text included, and touched first.
+    pub fn on(&mut self, layer: Layer, f: impl FnOnce(&mut Self)) {
+        let (scene_was, was) = (self.scene.set_layer(layer), self.layer);
+        self.layer = layer;
+        f(self);
+        self.layer = was;
+        self.scene.set_layer(scene_was);
+    }
+
+    /// Touches in `r` stop at this layer: nothing under it there can be touched.
+    pub fn block(&mut self, r: Rect) {
+        self.hits.blocks.push((r, self.layer));
+    }
+
+    /// Dim `r` with the theme's overlay colour and [`Ui::block`] it: what is under a modal.
+    pub fn scrim(&mut self, r: Rect) {
+        let t = self.t;
+        self.scene.fill(r.x, r.y, r.w, r.h, t.color.overlay);
+        self.block(r);
     }
 
     /// `.b`: a touch button with an optional second line.
@@ -144,5 +248,36 @@ impl<T: Copy + PartialEq> Ui<'_, T> {
         self.scene.fill(x, mid, side, 1.0, t.color.rule);
         self.scene.fill(x + w - side, mid, side, 1.0, t.color.rule);
         self.text(label, x + w * 0.5, y - 1.0, t.text.label.center());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touches_find_the_top_layer_and_scrims_block_what_is_under_them() {
+        let theme = Theme::default();
+        let mut scene = Scene::default();
+        let mut ui = Ui::new(&theme, &mut scene, None);
+        ui.hit('a', Rect::new(0.0, 0.0, 100.0, 100.0));
+        ui.hit('b', Rect::new(0.0, 200.0, 100.0, 100.0));
+        ui.on(Layer::Overlay, |ui| {
+            ui.scrim(Rect::new(0.0, 0.0, 100.0, 150.0));
+            ui.hit('m', Rect::new(10.0, 10.0, 20.0, 20.0));
+        });
+        let hits = ui.into_hits();
+        let at = |x, y| hits.find(x, y).map(|h| h.target);
+        assert_eq!(at(15.0, 15.0), Some('m'), "the overlay's target first");
+        assert_eq!(at(80.0, 80.0), None, "under the scrim, nothing");
+        assert_eq!(
+            at(50.0, 250.0),
+            Some('b'),
+            "beside the scrim, the base layer"
+        );
+        assert!(hits.blocked(&hits[0]) && !hits.blocked(&hits[1]));
+        // The scrim and the overlay's drawing are on the overlay plane.
+        assert_eq!(scene.planes[Layer::Overlay as usize].rects.len(), 1);
+        assert!(scene.planes[Layer::Base as usize].rects.is_empty());
     }
 }

@@ -6,6 +6,8 @@ use super::*;
 pub(super) const HEADER: Rect = Rect::new(113.0, 69.0, 903.0, 31.0);
 
 pub(super) const LIST_Y: f32 = 103.0;
+/// The rows' area, dimmed under a modal.
+pub(super) const LIST_AREA: Rect = Rect::new(107.0, LIST_Y, 913.0, ROW_H * ROWS as f32);
 
 pub(super) const JACKET_X: f32 = 113.0;
 
@@ -175,13 +177,7 @@ pub(super) fn list(ui: &mut Ui, b: &BrowseView) {
             t.text.row.color(t.color.label),
         );
     }
-    // Text and pictures draw above every rectangle, so under the question the rows go.
-    let shown = if b.ask_scan || b.modal.is_some() {
-        0
-    } else {
-        ROWS
-    };
-    for (i, row) in b.rows.iter().enumerate().take(shown) {
+    for (i, row) in b.rows.iter().enumerate().take(ROWS) {
         let y = LIST_Y + i as f32 * ROW_H;
         let selected = b.selected == Some(i);
         if selected {
@@ -292,7 +288,7 @@ pub(super) fn jacket(ui: &mut Ui, row: &Row, y: f32) {
     let side = JACKET_SIDE;
     let (x, top) = (JACKET_X + (JACKET_W - side) * 0.5, y + (ROW_H - side) * 0.5);
     match (row.kind, &row.art) {
-        (RowKind::Track, Some(art)) => ui.scene.images.push(Image {
+        (RowKind::Track, Some(art)) => ui.scene.image(Image {
             picture: Arc::clone(art),
             x,
             y: top,

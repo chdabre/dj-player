@@ -1,4 +1,4 @@
-//! Text through glyphon: one font system and glyph atlas for the app, and per layer a text
+//! Text through glyphon: one font system and glyph atlas for the app, and per plane a text
 //! renderer with its shaped buffers cached by content, so only changing strings (the
 //! readouts) re-shape each frame.
 
@@ -8,7 +8,7 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 
-use super::scene::{Align, Scene, Weight};
+use super::scene::{Align, Text, Weight};
 
 const FONT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/BarlowCondensed-Regular.ttf");
 const FONT_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/BarlowCondensed-SemiBold.ttf");
@@ -49,7 +49,7 @@ struct Slot {
     width: f32,
 }
 
-/// One layer's text: its renderer, viewport and shaped buffers (one per scene text, by index).
+/// One plane's text: its renderer, viewport and shaped buffers (one per text, by index).
 pub(super) struct LayerText {
     viewport: Viewport,
     renderer: TextRenderer,
@@ -70,14 +70,14 @@ impl LayerText {
         }
     }
 
-    /// Shape (or reuse) `scene`'s texts and prepare them for a `w`×`h` target placed by
-    /// `xform` (scale, offset x, offset y).
+    /// Shape (or reuse) `texts` and prepare them for a `w`×`h` target placed by `xform`
+    /// (scale, offset x, offset y).
     pub(super) fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         f: &mut Fonts,
-        scene: &Scene,
+        texts: &[Text],
         (w, h): (u32, u32),
         (s, ox, oy): (f32, f32, f32),
     ) {
@@ -88,7 +88,7 @@ impl LayerText {
                 height: h,
             },
         );
-        for (i, t) in scene.texts.iter().enumerate() {
+        for (i, t) in texts.iter().enumerate() {
             let key = (
                 t.text.clone(),
                 t.size.to_bits(),
@@ -130,14 +130,14 @@ impl LayerText {
                 .fold(0.0, f32::max);
             slot.key = key;
         }
-        self.slots.truncate(scene.texts.len());
+        self.slots.truncate(texts.len());
         let bounds = TextBounds {
             left: 0,
             top: 0,
             right: w as i32,
             bottom: h as i32,
         };
-        let areas = scene.texts.iter().zip(&self.slots).map(|(t, slot)| {
+        let areas = texts.iter().zip(&self.slots).map(|(t, slot)| {
             let left = match t.align {
                 Align::Left => t.x,
                 Align::Center => t.x - slot.width * 0.5,

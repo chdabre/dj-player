@@ -30,7 +30,7 @@ use winit::window::Window;
 use images::Images;
 use offscreen::Offscreen;
 use rects::{RectBatch, Rects};
-use scene::{Rgba, Scene};
+use scene::{LAYERS, Layer, Rgba, Scene};
 use text::{Fonts, LayerText};
 use waves::Waves;
 
@@ -66,7 +66,8 @@ struct Surface {
     view_buffer: wgpu::Buffer,
     view_bind: wgpu::BindGroup,
     rects: RectBatch,
-    text: LayerText,
+    /// Text by plane.
+    text: [LayerText; LAYERS],
 }
 
 impl Surface {
@@ -89,7 +90,7 @@ impl Surface {
             view_buffer,
             view_bind,
             rects: RectBatch::new(device),
-            text: LayerText::new(device, fonts),
+            text: [LayerText::new(device, fonts), LayerText::new(device, fonts)],
         }
     }
 }
@@ -438,7 +439,7 @@ impl Gfx {
                     .upload(&self.device, &self.queue, &self.sampler, self.srgb, scene),
             )
         } else {
-            (0, 0)
+            (0, Default::default())
         };
         let srgb = self.srgb;
         let surface = match which {
@@ -453,14 +454,16 @@ impl Gfx {
         }
         self.queue.write_buffer(&surface.view_buffer, 0, &view);
         surface.rects.upload(&self.device, &self.queue, scene, srgb);
-        surface.text.prepare(
-            &self.device,
-            &self.queue,
-            &mut self.fonts,
-            scene,
-            (w, h),
-            xform,
-        );
+        for (text, plane) in surface.text.iter_mut().zip(&scene.planes) {
+            text.prepare(
+                &self.device,
+                &self.queue,
+                &mut self.fonts,
+                &plane.texts,
+                (w, h),
+                xform,
+            );
+        }
         let [r, g, b, a] = color(srgb, scene.background).map(f64::from);
         let clear = wgpu::Color { r, g, b, a };
 
@@ -484,29 +487,37 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // Rectangles in batches, with each waveform after the rectangles below it.
-            let count = surface.rects.count as u32;
-            let mut drawn = 0u32;
-            for k in 0..=waves {
-                let until = scene
-                    .waves
-                    .get(k)
-                    .filter(|_| k < waves)
-                    .map_or(count, |(at, _)| *at as u32);
-                if until > drawn {
-                    self.rects
-                        .draw(&mut pass, &surface.view_bind, &surface.rects, drawn, until);
-                    drawn = until;
+            // Plane by plane: rectangles in batches with each waveform after the rectangles
+            // below it, then pictures, then text.
+            for layer in [Layer::Base, Layer::Overlay] {
+                let p = layer as usize;
+                let rects = surface.rects.planes[p].clone();
+                let waves_here = if layer == Layer::Base { waves } else { 0 };
+                let mut drawn = rects.start;
+                for k in 0..=waves_here {
+                    let until = scene.planes[p]
+                        .waves
+                        .get(k)
+                        .filter(|_| k < waves_here)
+                        .map_or(rects.end, |(at, _)| rects.start + *at as u32);
+                    if until > drawn {
+                        self.rects.draw(
+                            &mut pass,
+                            &surface.view_bind,
+                            &surface.rects,
+                            drawn,
+                            until,
+                        );
+                        drawn = until;
+                    }
+                    if k < waves_here {
+                        self.waves.draw(&mut pass, &surface.view_bind, k as u32);
+                    }
                 }
-                if k < waves {
-                    self.waves.draw(&mut pass, &surface.view_bind, k as u32);
-                }
-            }
-            if images > 0 {
                 self.images
-                    .draw(&mut pass, &surface.view_bind, scene, images);
+                    .draw(&mut pass, &surface.view_bind, scene, images[p].clone());
+                surface.text[p].render(&self.fonts.atlas, &mut pass);
             }
-            surface.text.render(&self.fonts.atlas, &mut pass);
         }
         encoder.finish()
     }

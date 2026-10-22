@@ -24,6 +24,8 @@ mod view;
 pub use keyboard::key_count;
 pub use keyboard::{BACKSPACE, CLEAR, DONE, SHIFT, Shift, key_char};
 pub use state::BrowseState;
+#[cfg(test)]
+pub use state::Focus;
 pub use view::{OnDeck, info_screen};
 // The parts' layout constants and drawing, for each other (`use super::*`).
 use keyboard::*;
@@ -35,7 +37,7 @@ use super::chrome::{lower, rail, rail_panel, tabs};
 use super::deck::{bottom, status};
 use super::{ChromeTarget, Target, Ui, View};
 use crate::kit::Rect;
-use crate::render::scene::{Image, Rgba, Weight};
+use crate::render::scene::{Image, Layer, Rgba, Weight};
 use crate::theme::TextStyle;
 use crate::waves::OverviewCache;
 /// The browse screen's touch targets.
@@ -205,9 +207,6 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
             if let Some(side) = &b.side {
                 side_panel(ui, side);
             }
-            if let Some(m) = &b.modal {
-                modal(ui, m);
-            }
         }
     }
     if b.keyboard {
@@ -217,8 +216,18 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
         status(ui, v);
         bottom(ui, v, overview);
     }
-    if b.ask_scan {
-        ask_scan(ui);
+    // A modal or the scan question goes over the list, which dims and stops taking touches.
+    let modal_up = b.info.is_none() && b.modal.is_some();
+    if modal_up || b.ask_scan {
+        ui.on(Layer::Overlay, |ui| {
+            ui.scrim(LIST_AREA);
+            if let Some(m) = b.modal.as_ref().filter(|_| modal_up) {
+                modal(ui, m);
+            }
+            if b.ask_scan {
+                ask_scan(ui);
+            }
+        });
     }
 }
 

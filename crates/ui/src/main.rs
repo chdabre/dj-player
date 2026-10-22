@@ -53,7 +53,7 @@ use winit::event::{
     ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::ModifiersState;
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::app::effects::{Effect, Effects};
@@ -66,7 +66,7 @@ use crate::render::Gfx;
 use crate::render::scene::Scene;
 use crate::screens::browse::{self, OnDeck, ROW_H, ROWS};
 use crate::screens::perform::{self, PerfState};
-use crate::screens::{Cx, HitBox, SaveState, ScreenKind, Screens, View};
+use crate::screens::{Cx, Hits, SaveState, ScreenKind, Screens, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::WaveSettings;
@@ -464,7 +464,7 @@ fn main() -> ExitCode {
             mode: args.wave_mode,
             ..WaveSettings::default()
         },
-        hits: Vec::new(),
+        hits: Hits::default(),
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
         debug: true,
@@ -530,7 +530,7 @@ struct App {
     theme: Theme,
     scene: Scene,
     wave_settings: WaveSettings,
-    hits: Vec<HitBox>,
+    hits: Hits,
     cursor: (f64, f64),
     modifiers: ModifiersState,
     debug: bool,
@@ -689,7 +689,7 @@ impl App {
     fn press(&mut self, x: f64, y: f64) {
         let Some(gfx) = &self.gfx else { return };
         let at = gfx.to_design(x, y);
-        let Some(hit) = self.hits.iter().find(|h| h.contains(at.0, at.1)).copied() else {
+        let Some(hit) = self.hits.find(at.0, at.1) else {
             return;
         };
         let (screens, mut cx) = self.split();
@@ -763,43 +763,11 @@ impl App {
             return;
         }
         let key = keymap::KeyPress::from(key);
-        let pressed = key.pressed;
         let screen = self.screens.screen;
         let browsing = screen == ScreenKind::Browse;
-        let (screens, mut cx) = self.split();
-        let b = &mut screens.browse;
-        if browsing && b.ask_scan {
-            if pressed {
-                match &key.key {
-                    Key::Named(NamedKey::Enter) => b.answer_scan(true, &mut cx),
-                    Key::Named(NamedKey::Escape) => b.answer_scan(false, &mut cx),
-                    _ => {}
-                }
-            }
-            return;
-        }
-        // While naming, the keyboard types the name: Enter names it, Esc gives up.
-        if browsing && b.editing.naming() {
-            if !pressed {
-                return;
-            }
-            if key.key == Key::Named(NamedKey::Escape) {
-                b.editing.modal = None;
-            }
-            for c in keymap::typed(&key) {
-                b.type_name(c, &mut cx);
-            }
-            return;
-        }
-        // While the search keyboard is up, the keys type; Enter and Esc still browse.
-        if browsing && b.keyboard {
-            let chars = keymap::typed(&key);
-            if !chars.is_empty() && chars != [browse::DONE] {
-                if pressed {
-                    for c in chars {
-                        b.type_char(c, &mut cx);
-                    }
-                }
+        if browsing {
+            let (screens, mut cx) = self.split();
+            if screens.browse.key(&key, &mut cx) {
                 return;
             }
         }
