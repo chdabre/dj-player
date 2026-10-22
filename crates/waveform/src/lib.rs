@@ -15,7 +15,11 @@
 pub mod blob;
 pub mod compute;
 pub mod display;
+mod filter;
+mod gain;
+mod model;
 pub mod render;
+mod theme;
 
 pub use blob::DecodeError;
 pub use compute::{
