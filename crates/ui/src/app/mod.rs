@@ -286,11 +286,10 @@ fn stick_root(args: &Args) -> Result<Option<PathBuf>, ExitCode> {
 fn start_player(args: &Args, root: Option<&Path>) -> Result<(Player, bool), ExitCode> {
     let library = match (args.library.clone(), root) {
         (Some(choice), _) => choice,
-        (None, Some(r)) => LibraryChoice::Folder(r.join(engined::persist::LIBRARY_DIR)),
+        (None, Some(r)) => LibraryChoice::Folder(r.join(engined::store::LIBRARY_DIR)),
         (None, None) => LibraryChoice::Auto,
     };
-    let ask_scan =
-        args.library.is_none() && root.is_some_and(|r| !engined::persist::has_library(r));
+    let ask_scan = args.library.is_none() && root.is_some_and(|r| !engined::store::has_library(r));
     let backend = CpalBackend::new();
     let options = Options {
         library,

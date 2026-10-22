@@ -1096,7 +1096,6 @@ dependencies = [
  "hound",
  "image",
  "library",
- "serde_json",
  "waveform",
 ]
 

@@ -18,6 +18,7 @@
 
 pub mod analyzer;
 mod audio;
+pub mod chain;
 #[cfg(feature = "essentia")]
 pub mod essentia;
 pub mod gridfit;
@@ -27,6 +28,7 @@ pub mod model;
 pub mod rekordbox;
 pub mod score;
 pub mod select;
+pub mod stored;
 #[cfg(feature = "stratum")]
 pub mod stratum;
 #[cfg(feature = "tempocnn")]
@@ -34,6 +36,7 @@ pub mod tempocnn;
 
 pub use analyzer::{AnalysisError, Analyzer, CancelFlag, RunResults, run_all};
 pub use audio::{TrackAudio, load, load_until};
+pub use chain::{Chain, merge, player_chain};
 pub use gridfit::{GridFit, GridFitConfig, PhaseSource};
 pub use model::{
     Analysed, Analysis, AnalyzerId, Beat, Beatgrid, BpmRange, Feature, FeatureSet, Key, Mode,

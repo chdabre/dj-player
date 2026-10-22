@@ -20,14 +20,14 @@ tempocnn = ["dep:tract-onnx"]
 stratum = ["dep:stratum-dsp"]
 # Essentia (AGPL-3.0) through a Python worker process: classic DSP, and the TempoCNN model.
 # Needs a Python with `essentia-tensorflow`; see docs/plan/analysis.md.
-essentia = ["dep:serde_json"]
+essentia = []
 
 [dependencies]
 engine-media.workspace = true
 quick-xml.workspace = true
 rustfft.workspace = true
 tract-onnx = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 stratum-dsp = { workspace = true, optional = true }
 
 [lints]

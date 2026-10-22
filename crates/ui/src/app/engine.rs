@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use engine_core::{DeckGrid, FALLBACK_BPM, HOT_CUES, beat_period};
-use engined::persist::{Listing, Playlists};
+use engined::store::{Listing, Playlists};
 use engined::{BatchProgress, Player};
 
 /// The library as input handlers may look at it: what it lists and what it is doing. Changes

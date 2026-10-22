@@ -8,7 +8,7 @@ use std::sync::Arc;
 use library::{EntryId, PlaylistId, TrackId};
 
 use super::{Browser, Entry, Kind, Level, LevelKind, Source, Tags, walk};
-use crate::persist::{Listing, Playlists, stored_path};
+use crate::store::{Listing, Playlists, stored_path};
 
 /// The library menu's entries.
 pub(super) const MENU_PLAYLISTS: &str = "PLAYLISTS";

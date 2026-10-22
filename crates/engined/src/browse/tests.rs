@@ -6,7 +6,7 @@ use std::sync::Arc;
 use library::{EntryId, PlaylistId, PlaylistKind, TrackId};
 
 use super::*;
-use crate::persist::{Listing, Playlists};
+use crate::store::{Listing, Playlists};
 
 pub(super) fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("browse-{name}-{}", std::process::id()));

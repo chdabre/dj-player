@@ -8,7 +8,7 @@ use engine_core::{DeckCommand, HOT_CUES, TrackCues};
 use library::{Cue, CueKind, Edit, HotCue, Track};
 
 use super::{AutoCue, DECK, Player};
-use crate::persist::Loaded;
+use crate::store::Loaded;
 
 impl Player {
     /// MEMORY: store the active loop, else the cue point, as a memory cue in the library.

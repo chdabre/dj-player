@@ -2,7 +2,7 @@
 //! stream, shared by the `engined` terminal CLI and the UI spike.
 //!
 //! [`Player::open_with`] picks the device format, starts decoding the file at that rate,
-//! starts the stream and mounts the library on a worker thread ([`persist`]). The waveform is
+//! starts the stream and mounts the library on a worker thread ([`store`]). The waveform is
 //! computed during the decode, from exactly the frames the deck plays, and grows in the
 //! loaded track's [`LiveWaveform`]. The owner calls [`Player::poll`] regularly: it restores
 //! the track's stored cues into the deck, uses the stored waveform and analysis when the
@@ -14,13 +14,14 @@ mod analysis;
 pub mod batch;
 pub mod browse;
 mod config;
-pub mod persist;
 mod player;
+pub mod stick;
+pub mod store;
 mod waveform_live;
 
 pub use analysis::Analysed;
 pub use batch::BatchProgress;
 pub use library::Persistence;
-pub use persist::LibraryChoice;
 pub use player::{AutoCue, LoadedTrack, Options, Player};
+pub use store::LibraryChoice;
 pub use waveform_live::LiveWaveform;

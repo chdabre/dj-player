@@ -313,7 +313,7 @@ mod tests {
     /// A browser over a temporary stick with tracks a, b (in folder `crate`), a list
     /// "Peak" (in folder "Saturday") holding a then b, and b on the tag list.
     fn browser() -> (Browser, std::path::PathBuf, PlaylistId) {
-        use engined::persist::{Listing, Playlists};
+        use engined::store::{Listing, Playlists};
         use library::{Listed, Playlist, PlaylistEntry, TrackId, TrackTags};
         use std::sync::Arc;
         // One folder per call: tests run in parallel.

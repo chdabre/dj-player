@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use engined::persist::{LIBRARY_DIR, LibraryChoice, LibraryWorker, Playlists, Reply};
+use engined::store::{LIBRARY_DIR, LibraryChoice, LibraryWorker, Playlists, Reply};
 use library::{Edit, PlaylistId, PlaylistKind};
 
 fn main() -> Result<(), String> {

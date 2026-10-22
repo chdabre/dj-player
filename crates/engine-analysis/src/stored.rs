@@ -11,7 +11,7 @@
 //! analyzers produce them. The analyzer's name, version and parameters live in the record
 //! that points at the blob.
 
-use engine_analysis::{
+use crate::model::{
     Analysed, Analysis, AnalyzerId, Beat, Beatgrid, Key, Mode, PitchClass, Provenance, Tempo,
 };
 use serde_json::{Value, json};

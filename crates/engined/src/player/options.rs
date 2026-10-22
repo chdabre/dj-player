@@ -1,6 +1,6 @@
 //! How a [`crate::Player`] is opened: analysis settings, the library and auto cue.
 
-use crate::persist::LibraryChoice;
+use crate::store::LibraryChoice;
 
 /// How to open a [`crate::Player`].
 #[derive(Debug, Clone, Default)]

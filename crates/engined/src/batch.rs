@@ -5,7 +5,7 @@
 //! The deck comes first: between files the job waits while `busy` is set (the player sets it
 //! while its own track decodes or analyses), and [`Batch::stop`] cancels the file under way.
 //! Results go to the player as [`BatchEvent`]s; it hands them to the library worker
-//! ([`crate::persist::LibraryWorker::store`]).
+//! ([`crate::store::LibraryWorker::store`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use waveform::compute::{Builder, Origin, Params, Timeline};
 
-use crate::persist::BatchResult;
+use crate::store::BatchResult;
 
 /// What the batch job reports.
 #[derive(Debug)]

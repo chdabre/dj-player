@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engined::persist::{FreshAnalysis, LibraryChoice, LibraryWorker, Loaded, Reply};
+use engined::store::{FreshAnalysis, LibraryChoice, LibraryWorker, Loaded, Reply};
 use library::{DeviceId, Edit, HotCue, Persistence};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -229,7 +229,7 @@ fn a_scan_records_every_track_with_its_tags_and_publishes_the_listing() {
     while !(finished
         && listing
             .as_ref()
-            .is_some_and(|l: &std::sync::Arc<engined::persist::Listing>| l.len() == 3))
+            .is_some_and(|l: &std::sync::Arc<engined::store::Listing>| l.len() == 3))
     {
         assert!(Instant::now() < until, "scan did not finish");
         match w.try_recv() {

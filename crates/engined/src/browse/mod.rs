@@ -16,7 +16,7 @@ mod tags;
 mod tests;
 mod view;
 
-pub use files::walk;
+pub use crate::stick::walk;
 pub(crate) use level::LevelKind;
 pub use level::{Entered, Entry, Kind, Level, Sort, Source};
 pub use tags::{LARGE_SIZE, Tags, Thumb, read_tags, thumbnail};
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use library::{PlaylistId, PlaylistKind, TrackId};
 
-use crate::persist::{Listing, Playlists};
+use crate::store::{Listing, Playlists};
 use order::{matches, order};
 use tags::TagReader;
 use view::{MENU_FOLDERS, MENU_PLAYLISTS};

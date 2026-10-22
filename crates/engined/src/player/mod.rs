@@ -22,7 +22,7 @@ use waveform::compute::{Origin, Timeline};
 
 use crate::analysis::analyze_in_background;
 use crate::batch::{self, BatchProgress};
-use crate::persist::{self, LibraryWorker, Reply};
+use crate::store::{self, LibraryWorker, Reply};
 use crate::waveform_live::{LiveWaveform, WaveTap};
 use track::LibState;
 
@@ -47,9 +47,9 @@ pub struct Player {
     /// serial is compared against it.
     cue_serial: u64,
     /// The library's tracks, as last published.
-    listing: Option<Arc<persist::Listing>>,
+    listing: Option<Arc<store::Listing>>,
     /// The library's playlists, as last published.
-    playlists: Option<Arc<persist::Playlists>>,
+    playlists: Option<Arc<store::Playlists>>,
     /// The last scan's progress (done, total).
     scan: Option<(usize, usize)>,
     /// ANALYZE ALL under way, and how far it is.
@@ -157,13 +157,13 @@ impl Player {
         Ok(())
     }
 
-    /// The library's tracks by stored path ([`persist::stored_path`]), once it has said.
-    pub fn listing(&self) -> Option<&Arc<persist::Listing>> {
+    /// The library's tracks by stored path ([`store::stored_path`]), once it has said.
+    pub fn listing(&self) -> Option<&Arc<store::Listing>> {
         self.listing.as_ref()
     }
 
     /// The library's playlists, once it has said.
-    pub fn playlists(&self) -> Option<&Arc<persist::Playlists>> {
+    pub fn playlists(&self) -> Option<&Arc<store::Playlists>> {
         self.playlists.as_ref()
     }
 

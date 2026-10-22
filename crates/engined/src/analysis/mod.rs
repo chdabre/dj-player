@@ -1,19 +1,17 @@
 //! The loaded track's analysis: tempo, grid and key on a background thread, reusing stored
 //! results whose analyzer version and parameters still match.
 
-mod stored;
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use engine_analysis::{Analysis, Analyzer, CancelFlag, FeatureSet, GridFit, GridFitConfig};
+use engine_analysis::{Analysis, Analyzer, CancelFlag, FeatureSet};
 use engine_core::DeckGrid;
 use library::{AnalysisRef, AudioHash};
 
-use crate::persist::FreshAnalysis;
+use crate::store::FreshAnalysis;
 
 /// What the analysis thread hands back: the deck grid (engine frames), the key, a line to
 /// print, and what to store in the library.
@@ -90,7 +88,7 @@ pub(crate) fn analyze_with(
     want_audio_hash: bool,
 ) -> Result<Analysed, String> {
     let started = Instant::now();
-    let (mut analyzers, hint) = chain(settings)?;
+    let (mut analyzers, hint) = engine_analysis::player_chain(settings)?;
     let mut source = Decode { path, stop, audio };
     let (context, fresh) = run_chain(&mut analyzers, &mut source, cached)?;
     let audio_hash = if want_audio_hash {
@@ -98,7 +96,7 @@ pub(crate) fn analyze_with(
     } else {
         None
     };
-    let merged = merge(context);
+    let merged = engine_analysis::merge(context);
     let bpm = merged.tempo.as_ref().map(|t| t.value.bpm);
     let grid = match (&merged.beatgrid, bpm) {
         (Some(g), Some(bpm)) => DeckGrid::from_seconds(
@@ -142,27 +140,6 @@ pub(crate) fn analyze_with(
     })
 }
 
-/// Analyzers in the order they run, each refining the results before it.
-type Chain = Vec<Box<dyn Analyzer>>;
-
-/// The analyzers in order: TempoCNN (if `TEMPOCNN_MODEL` is set), gridfit with its tempo as
-/// the hint, and the key. Also the hint, if there is one.
-fn chain(settings: engine_analysis::Settings) -> Result<(Chain, Option<&'static str>), String> {
-    let mut analyzers: Chain = Vec::new();
-    let mut hint = None;
-    if let Some(t) = engine_analysis::tempocnn::TempoCnn::from_env() {
-        analyzers.push(Box::new(t?.with_range(settings.bpm_range)));
-        hint = Some("tempocnn");
-    }
-    analyzers.push(Box::new(GridFit::new(GridFitConfig {
-        tempo_hint: hint,
-        bpm_range: settings.bpm_range,
-        ..GridFitConfig::default()
-    })));
-    analyzers.push(Box::new(engine_analysis::hpcpkey::HpcpKey::default()));
-    Ok((analyzers, hint))
-}
-
 /// The track's audio, decoded on first use only.
 struct Decode<'a> {
     path: &'a Path,
@@ -201,7 +178,7 @@ fn run_chain(
         let reuse = cached
             .get(&id.name)
             .filter(|(r, _)| fresh.is_empty() && r.version == id.version && r.params == id.params)
-            .and_then(|(_, blob)| stored::decode(blob, &id));
+            .and_then(|(_, blob)| engine_analysis::stored::decode(blob, &id));
         let result = match reuse {
             Some(r) => r,
             None => {
@@ -212,7 +189,7 @@ fn run_chain(
                     name: id.name.clone(),
                     version: id.version.clone(),
                     params: id.params.clone(),
-                    blob: stored::encode(&r),
+                    blob: engine_analysis::stored::encode(&r),
                 });
                 r
             }
@@ -220,17 +197,6 @@ fn run_chain(
         context.push(result);
     }
     Ok((context, fresh))
-}
-
-/// Later analyzers refine earlier ones (gridfit's tempo over TempoCNN's).
-fn merge(context: Vec<Analysis>) -> Analysis {
-    let mut merged = Analysis::default();
-    for r in context {
-        merged.tempo = r.tempo.or(merged.tempo);
-        merged.beatgrid = r.beatgrid.or(merged.beatgrid);
-        merged.key = r.key.or(merged.key);
-    }
-    merged
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use engined::browse::{Browser, Entered, Kind, Source};
-use engined::persist::Listing;
+use engined::store::Listing;
 
 use super::{BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, Shift, key_char};
 use winit::keyboard::{Key, NamedKey};
