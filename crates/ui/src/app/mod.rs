@@ -1,5 +1,5 @@
 //! The application around the screens: the window and its events (`platform.rs`), the
-//! frame (`frame.rs`), screenshots (`capture.rs`), the engine link (`engine.rs`), what the UI
+//! frame (`frame.rs`), screenshots (`capture.rs`), the player's port (`engine.rs`), what the UI
 //! holds about the loaded track (`track.rs`), effects (`effects.rs`) and the dev keyboard
 //! (`keymap.rs`); what the controls do is the player's (`engined::controls`). [`App`] owns
 //! all of it.
@@ -10,16 +10,15 @@ pub mod engine;
 mod frame;
 pub mod keymap;
 mod platform;
+mod start;
 pub mod track;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use engine_core::DeckCommand;
-use engine_io::CpalBackend;
-use engined::browse::Browser;
-use engined::{LibraryChoice, Options, Player};
+use browser::Browser;
+use player_api::{DeckCommand, OnDeck, Port};
 use winit::keyboard::ModifiersState;
 
 use crate::args::{self, Args};
@@ -34,7 +33,8 @@ use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::WaveSettings;
 use effects::{Effect, Effects};
-use engine::{DeckSnapshot, LibraryView};
+use engine::DeckSnapshot;
+use start::start_player;
 use track::Track;
 
 /// Who got the pointer when it went down: the device screen or the stand-in shell.
@@ -46,9 +46,12 @@ pub(crate) enum PointerOn {
 }
 
 pub struct App {
-    player: Player,
+    /// The player, through its port: everything the UI asks of it and reads from it.
+    player: Box<dyn Port>,
     /// The deck as of the start of the last frame: what the screen shows and input acts on.
     deck: DeckSnapshot,
+    /// The track on the deck, as of the same read (and since the last load).
+    on_deck: Option<OnDeck>,
     /// The loaded track, as the UI holds it.
     track: Track,
     /// The stick's folder tree, when there is a stick (`LIBRARY_DIR`).
@@ -59,7 +62,6 @@ pub struct App {
     screens: Screens,
     /// What input asked the engine and the library to do, carried out after each event.
     effects: Effects,
-    /// What the player's controls do (fader range, jog, held buttons), whoever presses them.
     /// `--analyze-all` still to start.
     pending_analyze_all: bool,
     /// `--open` levels still to open, and `--menu` still to show.
@@ -96,13 +98,14 @@ impl App {
     pub fn start(args: Args) -> Result<Self, ExitCode> {
         let root = stick_root(&args)?;
         let (mut player, ask_scan) = start_player(&args, root.as_deref())?;
-        load_startup(&mut player, &args)?;
-        let sr = player.format.sample_rate;
+        load_startup(player.as_mut(), &args)?;
+        let sr = player.output().sample_rate;
         let track = match args.file.as_deref() {
             Some(f) => Track::new(f, None, sr),
             None => Track::none(sr),
         };
-        let deck = DeckSnapshot::read(&player);
+        let deck = player.deck();
+        let on_deck = player.on_deck();
         let browser = root.map(|r| {
             let mut b = Browser::new(r, ROWS);
             if let Some(s) = args.sort {
@@ -122,6 +125,7 @@ impl App {
             shell_scene: Scene::default(),
             last_frame: None,
             deck,
+            on_deck,
             track,
             player,
             browser,
@@ -174,8 +178,8 @@ impl App {
         let cx = Cx {
             deck: &self.deck,
             browser: self.browser.as_mut(),
-            library: LibraryView::read(&self.player),
-            loaded: self.player.loaded().map(|d| d.file()),
+            library: self.player.library(),
+            loaded: self.on_deck.as_ref().map(|d| d.file.as_path()),
             shown: self.track.last_shown.map(|(_, p)| p),
             effects: &mut self.effects,
         };
@@ -237,7 +241,8 @@ impl App {
             return;
         }
         let tags = self.browser.as_ref().and_then(|b| b.info(path));
-        self.track = Track::new(path, tags.as_ref(), self.player.format.sample_rate);
+        self.track = Track::new(path, tags.as_ref(), self.player.output().sample_rate);
+        self.on_deck = self.player.on_deck();
         self.screens.loaded();
         eprintln!("loaded {}", path.display());
     }
@@ -250,10 +255,7 @@ impl App {
         };
         self.pending_search.is_none()
             && self.pending_open.is_none()
-            && self
-                .screens
-                .browse
-                .settled(b, &LibraryView::read(&self.player))
+            && self.screens.browse.settled(b, &self.player.library())
     }
 }
 
@@ -275,42 +277,8 @@ fn stick_root(args: &Args) -> Result<Option<PathBuf>, ExitCode> {
     Ok(root)
 }
 
-/// Start the player with the library `args` (or the stick) asks for; also whether to ask
-/// "scan this stick?" (a stick with no library is asked once, before mounting makes one).
-fn start_player(args: &Args, root: Option<&Path>) -> Result<(Player, bool), ExitCode> {
-    let library = match (args.library.clone(), root) {
-        (Some(choice), _) => choice,
-        (None, Some(r)) => LibraryChoice::Folder(r.join(engined::store::LIBRARY_DIR)),
-        (None, None) => LibraryChoice::Auto,
-    };
-    let ask_scan = args.library.is_none() && root.is_some_and(|r| !engined::store::has_library(r));
-    let backend = CpalBackend::new();
-    let options = Options {
-        library,
-        auto_cue: args.auto_cue,
-        ..Options::default()
-    };
-    let player = match Player::start(&backend, &args.request, options) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("dj-ui: {e}");
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    eprintln!(
-        "{} Hz, {} ch, buffer {}, {}",
-        player.format.sample_rate,
-        player.format.channels,
-        player
-            .buffer_frames()
-            .map_or("default".into(), |n| format!("{n} frames")),
-        player.device_name()
-    );
-    Ok((player, ask_scan))
-}
-
 /// `--scan`, and the file with `--hot-cues`, `--at` and `--play`.
-fn load_startup(player: &mut Player, args: &Args) -> Result<(), ExitCode> {
+fn load_startup(player: &mut dyn Port, args: &Args) -> Result<(), ExitCode> {
     if args.scan {
         player.scan();
     }
@@ -321,8 +289,8 @@ fn load_startup(player: &mut Player, args: &Args) -> Result<(), ExitCode> {
         eprintln!("dj-ui: {}: {e}", file.display());
         return Err(ExitCode::FAILURE);
     }
-    let sr = f64::from(player.format.sample_rate);
-    for (i, &at) in args.hot_cues.iter().enumerate().take(engine_core::HOT_CUES) {
+    let sr = f64::from(player.output().sample_rate);
+    for (i, &at) in args.hot_cues.iter().enumerate().take(player_api::HOT_CUES) {
         player.send(DeckCommand::Seek(at * sr));
         player.send(DeckCommand::HotCue(i));
     }

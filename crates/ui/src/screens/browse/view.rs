@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
-use engined::browse::{Browser, Entry, Kind, Source, Tags};
-use library::PlaylistKind;
+use browser::{Browser, Entry, Kind, Source, Tags};
+use player_api::PlaylistKind;
 
 use super::editing::Modal;
 use super::state::BrowseState;

@@ -1,9 +1,9 @@
-//! A folder's listing as browser entries (see [`crate::stick`] for what is listed).
+//! A folder's listing as browser entries (see [`library::stick`] for what is listed).
 
 use std::path::Path;
 
 use super::{Entry, Kind};
-use crate::stick;
+use library::stick;
 
 /// The folders and tracks in `dir`, as [`stick::read_dir`] lists them.
 pub(crate) fn list(dir: &Path, root: bool) -> std::io::Result<Vec<Entry>> {
@@ -21,7 +21,7 @@ pub(crate) fn list(dir: &Path, root: bool) -> std::io::Result<Vec<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browse::tests::{temp_dir, touch};
+    use crate::tests::{temp_dir, touch};
     use library::LIBRARY_DIR;
 
     #[test]

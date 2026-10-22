@@ -3,7 +3,7 @@
 //! field has the keyboard (search, naming), and [`shortcut`] for everything else. The app
 //! decides which applies (focus); this module only knows the keys.
 
-use engine_core::DeckCommand;
+use player_api::DeckCommand;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 

@@ -18,11 +18,9 @@ default = ["standin"]
 standin = []
 
 [dependencies]
-engine-core.workspace = true
-engine-io.workspace = true
 engined = { path = "../engined" }
-library.workspace = true
-surface.workspace = true
+player-api.workspace = true
+browser.workspace = true
 waveform = { workspace = true, default-features = false }
 assert_no_alloc.workspace = true
 wgpu = "30"

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use library::PlaylistId;
+use player_api::PlaylistId;
 
 use super::Action;
 

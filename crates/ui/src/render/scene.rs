@@ -123,7 +123,7 @@ pub struct Scene {
 /// A picture (artwork) in a rounded rectangle, design pixels.
 #[derive(Debug, Clone)]
 pub struct Image {
-    pub picture: std::sync::Arc<engined::browse::Thumb>,
+    pub picture: std::sync::Arc<browser::Thumb>,
     pub x: f32,
     pub y: f32,
     pub w: f32,

@@ -9,8 +9,8 @@ mod modal;
 pub use menu::{Action, menu, pick_lists, tag_target};
 pub use modal::{Modal, Naming};
 
-use engined::browse::{Browser, Sort};
-use library::{Edit, EntryId, PlaylistId, PlaylistKind};
+use browser::{Browser, Sort};
+use player_api::{Edit, EntryId, PlaylistId, PlaylistKind};
 
 use super::{BACKSPACE, BrowseState, CLEAR, DONE, Shift};
 use crate::app::effects::Effect;
@@ -313,8 +313,8 @@ mod tests {
     /// A browser over a temporary stick with tracks a, b (in folder `crate`), a list
     /// "Peak" (in folder "Saturday") holding a then b, and b on the tag list.
     fn browser() -> (Browser, std::path::PathBuf, PlaylistId) {
-        use engined::store::{Listing, Playlists};
-        use library::{Listed, Playlist, PlaylistEntry, TrackId, TrackTags};
+        use player_api::{Listed, Playlist, PlaylistEntry, TrackId, TrackTags};
+        use player_api::{Listing, Playlists};
         use std::sync::Arc;
         // One folder per call: tests run in parallel.
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn the_menu_offers_what_the_selection_allows() {
-        use engined::browse::Source;
+        use browser::Source;
         let (mut b, d, peak) = browser();
         // A folder on the stick.
         assert_eq!(
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn move_drops_the_entry_before_the_one_below_and_follows_it() {
-        use engined::browse::Source;
+        use browser::Source;
         let (mut b, d, peak) = browser();
         b.set_source(Source::Library);
         b.enter();

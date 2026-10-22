@@ -4,6 +4,7 @@
 mod controls;
 mod cues;
 mod options;
+mod port;
 mod track;
 
 pub use options::{AutoCue, Options};
@@ -442,7 +443,7 @@ impl Player {
                 break;
             };
             let finished = matches!(event, batch::BatchEvent::Finished { .. });
-            if let Some(r) = progress.note(event, lines)
+            if let Some(r) = batch::note(progress, event, lines)
                 && let Some(lib) = &self.library
             {
                 lib.store(*r);

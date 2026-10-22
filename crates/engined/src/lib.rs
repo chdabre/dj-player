@@ -12,17 +12,17 @@
 
 mod analysis;
 pub mod batch;
-pub mod browse;
 mod config;
 pub mod controls;
 mod player;
-pub mod stick;
 pub mod store;
 mod waveform_live;
 
 pub use analysis::Analysed;
 pub use batch::BatchProgress;
+pub use engine_io::{CpalBackend, StreamRequest};
 pub use library::Persistence;
 pub use player::{AutoCue, LoadedTrack, Options, Player};
+pub use player_api::Port;
 pub use store::LibraryChoice;
 pub use waveform_live::LiveWaveform;

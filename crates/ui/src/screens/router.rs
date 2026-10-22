@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use engined::browse::{Browser, Source};
+use browser::{Browser, Source};
 
 use super::{BrowseState, BrowseTarget, DeckDisplay, HitBox, PerfState, ScreenKind, Target};
 use super::{chrome, perform};

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use library::LIBRARY_DIR;
+use crate::LIBRARY_DIR;
 
 /// File extensions listed as tracks (lower case).
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -19,7 +19,7 @@ const HIDDEN_AT_ROOT: &[&str] = &[LIBRARY_DIR, REKORDBOX_DIR, "System Volume Inf
 
 /// One folder or audio file in a folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Item {
+pub struct Item {
     pub name: String,
     pub path: PathBuf,
     pub folder: bool,
@@ -28,7 +28,7 @@ pub(crate) struct Item {
 /// The folders and audio files in `dir`: folders first, then files, each sorted by name
 /// without regard to case. Hidden files are left out, and at the root (`root`) the folders
 /// that hold no tracks.
-pub(crate) fn read_dir(dir: &Path, root: bool) -> std::io::Result<Vec<Item>> {
+pub fn read_dir(dir: &Path, root: bool) -> std::io::Result<Vec<Item>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let Ok(e) = e else { continue };

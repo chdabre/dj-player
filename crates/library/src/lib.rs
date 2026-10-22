@@ -19,6 +19,7 @@ mod ids;
 mod library;
 mod model;
 mod position;
+pub mod stick;
 mod time;
 
 pub use hash::{AUDIO_HASH_VERSION, AudioHash, FileHash, track_id};

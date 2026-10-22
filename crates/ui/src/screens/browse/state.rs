@@ -7,8 +7,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use engined::browse::{Browser, Entered, Kind, Source};
-use engined::store::Listing;
+use browser::{Browser, Entered, Kind, Source};
+use player_api::Listing;
 
 use super::{BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, Shift, key_char};
 use winit::keyboard::{Key, NamedKey};

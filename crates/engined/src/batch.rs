@@ -32,62 +32,49 @@ pub enum BatchEvent {
     },
 }
 
-/// How far ANALYZE ALL is.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BatchProgress {
-    /// Files finished (analysed or failed) of `total`.
-    pub done: usize,
-    pub total: usize,
-    pub failed: usize,
-    /// The file under way.
-    pub current: Option<String>,
-    /// Asked to stop; finishing the file under way.
-    pub stopping: bool,
-}
+pub use player_api::BatchProgress;
 
-impl BatchProgress {
-    /// Count `event` in, with a line to show where it is worth one; a finished file's
-    /// result comes back to be stored.
-    pub(crate) fn note(
-        &mut self,
-        event: BatchEvent,
-        lines: &mut Vec<String>,
-    ) -> Option<Box<BatchResult>> {
-        match event {
-            BatchEvent::Started(_, file) => self.current = Some(file_name(&file)),
-            BatchEvent::Done(r) => {
-                self.done += 1;
-                lines.push(format!(
-                    "analyze all {}/{}: {}: {}, key {}",
-                    self.done,
-                    self.total,
-                    file_name(&r.file),
-                    r.bpm.map_or("no tempo".into(), |b| format!("{b:.2} BPM")),
-                    r.key.as_deref().unwrap_or("?"),
-                ));
-                return Some(r);
-            }
-            BatchEvent::Failed(file, e) => {
-                self.done += 1;
-                self.failed += 1;
-                lines.push(format!("analyze all: {}: {e}", file_name(&file)));
-            }
-            BatchEvent::Finished { stopped } => {
-                lines.push(format!(
-                    "analyze all {}: {} of {} done{}",
-                    if stopped { "stopped" } else { "finished" },
-                    self.done - self.failed,
-                    self.total,
-                    if self.failed > 0 {
-                        format!(", {} failed", self.failed)
-                    } else {
-                        String::new()
-                    }
-                ));
-            }
+/// Count `event` into `progress`, with a line to show where it is worth one; a finished
+/// file's result comes back to be stored.
+pub(crate) fn note(
+    progress: &mut BatchProgress,
+    event: BatchEvent,
+    lines: &mut Vec<String>,
+) -> Option<Box<BatchResult>> {
+    match event {
+        BatchEvent::Started(_, file) => progress.current = Some(file_name(&file)),
+        BatchEvent::Done(r) => {
+            progress.done += 1;
+            lines.push(format!(
+                "analyze all {}/{}: {}: {}, key {}",
+                progress.done,
+                progress.total,
+                file_name(&r.file),
+                r.bpm.map_or("no tempo".into(), |b| format!("{b:.2} BPM")),
+                r.key.as_deref().unwrap_or("?"),
+            ));
+            return Some(r);
         }
-        None
+        BatchEvent::Failed(file, e) => {
+            progress.done += 1;
+            progress.failed += 1;
+            lines.push(format!("analyze all: {}: {e}", file_name(&file)));
+        }
+        BatchEvent::Finished { stopped } => {
+            lines.push(format!(
+                "analyze all {}: {} of {} done{}",
+                if stopped { "stopped" } else { "finished" },
+                progress.done - progress.failed,
+                progress.total,
+                if progress.failed > 0 {
+                    format!(", {} failed", progress.failed)
+                } else {
+                    String::new()
+                }
+            ));
+        }
     }
+    None
 }
 
 fn file_name(p: &Path) -> String {

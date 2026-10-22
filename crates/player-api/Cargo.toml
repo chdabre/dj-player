@@ -1,0 +1,17 @@
+[package]
+name = "player-api"
+description = "The port between the player and its UI: what the UI may ask and read, as plain data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+engine-core.workspace = true
+library.workspace = true
+surface.workspace = true
+waveform = { workspace = true, default-features = false }
+
+[lints]
+workspace = true

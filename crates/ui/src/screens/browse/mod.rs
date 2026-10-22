@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use engined::browse::Thumb;
+use browser::Thumb;
 
 mod editing;
 mod keyboard;

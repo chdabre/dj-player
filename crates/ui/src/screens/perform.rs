@@ -9,7 +9,7 @@
 //!   tapped again or the mode changes. CALL (stored hot cues to call up) comes with the library.
 //! - **BEAT LOOP:** a 1/2 to 16 beat loop from the playhead; tapping the active length exits.
 
-use engine_core::{BEAT_LOOPS, DeckCommand, HOT_CUES};
+use player_api::{BEAT_LOOPS, DeckCommand, HOT_CUES};
 
 use super::chrome::{self, COLUMN_W, COLUMN_X, CONTENT_W, CONTENT_X, Chrome, Top};
 use super::deck::{bottom, cue_column, hot_cue_color, hot_cue_letter, phase, status, zoom};

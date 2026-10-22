@@ -1,6 +1,6 @@
 //! Layout: every screen fits the panel, and its touch targets don't overlap.
 
-use engine_core::DeckGrid;
+use player_api::DeckGrid;
 
 use super::fixtures::{deck, view};
 use crate::render::scene::Scene;
@@ -402,7 +402,7 @@ fn performance_screen_fits_and_targets_do_not_overlap() {
             .iter()
             .filter(|h| matches!(h.target, Target::Perform(PerfTarget::BeatLoop(_))))
             .count();
-        assert_eq!(loops, engine_core::BEAT_LOOPS.len());
+        assert_eq!(loops, player_api::BEAT_LOOPS.len());
     }
 }
 

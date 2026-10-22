@@ -8,6 +8,7 @@
 //! rather than the UI's frames (`docs/research/engine.md`, "Controller path").
 
 use engine_core::{DeckCommand, HOT_CUES};
+pub use surface::Jog;
 use surface::{Control, ControlEvent, Nav, SECONDS_PER_TURN};
 
 /// What the surface reads of the deck when a control acts.
@@ -15,15 +16,6 @@ use surface::{Control, ControlEvent, Nav, SECONDS_PER_TURN};
 pub struct DeckNow {
     pub rate: f64,
     pub quantize_on: bool,
-}
-
-/// A hand on the jog.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Jog {
-    /// Scratching with the top plate.
-    Scratch,
-    /// Bending with the ring from the rate `base`.
-    Bend { base: f64 },
 }
 
 /// Tempo fader ranges (fraction of the rate either way) and their labels; WIDE is ±100 %.

@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use engine_io::StreamRequest;
-use engined::browse::{Sort, Source};
+use browser::{Sort, Source};
+use engined::StreamRequest;
 use engined::{AutoCue, LibraryChoice};
 
 use crate::screens::perform::{self, PerfState};

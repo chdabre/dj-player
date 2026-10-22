@@ -1,0 +1,17 @@
+[package]
+name = "browser"
+description = "The browse screen's model: a stick's folders, the library's tracks and playlists, sorting, search, and tags and artwork read in the background."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+engine-media.workspace = true
+library.workspace = true
+player-api.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

@@ -76,6 +76,12 @@ impl LiveWaveform {
     }
 }
 
+impl player_api::WaveformFeed for LiveWaveform {
+    fn update(&self, have: &mut Vec<Entry>) -> bool {
+        LiveWaveform::update(self, have)
+    }
+}
+
 /// Feeds the decoded audio to a [`Builder`] on the loader thread and publishes the entries
 /// every so often. Dropping it (the loader is done) finishes the waveform.
 pub(crate) struct WaveTap {

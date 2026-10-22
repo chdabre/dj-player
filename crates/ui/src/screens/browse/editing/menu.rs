@@ -3,8 +3,8 @@
 
 use std::path::PathBuf;
 
-use engined::browse::{Browser, Kind, walk};
-use library::{EntryId, PlaylistId, PlaylistKind};
+use browser::{Browser, Kind, walk};
+use player_api::{EntryId, PlaylistId, PlaylistKind};
 
 /// Something the MENU (or TAG TRACK) does.
 #[derive(Debug, Clone, PartialEq, Eq)]

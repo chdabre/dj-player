@@ -2,7 +2,7 @@
 //! track search, SEARCH, CUE, PLAY), the right column (BACK, TAG TRACK, the browse knob, F1,
 //! F2, the tempo fader) and the bottom band (loops, pads, the jog and its settings).
 
-use engine_core::HOT_CUES;
+use player_api::HOT_CUES;
 
 use super::draw::Draw;
 use super::{

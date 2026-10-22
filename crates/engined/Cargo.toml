@@ -15,9 +15,9 @@ engine-analysis.workspace = true
 waveform = { workspace = true, default-features = false }
 assert_no_alloc.workspace = true
 library.workspace = true
+player-api.workspace = true
 surface.workspace = true
 crossterm.workspace = true
-image.workspace = true
 
 [dev-dependencies]
 hound.workspace = true

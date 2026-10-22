@@ -4,8 +4,8 @@
 
 use std::path::PathBuf;
 
-use engine_core::DeckCommand;
-use library::{Edit, PlaylistId};
+use player_api::DeckCommand;
+use player_api::{Edit, PlaylistId};
 
 #[derive(Debug, Clone)]
 pub enum Effect {

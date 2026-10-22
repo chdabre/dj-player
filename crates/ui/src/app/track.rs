@@ -47,7 +47,7 @@ impl Track {
     }
 
     /// `path` just loaded; `listed` are its tags as the browser has them, if it does.
-    pub fn new(path: &Path, listed: Option<&engined::browse::Tags>, sample_rate: u32) -> Self {
+    pub fn new(path: &Path, listed: Option<&browser::Tags>, sample_rate: u32) -> Self {
         Self {
             title: track_title(path, listed),
             tags: Some(LoadedTags::read(path)),
@@ -56,7 +56,7 @@ impl Track {
     }
 
     /// Take the waveform entries decoded since the last frame from `live`.
-    pub fn update_wave(&mut self, live: &engined::LiveWaveform) {
+    pub fn update_wave(&mut self, live: &dyn player_api::WaveformFeed) {
         if !self.wave_complete {
             self.wave_complete = live.update(&mut self.wave);
         }
@@ -75,24 +75,24 @@ impl Track {
 
 /// The loaded track's tags and artwork, read once when it loads (the INFO screen).
 pub struct LoadedTags {
-    pub tags: engined::browse::Tags,
-    pub art: Option<Arc<engined::browse::Thumb>>,
+    pub tags: browser::Tags,
+    pub art: Option<Arc<browser::Thumb>>,
 }
 
 impl LoadedTags {
     fn read(path: &Path) -> Self {
-        let mut tags = engined::browse::read_tags(path).unwrap_or_default();
+        let mut tags = browser::read_tags(path).unwrap_or_default();
         let art = tags
             .artwork
             .take()
-            .and_then(|a| engined::browse::thumbnail(&a.data, engined::browse::LARGE_SIZE))
+            .and_then(|a| browser::thumbnail(&a.data, browser::LARGE_SIZE))
             .map(Arc::new);
         Self { tags, art }
     }
 }
 
 /// A track's title: its tag, else the file name without extension.
-pub fn track_title(path: &Path, tags: Option<&engined::browse::Tags>) -> String {
+pub fn track_title(path: &Path, tags: Option<&browser::Tags>) -> String {
     tags.and_then(|t| t.title.clone()).unwrap_or_else(|| {
         path.file_stem()
             .map_or("[TRACK]".into(), |s| s.to_string_lossy().into_owned())

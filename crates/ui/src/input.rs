@@ -5,7 +5,7 @@
 //! and the hardware behave alike.
 
 #[cfg(feature = "standin")]
-pub use engined::controls::Jog;
+pub use player_api::Jog;
 #[cfg(feature = "standin")]
-pub use surface::SECONDS_PER_TURN;
-pub use surface::{Control, ControlEvent, Nav};
+pub use player_api::SECONDS_PER_TURN;
+pub use player_api::{Control, ControlEvent, Nav};

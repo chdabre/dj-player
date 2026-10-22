@@ -1,6 +1,6 @@
 //! Input: what taps, drags and the browse controls do.
 
-use engine_core::DeckCommand;
+use player_api::DeckCommand;
 
 use super::fixtures::{cx, deck, hit, key, said, stick};
 use crate::app::effects::Effect;
@@ -165,7 +165,7 @@ fn the_question_has_the_focus_the_knob_answers_it() {
     s.nav(Nav::Push, &mut cx(&d, Some(&mut b), &mut fx));
     assert!(!s.browse.ask_scan);
     assert_eq!(said(&fx), [format!("{:?}", Effect::Scan)]);
-    assert_eq!(b.source(), engined::browse::Source::Library);
+    assert_eq!(b.source(), browser::Source::Library);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

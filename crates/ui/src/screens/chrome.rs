@@ -2,8 +2,8 @@
 //! the lower bands' panels. A screen draws it with [`frame`] and its own [`Chrome`] options,
 //! and lays itself out against the geometry here.
 
-use engine_core::DeckCommand;
-use engined::browse::Source;
+use browser::Source;
+use player_api::DeckCommand;
 
 use super::{Cx, ScreenKind, Screens, Target, Ui, View};
 use crate::app::effects::Effect;

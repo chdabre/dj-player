@@ -18,6 +18,8 @@ waveform = { path = "crates/waveform", default-features = false }
 library = { path = "crates/library" }
 rekordbox = { path = "crates/rekordbox" }
 surface = { path = "crates/surface" }
+player-api = { path = "crates/player-api" }
+browser = { path = "crates/browser" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"

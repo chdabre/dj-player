@@ -1,7 +1,7 @@
 //! What the screens' tests share: a deck, a view of it, a handler's context, a stick.
 
-use engine_core::DeckGrid;
-use engined::browse::Browser;
+use browser::Browser;
+use player_api::DeckGrid;
 
 use crate::app::effects::{Effect, Effects};
 use crate::app::engine::{DeckSnapshot, LibraryView};

@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use engined::browse::Browser;
+use browser::Browser;
 
 use super::browse::{InfoView, info_fields, info_panel};
 use super::chrome::{self, Chrome, Top};

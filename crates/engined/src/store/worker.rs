@@ -360,7 +360,7 @@ impl<'a> Worker<'a> {
         let files = loc
             .root
             .as_deref()
-            .map(crate::stick::walk)
+            .map(library::stick::walk)
             .unwrap_or_default();
         sayer(self.replies)(format!("library: scanning {} files", files.len()));
         let _ = self.replies.send(Reply::Scan {

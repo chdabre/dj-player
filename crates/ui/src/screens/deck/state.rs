@@ -1,7 +1,7 @@
 //! The deck displays' own state (the zoom step and the hand on the waveform) and what touches
 //! on them do.
 
-use engine_core::DeckCommand;
+use player_api::DeckCommand;
 
 use super::{DeckTarget, OVERVIEW};
 use crate::app::effects::Effect;

@@ -4,12 +4,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engined::Persistence;
-use engined::browse::Browser;
+use browser::Browser;
+use player_api::Persistence;
 
 use super::App;
 use super::capture::write_png;
-use super::engine::{DeckSnapshot, LibraryView};
 use crate::render;
 use crate::screens::browse::{BrowseView, InfoView};
 use crate::screens::info::{self, OnDeck};
@@ -48,7 +47,8 @@ impl App {
         self.player.tick_controls(dt);
         // Held controls act before the deck is read, as a press would.
         self.apply_effects();
-        self.deck = DeckSnapshot::read(&self.player);
+        self.deck = self.player.deck();
+        self.on_deck = self.player.on_deck();
         let sr = self.deck.sample_rate;
         let speed = self.deck.speed();
         let mut position = self.track.clock.update(now, self.deck.position, speed);
@@ -63,8 +63,8 @@ impl App {
                 .record_playhead((position - p - expected) / sr * 1e3);
         }
         self.track.last_shown = Some((now, position));
-        if let Some(d) = self.player.loaded() {
-            self.track.update_wave(d.waveform());
+        if let Some(d) = &self.on_deck {
+            self.track.update_wave(d.waveform.as_ref());
         }
         position
     }
@@ -76,13 +76,14 @@ impl App {
         let Some(b) = self.browser.as_mut() else {
             return startup;
         };
-        if let Some(p) = self.player.playlists() {
+        let library = self.player.library();
+        if let Some(p) = library.playlists {
             b.set_playlists(Arc::clone(p));
         }
-        if let Some(l) = self.player.listing() {
+        if let Some(l) = library.listing {
             b.set_listing(Arc::clone(l));
             // `--open` once the library has said what it has (playlists included).
-            if self.player.playlists().is_some()
+            if library.playlists.is_some()
                 && let Some(path) = self.pending_open.take()
             {
                 open_levels(b, &path);
@@ -117,9 +118,10 @@ impl App {
     /// A screenshot can be taken: the track is decoded, analysed and its waveform complete,
     /// and the browse screen shows everything it waits for.
     fn ready(&self) -> bool {
-        self.player.loaded().is_none_or(|d| {
-            d.analysed.is_some() && d.source.is_complete() && self.track.wave_complete
-        }) && (self.screens.screen != ScreenKind::Browse || self.browse_settled())
+        self.on_deck
+            .as_ref()
+            .is_none_or(|d| d.analysed && d.decoded && self.track.wave_complete)
+            && (self.screens.screen != ScreenKind::Browse || self.browse_settled())
     }
 
     /// Build the device screen (and the stand-in) into their scenes; returns how long it took.
@@ -168,27 +170,25 @@ impl App {
         if self.screens.screen != ScreenKind::Browse {
             return None;
         }
-        let library = LibraryView::read(&self.player);
-        let loaded = self.player.loaded();
-        self.browser.as_ref().map(|b| {
-            self.screens
-                .browse
-                .view(b, &library, loaded.map(|d| d.file()))
-        })
+        let library = self.player.library();
+        let loaded = self.on_deck.as_ref().map(|d| d.file.as_path());
+        self.browser
+            .as_ref()
+            .map(|b| self.screens.browse.view(b, &library, loaded))
     }
 
     /// The INFO screen's view, when it is up.
     fn info_view(&self) -> Option<InfoView> {
-        let loaded = self.player.loaded();
+        let loaded = self.on_deck.as_ref();
         (self.screens.screen == ScreenKind::Info).then(|| {
             info::view(
                 self.browser.as_ref(),
                 loaded
                     .zip(self.track.tags.as_ref())
                     .map(|(d, tags)| OnDeck {
-                        path: d.file(),
-                        bpm: d.analysed.as_ref().and_then(|a| a.bpm),
-                        key: d.analysed.as_ref().and_then(|a| a.key.clone()),
+                        path: &d.file,
+                        bpm: d.bpm,
+                        key: d.key.clone(),
                         tags,
                     }),
             )
@@ -197,7 +197,7 @@ impl App {
 
     /// What the status band says about the library.
     fn save_state(&self) -> Option<SaveState> {
-        self.player.persistence().map(|p| match p {
+        self.player.library().persistence.map(|p| match p {
             Persistence::Saved => SaveState::Saved,
             Persistence::Pending => SaveState::Saving,
             Persistence::Unsaved { .. } => SaveState::Unsaved,
@@ -236,7 +236,7 @@ impl App {
             self.stats.record(now, build, timing);
         }
         if let Some(summary) = self.stats.take_if_due(now, Duration::from_secs(2)) {
-            let load = self.player.load_meter().take();
+            let load = self.player.load_meter();
             eprintln!(
                 "{summary}  audio load avg {:.1} % peak {:.1} %",
                 load.average * 100.0,
@@ -251,6 +251,7 @@ impl App {
     #[cfg(feature = "standin")]
     fn shell_view(&self) -> standin::ShellView {
         let d = &self.deck;
+        let controls = self.player.controls();
         standin::ShellView {
             playing: d.playing,
             reverse: d.reverse,
@@ -260,9 +261,9 @@ impl App {
             hot_cues: d.hot_cues,
             rate: d.rate,
             position: d.position / d.sample_rate,
-            range: self.player.controls().range(),
-            vinyl: self.player.controls().vinyl(),
-            jog: self.player.controls().jog(),
+            range: controls.range,
+            vinyl: controls.vinyl,
+            jog: controls.jog,
         }
     }
 }

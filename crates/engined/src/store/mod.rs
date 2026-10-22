@@ -8,16 +8,13 @@ mod worker;
 
 pub use crate::config::device_id;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
-use library::{
-    AnalysisRef, AudioHash, DeviceId, Edit, Listed, Persistence, Playlist, PlaylistEntry,
-    PlaylistId, Track, TrackRef,
-};
+use library::{AnalysisRef, AudioHash, DeviceId, Edit, Persistence, PlaylistId, Track, TrackRef};
 use waveform::compute::Waveform;
 
 pub use library::{LIBRARY_DIR, stored_path};
@@ -55,32 +52,7 @@ pub struct Loaded {
     pub analysis: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
 }
 
-/// The library's tracks by path (relative to the stick's root, as stored).
-pub type Listing = HashMap<String, Listed>;
-
-/// The playlists of a library, as the browser shows them.
-#[derive(Debug, Clone, Default)]
-pub struct Playlists {
-    /// The tag list first, then the tree depth first (see [`library::Library::playlists`]).
-    pub lists: Vec<Playlist>,
-    /// Each list's entries, in order.
-    pub entries: HashMap<PlaylistId, Vec<PlaylistEntry>>,
-}
-
-impl Playlists {
-    pub fn get(&self, id: PlaylistId) -> Option<&Playlist> {
-        self.lists.iter().find(|p| p.id == id)
-    }
-
-    /// The tracks on the tag list.
-    pub fn tagged(&self) -> impl Iterator<Item = library::TrackId> + '_ {
-        self.entries
-            .get(&PlaylistId::TAG_LIST)
-            .into_iter()
-            .flatten()
-            .map(|e| e.track)
-    }
-}
+pub use player_api::{Listing, Playlists};
 
 /// What the batch job computed for one file, to store with its record (made if missing).
 #[derive(Debug, Clone)]
