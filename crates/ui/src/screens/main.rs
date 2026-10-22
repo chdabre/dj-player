@@ -1,27 +1,32 @@
 //! The main playback screen ("1 · Normal playback"): the title bar, phase meters and zoom
 //! waveform over the status band and overview.
 
+use super::chrome::{self, COLUMN_X, CONTENT_W, CONTENT_X, Chrome, DIVIDER_X, Top};
 use super::deck::{cue_column, phase, zoom};
-use super::{ChromeTarget, DeckTarget, Target, Ui, View, chrome, deck};
+use super::{ChromeTarget, DeckTarget, Target, Ui, View, deck};
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
 use crate::waves::OverviewCache;
 
-const ZOOM: Rect = Rect::new(113.0, 172.0, 703.0, 211.0);
+pub(crate) const ZOOM: Rect = Rect::new(CONTENT_X, 172.0, CONTENT_W, 211.0);
 
 /// Lay out the main screen.
 pub(crate) fn build(ui: &mut Ui, view: &View, overview: &mut OverviewCache) {
     let t = ui.t;
-    // Frame: rail, tab row, info, status band, bottom strip, column dividers.
-    chrome::rail_panel(ui);
-    ui.section(Rect::new(106.0, 2.0, 915.0, 64.0));
-    ui.section(Rect::new(106.0, 66.0, 915.0, 325.0));
-    chrome::lower(ui);
+    chrome::frame(
+        ui,
+        view,
+        Chrome {
+            top: Top::Tabs {
+                lit: Target::Chrome(ChromeTarget::Usb),
+                tab: None,
+            },
+            lower: true,
+        },
+    );
+    // The right column's divider, beside the zoom.
     ui.scene
-        .fill(822.0, 117.0, 1.0, 269.0, t.color.section_edge);
-
-    chrome::rail(ui, view, Target::Chrome(ChromeTarget::Usb));
-    chrome::tabs(ui, None);
+        .fill(DIVIDER_X, 117.0, 1.0, 269.0, t.color.section_edge);
     info(ui, view);
     deck::status(ui, view);
     deck::bottom(ui, view, overview);
@@ -31,7 +36,7 @@ fn info(ui: &mut Ui, v: &View) {
     let t = ui.t;
     // Title bar with the track colour on the left.
     ui.scene.rounded(
-        113.0,
+        CONTENT_X,
         69.0,
         903.0,
         43.0,
@@ -41,7 +46,7 @@ fn info(ui: &mut Ui, v: &View) {
         t.color.button_edge,
     );
     ui.scene.rounded(
-        113.0,
+        CONTENT_X,
         69.0,
         6.0,
         43.0,
@@ -70,26 +75,22 @@ fn info(ui: &mut Ui, v: &View) {
     // Right column: cue/loop memory and call.
     cue_column(ui, v, 159.0, 58.0, 62.0);
     let zoom_label = format!("ZOOM {}", v.zoom_beats);
+    let zoom_chip = Rect::new(COLUMN_X, 344.0, 88.0, 36.0);
     ui.chip(
-        Rect::new(828.0, 344.0, 88.0, 36.0),
+        zoom_chip,
         &zoom_label,
         t.text.chip,
         t.color.chip_edge,
         t.color.chip_selected,
     );
-    ui.hit(
-        Target::Deck(DeckTarget::Zoom),
-        Rect::new(828.0, 344.0, 88.0, 36.0),
-    );
+    ui.hit(Target::Deck(DeckTarget::Zoom), zoom_chip);
+    let grid_chip = Rect::new(923.0, 344.0, 93.0, 36.0);
     ui.chip(
-        Rect::new(923.0, 344.0, 93.0, 36.0),
+        grid_chip,
         "GRID",
         t.text.chip,
         t.color.chip_edge,
         Rgba::TRANSPARENT,
     );
-    ui.hit(
-        Target::Deck(DeckTarget::Grid),
-        Rect::new(923.0, 344.0, 93.0, 36.0),
-    );
+    ui.hit(Target::Deck(DeckTarget::Grid), grid_chip);
 }

@@ -1,6 +1,7 @@
 //! A track's details: the INFO screen's panel, and the browser's side panel beside the list.
 
 use super::*;
+use crate::screens::chrome::CONTENT_X;
 
 /// The INFO screen: a header with the source and the track's place, then the artwork as
 /// large as the panel is tall, and beside it the names, large BPM / key / time / rating
@@ -10,7 +11,7 @@ pub(crate) fn info_panel(ui: &mut Ui, i: &InfoView) {
     let t = ui.t;
     let line_y = |y: f32, h: f32, size: f32| y + (h - size * t.font.line_height) * 0.5;
     // Header bar.
-    let (hx, hy, hw, hh) = (113.0, 69.0, 903.0, 35.0);
+    let (hx, hy, hw, hh) = (CONTENT_X, 69.0, 903.0, 35.0);
     ui.scene.rounded(
         hx,
         hy,
@@ -35,7 +36,7 @@ pub(crate) fn info_panel(ui: &mut Ui, i: &InfoView) {
     );
 
     // Artwork: the panel's full height.
-    let (ax, ay) = (113.0, 111.0);
+    let (ax, ay) = (CONTENT_X, 111.0);
     let side = 384.0 - ay;
     match &i.art {
         Some(art) => ui.scene.image(Image {

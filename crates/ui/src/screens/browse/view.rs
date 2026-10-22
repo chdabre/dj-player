@@ -6,11 +6,11 @@ use std::path::Path;
 use engined::browse::{Browser, Kind, Source, Tags};
 use library::PlaylistKind;
 
+use super::editing::Modal;
 use super::state::BrowseState;
 use super::{BrowseView, InfoView, ModalView, ROWS, Row, RowKind, length};
 use crate::app::engine::LibraryView;
 use crate::app::track::track_title;
-use crate::playlists::Modal;
 
 impl BrowseState {
     /// What the browse screen shows of the browser; `loaded` is the file on the deck.

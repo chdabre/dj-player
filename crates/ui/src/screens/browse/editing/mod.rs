@@ -1,277 +1,20 @@
-//! Playlists on the browse screen: the MENU of actions on the selection, the playlist
-//! picker (ADD TO PLAYLIST), naming with the search keyboard, the confirmation before a
-//! delete, and moving an entry with the knob. [`Editing`] holds the state and turns choices
-//! into [`Effect`]s; the app carries them out on the player.
+//! Playlists on the browse screen: the MENU of actions on the selection (`menu.rs`), the
+//! playlist picker (ADD TO PLAYLIST), naming with the search keyboard, the confirmation before
+//! a delete (`modal.rs`), and moving an entry with the knob. [`Editing`] holds the state and
+//! turns choices into [`Effect`]s; the app carries them out on the player.
 
-use std::path::PathBuf;
+mod menu;
+mod modal;
 
-use engined::browse::{Browser, Kind, Sort, walk};
+pub use menu::{Action, menu, pick_lists, tag_target};
+pub use modal::{Modal, Naming};
+
+use engined::browse::{Browser, Sort};
 use library::{Edit, EntryId, PlaylistId, PlaylistKind};
 
+use super::{BACKSPACE, BrowseState, CLEAR, DONE, Shift};
 use crate::app::effects::Effect;
-use crate::screens::browse::{BACKSPACE, CLEAR, DONE};
-
-/// Something the MENU (or TAG TRACK) does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    /// Add these files to the tag list.
-    Tag(Vec<PathBuf>),
-    /// Remove these tag list entries.
-    Untag(Vec<EntryId>),
-    /// Pick a playlist to add these files to.
-    AddTo(Vec<PathBuf>),
-    /// Remove an entry from the shown list.
-    Remove(EntryId),
-    /// Move an entry with the knob.
-    Move(EntryId),
-    /// A new list of these files, named after `name` (asked first).
-    MakePlaylist {
-        files: Vec<PathBuf>,
-        name: String,
-    },
-    NewPlaylist(Option<PlaylistId>),
-    NewFolder(Option<PlaylistId>),
-    Rename(PlaylistId, String),
-    /// Ask, then delete.
-    Delete(PlaylistId, String),
-    /// The tag list into a new playlist (named first), emptying it.
-    ConvertTagList,
-    /// Ask, then empty the tag list.
-    ClearTagList,
-}
-
-impl Action {
-    pub fn label(&self) -> String {
-        match self {
-            Action::Tag(f) if f.len() > 1 => format!("ADD {} TRACKS TO TAG LIST", f.len()),
-            Action::Tag(_) => "ADD TO TAG LIST".into(),
-            Action::Untag(_) => "REMOVE FROM TAG LIST".into(),
-            Action::AddTo(f) if f.len() > 1 => format!("ADD {} TRACKS TO PLAYLIST…", f.len()),
-            Action::AddTo(_) => "ADD TO PLAYLIST…".into(),
-            Action::Remove(_) => "REMOVE FROM THIS LIST".into(),
-            Action::Move(_) => "MOVE".into(),
-            Action::MakePlaylist { .. } => "MAKE PLAYLIST".into(),
-            Action::NewPlaylist(_) => "NEW PLAYLIST".into(),
-            Action::NewFolder(_) => "NEW FOLDER".into(),
-            Action::Rename(..) => "RENAME".into(),
-            Action::Delete(..) => "DELETE".into(),
-            Action::ConvertTagList => "MAKE PLAYLIST FROM TAG LIST".into(),
-            Action::ClearTagList => "REMOVE ALL".into(),
-        }
-    }
-}
-
-/// What a name typed on the keyboard is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Naming {
-    NewPlaylist {
-        parent: Option<PlaylistId>,
-        files: Vec<PathBuf>,
-    },
-    NewFolder(Option<PlaylistId>),
-    Rename(PlaylistId),
-    ConvertTagList,
-}
-
-impl Naming {
-    pub fn prompt(&self) -> &'static str {
-        match self {
-            Naming::NewPlaylist { .. } | Naming::ConvertTagList => "NEW PLAYLIST",
-            Naming::NewFolder(_) => "NEW FOLDER",
-            Naming::Rename(_) => "RENAME",
-        }
-    }
-}
-
-/// A modal over the browse list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Modal {
-    Menu {
-        actions: Vec<Action>,
-        cursor: usize,
-    },
-    /// ADD TO PLAYLIST: `None` is NEW PLAYLIST.
-    Pick {
-        files: Vec<PathBuf>,
-        lists: Vec<(String, Option<PlaylistId>)>,
-        cursor: usize,
-    },
-    /// Typing a name on the keyboard.
-    Name {
-        naming: Naming,
-        text: String,
-    },
-    /// Delete or empty, once confirmed.
-    Confirm {
-        question: String,
-        action: Action,
-        cursor: usize,
-    },
-}
-
-impl Modal {
-    /// Rows a list modal shows: its title and its rows (none for naming).
-    pub fn rows(&self) -> Option<(String, Vec<String>, usize)> {
-        match self {
-            Modal::Menu { actions, cursor } => Some((
-                "MENU".into(),
-                actions.iter().map(Action::label).collect(),
-                *cursor,
-            )),
-            Modal::Pick { lists, cursor, .. } => Some((
-                "ADD TO PLAYLIST".into(),
-                lists.iter().map(|l| l.0.clone()).collect(),
-                *cursor,
-            )),
-            Modal::Confirm {
-                question, cursor, ..
-            } => Some((
-                question.clone(),
-                vec!["YES".into(), "CANCEL".into()],
-                *cursor,
-            )),
-            Modal::Name { .. } => None,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.rows().map_or(0, |r| r.1.len())
-    }
-
-    /// Move a list modal's cursor (clamped).
-    pub fn move_by(&mut self, delta: isize) {
-        let last = self.len().saturating_sub(1);
-        if let Modal::Menu { cursor, .. }
-        | Modal::Pick { cursor, .. }
-        | Modal::Confirm { cursor, .. } = self
-        {
-            *cursor = cursor.saturating_add_signed(delta).min(last);
-        }
-    }
-
-    pub fn select(&mut self, i: usize) {
-        if i < self.len()
-            && let Modal::Menu { cursor, .. }
-            | Modal::Pick { cursor, .. }
-            | Modal::Confirm { cursor, .. } = self
-        {
-            *cursor = i;
-        }
-    }
-}
-
-/// The files of the selection: a track, or every track under a folder.
-fn files_of(b: &Browser) -> Vec<PathBuf> {
-    let Some(e) = b.level().selected() else {
-        return Vec::new();
-    };
-    match e.kind {
-        Kind::Track if !e.path.as_os_str().is_empty() => vec![e.path.clone()],
-        Kind::Folder if e.path.is_dir() => walk(&e.path),
-        _ => Vec::new(),
-    }
-}
-
-/// The MENU for the browser's selection and the level shown.
-pub fn menu(b: &Browser) -> Vec<Action> {
-    let mut out = Vec::new();
-    let level = b.level();
-    let shown = b.shown_playlist();
-    match level.selected() {
-        Some(e) if e.kind == Kind::Track && !e.path.as_os_str().is_empty() => {
-            let tagged = b.tag_entries(&e.path);
-            if tagged.is_empty() {
-                out.push(Action::Tag(vec![e.path.clone()]));
-            } else {
-                out.push(Action::Untag(tagged));
-            }
-            out.push(Action::AddTo(vec![e.path.clone()]));
-        }
-        Some(e) if e.kind == Kind::Folder && e.path.is_dir() => {
-            let files = files_of(b);
-            if !files.is_empty() {
-                out.push(Action::MakePlaylist {
-                    files: files.clone(),
-                    name: e.name.clone(),
-                });
-                out.push(Action::Tag(files.clone()));
-                out.push(Action::AddTo(files));
-            }
-        }
-        Some(e) => {
-            if let Kind::Playlist(id) = e.kind {
-                let kind = b.playlists().and_then(|p| p.get(id)).map(|p| p.kind);
-                match kind {
-                    Some(PlaylistKind::Tag) => {
-                        out.push(Action::ConvertTagList);
-                        out.push(Action::ClearTagList);
-                    }
-                    Some(_) => {
-                        out.push(Action::Rename(id, e.name.clone()));
-                        out.push(Action::Delete(id, e.name.clone()));
-                    }
-                    None => {}
-                }
-            }
-        }
-        None => {}
-    }
-    // In a list: the selected entry.
-    if shown.is_some()
-        && let Some(entry) = level.selected().and_then(|e| e.entry)
-    {
-        if shown != Some(PlaylistId::TAG_LIST) {
-            out.push(Action::Remove(entry));
-        }
-        out.push(Action::Move(entry));
-    }
-    if shown == Some(PlaylistId::TAG_LIST) && !level.entries.is_empty() {
-        out.push(Action::ConvertTagList);
-        out.push(Action::ClearTagList);
-    }
-    if let Some(parent) = b.shown_playlist_folder() {
-        out.push(Action::NewPlaylist(parent));
-        out.push(Action::NewFolder(parent));
-    }
-    out.dedup();
-    out
-}
-
-/// The lists files can go into, by their place in the tree ("Saturday / Peak"), after NEW
-/// PLAYLIST. The tag list has its own button.
-pub fn pick_lists(b: &Browser) -> Vec<(String, Option<PlaylistId>)> {
-    let mut out = vec![("NEW PLAYLIST".to_string(), None)];
-    let Some(p) = b.playlists() else {
-        return out;
-    };
-    let name_of = |id: PlaylistId| p.get(id).map_or_else(String::new, |l| l.name.clone());
-    for l in &p.lists {
-        if l.kind != PlaylistKind::List {
-            continue;
-        }
-        let mut path = vec![l.name.clone()];
-        let mut up = l.parent;
-        while let Some(f) = up {
-            path.push(name_of(f));
-            up = p.get(f).and_then(|x| x.parent);
-        }
-        path.reverse();
-        out.push((path.join("  /  "), Some(l.id)));
-    }
-    out
-}
-
-/// TAG TRACK's track: the selection on the browse screen, else the loaded file.
-pub fn tag_target(b: Option<&Browser>, browsing: bool, loaded: Option<PathBuf>) -> Option<PathBuf> {
-    if browsing
-        && let Some(e) = b.and_then(|b| b.level().selected())
-        && e.kind == Kind::Track
-        && !e.path.as_os_str().is_empty()
-    {
-        return Some(e.path.clone());
-    }
-    loaded
-}
+use crate::screens::Cx;
 
 /// Editing playlists on the browse screen: the modal over the list, if any, and the entry the
 /// knob is moving, if any.
@@ -476,9 +219,71 @@ fn named(naming: Naming, name: String) -> Effect {
     }
 }
 
+/// The browse state's side of editing: the keyboard's shift and the context's browser.
+impl BrowseState {
+    /// A key typed into a name (on-screen keyboard or a real one); DONE names it.
+    pub fn type_name(&mut self, c: char, cx: &mut Cx) {
+        self.editing.type_name(c, cx.effects);
+    }
+
+    /// MENU: the actions on the selection, as a modal.
+    pub fn open_menu(&mut self, cx: &mut Cx) {
+        let Some(b) = cx.browser.as_deref() else {
+            return;
+        };
+        if !self.editing.open_menu(b) {
+            eprintln!("menu: nothing to do here");
+            return;
+        }
+        self.keyboard = false;
+    }
+
+    /// The modal's push (or a touch on one of its rows). A name to type starts with a
+    /// capital when it is empty.
+    pub(in crate::screens::browse) fn modal_push(&mut self, cx: &mut Cx) {
+        self.editing.push(cx.browser.as_deref_mut(), cx.effects);
+        self.shift = if self.editing.naming_empty() {
+            Shift::Once
+        } else {
+            Shift::Off
+        };
+    }
+
+    /// MOVE: the moving entry one place up (`-1`) or down, the cursor with it.
+    pub(in crate::screens::browse) fn move_entry(&mut self, delta: isize, cx: &mut Cx) {
+        if let Some(b) = cx.browser.as_deref_mut() {
+            self.editing.move_entry(delta, b, cx.effects);
+        }
+    }
+
+    /// TAG TRACK: the selected track (on the browse screen) or the loaded one onto the tag
+    /// list; `remove` (a long press) takes it off.
+    pub fn tag_track(&mut self, remove: bool, browsing: bool, cx: &mut Cx) {
+        let loaded = cx.loaded.map(|p| p.to_path_buf());
+        let Some(path) = tag_target(cx.browser.as_deref(), browsing, loaded) else {
+            return;
+        };
+        let tagged = cx
+            .browser
+            .as_deref()
+            .map(|b| b.tag_entries(&path))
+            .unwrap_or_default();
+        let action = match (remove, tagged.is_empty()) {
+            (true, false) => Action::Untag(tagged),
+            (false, true) => Action::Tag(vec![path]),
+            // Already tagged, or nothing to remove.
+            _ => return,
+        };
+        self.editing
+            .act(action, cx.browser.as_deref_mut(), cx.effects);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screens::browse::{BACKSPACE, CLEAR, DONE};
+    use std::path::PathBuf;
 
     #[test]
     fn modal_cursors_clamp() {

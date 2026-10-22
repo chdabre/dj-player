@@ -537,52 +537,38 @@ impl Theme {
 mod tests {
     use super::*;
 
+    /// Every `.rs` file under `src/`, by its path there, with its contents.
+    fn sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![root.clone()];
+        let mut out = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path.strip_prefix(&root).unwrap().to_string_lossy();
+                    let src = std::fs::read_to_string(&path).unwrap();
+                    out.push((name.replace('\\', "/"), src));
+                }
+            }
+        }
+        out
+    }
+
     /// Screens take colours and sizes from the theme only: no colour literal outside this
-    /// file (tests excepted).
+    /// file, in any file under `src/` (tests excepted).
     #[test]
     fn screens_have_no_colour_literals() {
-        for (file, src) in [
-            ("main.rs", include_str!("main.rs")),
-            ("args.rs", include_str!("args.rs")),
-            ("app/mod.rs", include_str!("app/mod.rs")),
-            ("app/frame.rs", include_str!("app/frame.rs")),
-            ("app/platform.rs", include_str!("app/platform.rs")),
-            ("screens/mod.rs", include_str!("screens/mod.rs")),
-            ("screens/chrome.rs", include_str!("screens/chrome.rs")),
-            ("screens/deck.rs", include_str!("screens/deck.rs")),
-            ("screens/main.rs", include_str!("screens/main.rs")),
-            ("screens/info.rs", include_str!("screens/info.rs")),
-            ("screens/perform.rs", include_str!("screens/perform.rs")),
-            (
-                "screens/browse/mod.rs",
-                include_str!("screens/browse/mod.rs"),
-            ),
-            (
-                "screens/browse/keyboard.rs",
-                include_str!("screens/browse/keyboard.rs"),
-            ),
-            (
-                "screens/browse/list.rs",
-                include_str!("screens/browse/list.rs"),
-            ),
-            (
-                "screens/browse/panels.rs",
-                include_str!("screens/browse/panels.rs"),
-            ),
-            (
-                "screens/browse/modal.rs",
-                include_str!("screens/browse/modal.rs"),
-            ),
-            ("standin.rs", include_str!("standin.rs")),
-            ("kit/mod.rs", include_str!("kit/mod.rs")),
-            ("kit/rect.rs", include_str!("kit/rect.rs")),
-            ("render/mod.rs", include_str!("render/mod.rs")),
-            ("render/rects.rs", include_str!("render/rects.rs")),
-            ("render/waves.rs", include_str!("render/waves.rs")),
-            ("render/images.rs", include_str!("render/images.rs")),
-            ("render/text.rs", include_str!("render/text.rs")),
-            ("render/offscreen.rs", include_str!("render/offscreen.rs")),
-        ] {
+        let files = sources();
+        assert!(files.iter().any(|(f, _)| f == "screens/mod.rs"));
+        for (file, src) in &files {
+            // The tokens themselves, and tests (whole test modules, and test code after
+            // `#[cfg(test)]`).
+            if file == "theme.rs" || file.split('/').any(|part| part == "tests") {
+                continue;
+            }
             let code = src.split("#[cfg(test)]").next().unwrap_or(src);
             for pattern in ["Rgba::hex(", "Rgba(["] {
                 assert!(

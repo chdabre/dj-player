@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use engined::browse::Thumb;
 
+mod editing;
 mod keyboard;
 mod list;
 mod modal;
@@ -34,7 +35,7 @@ use list::*;
 use modal::*;
 use panels::*;
 
-use super::chrome::{lower, rail, rail_panel, tabs};
+use super::chrome::{self, Chrome, Top};
 use super::deck::{bottom, status};
 use super::{ChromeTarget, Target, Ui, View};
 use crate::kit::Rect;
@@ -175,9 +176,6 @@ pub struct BrowseView {
 }
 
 pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut OverviewCache) {
-    rail_panel(ui);
-    ui.section(Rect::new(106.0, 2.0, 915.0, 64.0));
-    ui.section(Rect::new(106.0, 66.0, 915.0, 325.0));
     // The tag list belongs to no source on the rail.
     let lit = if b.library {
         Target::Chrome(ChromeTarget::Library)
@@ -186,14 +184,22 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
     } else {
         Target::Chrome(ChromeTarget::Usb)
     };
-    rail(ui, v, lit);
-    tabs(
+    let tab = if b.tag_list {
+        Target::Chrome(ChromeTarget::TagList)
+    } else {
+        Target::Chrome(ChromeTarget::Browse)
+    };
+    chrome::frame(
         ui,
-        Some(if b.tag_list {
-            Target::Chrome(ChromeTarget::TagList)
-        } else {
-            Target::Chrome(ChromeTarget::Browse)
-        }),
+        v,
+        Chrome {
+            top: Top::Tabs {
+                lit,
+                tab: Some(tab),
+            },
+            // The keyboard goes over the lower bands.
+            lower: !b.keyboard,
+        },
     );
     header(ui, b);
     list(ui, b);
@@ -203,7 +209,6 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
     if b.keyboard {
         keyboard(ui, b.shift);
     } else {
-        lower(ui);
         status(ui, v);
         bottom(ui, v, overview);
     }

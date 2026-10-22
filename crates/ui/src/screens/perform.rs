@@ -11,11 +11,12 @@
 
 use engine_core::{BEAT_LOOPS, DeckCommand, HOT_CUES};
 
-use super::chrome::{lower, rail_bottom, rail_panel};
+use super::chrome::{self, COLUMN_W, COLUMN_X, CONTENT_W, CONTENT_X, Chrome, Top};
 use super::deck::{bottom, cue_column, hot_cue_color, hot_cue_letter, phase, status, zoom};
 use super::{ChromeTarget, Target, Ui, View};
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
+
 /// The performance screen's touch targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerfTarget {
@@ -32,11 +33,11 @@ pub enum PerfTarget {
 /// Pads per bank.
 pub const PADS: usize = 4;
 
-const ZOOM: Rect = Rect::new(113.0, 95.0, 703.0, 72.0);
+const ZOOM: Rect = Rect::new(CONTENT_X, 95.0, CONTENT_W, 72.0);
 
-const PAD_ROW: Rect = Rect::new(113.0, 180.0, 703.0, 88.0);
+const PAD_ROW: Rect = Rect::new(CONTENT_X, 180.0, CONTENT_W, 88.0);
 
-const LOOP_ROW: Rect = Rect::new(113.0, 299.0, 703.0, 67.0);
+const LOOP_ROW: Rect = Rect::new(CONTENT_X, 299.0, CONTENT_W, 67.0);
 
 /// Inner padding of a pad row, and the gap between pads.
 const ROW_PAD: f32 = 6.0;
@@ -220,26 +221,22 @@ fn row_frame(ui: &mut Ui, Rect { x, y, w, h }: Rect) {
 
 /// Lay out the performance screen.
 pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::OverviewCache) {
-    let t = ui.t;
     let perf = v.perf;
-
-    // Frame: rail, top row, pads section, status band, bottom strip, column dividers.
-    rail_panel(ui);
-    ui.section(Rect::new(106.0, 2.0, 915.0, 85.0));
-    ui.section(Rect::new(106.0, 90.0, 915.0, 301.0));
-    lower(ui);
-    for (y, h) in [(7.0, 75.0), (95.0, 292.0)] {
-        ui.scene.fill(822.0, y, 1.0, h, t.color.section_edge);
-    }
-
+    chrome::frame(
+        ui,
+        v,
+        Chrome {
+            top: Top::Perform,
+            lower: true,
+        },
+    );
     rail(ui, perf);
-    rail_bottom(ui, v);
 
     // Top row: phase meters and the way back to the main screen.
     phase(ui, v, 233.0, 367.0, 12.0);
     ui.button(
         Target::Chrome(ChromeTarget::Perform),
-        Rect::new(828.0, 7.0, 188.0, 77.0),
+        Rect::new(COLUMN_X, 7.0, COLUMN_W, 77.0),
         "PERFORM",
         None,
         true,

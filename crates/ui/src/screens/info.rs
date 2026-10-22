@@ -7,22 +7,26 @@ use std::path::Path;
 use engined::browse::Browser;
 
 use super::browse::{InfoView, info_fields, info_panel};
-use super::chrome::{lower, rail, rail_panel, tabs};
+use super::chrome::{self, Chrome, Top};
 use super::deck::{bottom, status};
 use super::{ChromeTarget, Target, Ui, View};
 use crate::app::track::LoadedTags;
-use crate::kit::Rect;
 use crate::waves::OverviewCache;
 
 /// Lay out the INFO screen.
 pub(crate) fn build(ui: &mut Ui, v: &View, info: &InfoView, overview: &mut OverviewCache) {
-    rail_panel(ui);
-    ui.section(Rect::new(106.0, 2.0, 915.0, 64.0));
-    ui.section(Rect::new(106.0, 66.0, 915.0, 325.0));
-    rail(ui, v, Target::Chrome(ChromeTarget::Usb));
-    tabs(ui, Some(Target::Chrome(ChromeTarget::Info)));
+    chrome::frame(
+        ui,
+        v,
+        Chrome {
+            top: Top::Tabs {
+                lit: Target::Chrome(ChromeTarget::Usb),
+                tab: Some(Target::Chrome(ChromeTarget::Info)),
+            },
+            lower: true,
+        },
+    );
     info_panel(ui, info);
-    lower(ui);
     status(ui, v);
     bottom(ui, v, overview);
 }

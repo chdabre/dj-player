@@ -3,7 +3,7 @@
 use super::*;
 
 /// Where the keyboard goes: over the status band and the bottom strip.
-pub(super) const KEYBOARD: Rect = Rect::new(106.0, 395.0, 915.0, 202.0);
+pub(super) const KEYBOARD: Rect = crate::screens::chrome::LOWER;
 
 /// The on-screen keyboard's special keys, as characters.
 pub const BACKSPACE: char = '\u{8}';

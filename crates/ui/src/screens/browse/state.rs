@@ -13,10 +13,10 @@ use engined::persist::Listing;
 use super::{BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, Shift, key_char};
 use winit::keyboard::{Key, NamedKey};
 
+use super::editing::Editing;
 use crate::app::effects::Effect;
 use crate::app::keymap::{self, KeyPress};
 use crate::input::Nav;
-use crate::playlists::{self, Action, Editing};
 use crate::screens::{Cx, ScreenKind, Show};
 
 /// Finger travel (design pixels) before a touch on the list counts as a drag.
@@ -325,63 +325,6 @@ impl BrowseState {
             _ => {}
         }
         b.set_query(&q);
-    }
-
-    /// A key typed into a name (on-screen keyboard or a real one); DONE names it.
-    pub fn type_name(&mut self, c: char, cx: &mut Cx) {
-        self.editing.type_name(c, cx.effects);
-    }
-
-    /// MENU: the actions on the selection, as a modal.
-    pub fn open_menu(&mut self, cx: &mut Cx) {
-        let Some(b) = cx.browser.as_deref() else {
-            return;
-        };
-        if !self.editing.open_menu(b) {
-            eprintln!("menu: nothing to do here");
-            return;
-        }
-        self.keyboard = false;
-    }
-
-    /// The modal's push (or a touch on one of its rows). A name to type starts with a
-    /// capital when it is empty.
-    fn modal_push(&mut self, cx: &mut Cx) {
-        self.editing.push(cx.browser.as_deref_mut(), cx.effects);
-        self.shift = if self.editing.naming_empty() {
-            Shift::Once
-        } else {
-            Shift::Off
-        };
-    }
-
-    /// MOVE: the moving entry one place up (`-1`) or down, the cursor with it.
-    fn move_entry(&mut self, delta: isize, cx: &mut Cx) {
-        if let Some(b) = cx.browser.as_deref_mut() {
-            self.editing.move_entry(delta, b, cx.effects);
-        }
-    }
-
-    /// TAG TRACK: the selected track (on the browse screen) or the loaded one onto the tag
-    /// list; `remove` (a long press) takes it off.
-    pub fn tag_track(&mut self, remove: bool, browsing: bool, cx: &mut Cx) {
-        let loaded = cx.loaded.map(|p| p.to_path_buf());
-        let Some(path) = playlists::tag_target(cx.browser.as_deref(), browsing, loaded) else {
-            return;
-        };
-        let tagged = cx
-            .browser
-            .as_deref()
-            .map(|b| b.tag_entries(&path))
-            .unwrap_or_default();
-        let action = match (remove, tagged.is_empty()) {
-            (true, false) => Action::Untag(tagged),
-            (false, true) => Action::Tag(vec![path]),
-            // Already tagged, or nothing to remove.
-            _ => return,
-        };
-        self.editing
-            .act(action, cx.browser.as_deref_mut(), cx.effects);
     }
 
     /// ANALYZE ALL: analyse every library track without our analysis, in a batch; or stop.

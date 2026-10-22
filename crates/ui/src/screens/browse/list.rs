@@ -2,14 +2,15 @@
 //! rows with jacket, title, artist and details, and the scroll bar.
 
 use super::*;
+use crate::screens::chrome::CONTENT_X;
 
-pub(super) const HEADER: Rect = Rect::new(113.0, 69.0, 903.0, 31.0);
+pub(super) const HEADER: Rect = Rect::new(CONTENT_X, 69.0, 903.0, 31.0);
 
 pub(super) const LIST_Y: f32 = 103.0;
 /// The rows' area, dimmed under a modal.
 pub(super) const LIST_AREA: Rect = Rect::new(107.0, LIST_Y, 913.0, ROW_H * ROWS as f32);
 
-pub(super) const JACKET_X: f32 = 113.0;
+pub(super) const JACKET_X: f32 = CONTENT_X;
 
 pub(super) const JACKET_W: f32 = 95.0;
 

@@ -30,7 +30,6 @@ mod clock;
 #[cfg_attr(not(feature = "standin"), allow(dead_code))]
 mod input;
 mod kit;
-mod playlists;
 mod render;
 mod screens;
 #[cfg(feature = "standin")]
