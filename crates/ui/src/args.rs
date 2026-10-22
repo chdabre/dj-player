@@ -57,156 +57,29 @@ pub struct Args {
     pub hot_cues: Vec<f64>,
 }
 
+/// The arguments still to read.
+type Rest = std::iter::Skip<std::env::Args>;
+
 pub fn parse() -> Result<Args, String> {
-    let mut file = None;
-    let mut request = StreamRequest::default();
-    let (mut fullscreen, mut screenshot, mut at) = (false, None, None);
-    let mut standin = cfg!(feature = "standin");
-    let (mut play, mut run_for) = (false, None);
-    let mut theme = Theme::default();
+    let mut a = Args::defaults();
     let mut wave_theme: Option<String> = None;
-    let mut wave_mode = Mode::ThreeBand;
-    let mut library = None;
-    let mut browse = false;
-    let (mut source, mut sort, mut search, mut scan) = (None, None, None, false);
-    let (mut info, mut info_screen, mut analyze_all) = (false, false, false);
-    let (mut open, mut menu) = (None, false);
-    let mut auto_cue = AutoCue::default();
-    let mut perform: Option<PerfState> = None;
-    let mut hot_cues: Vec<f64> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--wave-theme" {
+            wave_theme = Some(args.next().ok_or("--wave-theme needs a name")?);
+            continue;
+        }
+        let handled = output(&mut a, &arg, &mut args)?
+            || look(&mut a, &arg, &mut args)?
+            || deck(&mut a, &arg, &mut args)?
+            || browse(&mut a, &arg, &mut args)?;
+        if handled {
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Err(String::new()),
-            "--device" => request.device = Some(args.next().ok_or("--device needs a name")?),
-            "--buffer" => {
-                let n = args.next().ok_or("--buffer needs a frame count")?;
-                request.buffer_frames = Some(n.parse().map_err(|_| format!("bad buffer {n:?}"))?);
-            }
-            "--fullscreen" => fullscreen = true,
-            "--no-standin" => standin = false,
-            "--screenshot" => {
-                screenshot = Some(PathBuf::from(
-                    args.next().ok_or("--screenshot needs a path")?,
-                ))
-            }
-            "--at" => {
-                let s = args.next().ok_or("--at needs seconds")?;
-                at = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
-            }
-            "--wave-theme" => {
-                let name = args.next().ok_or("--wave-theme needs a name")?;
-                wave_theme = Some(name);
-            }
-            "--wave-mode" => {
-                let name = args
-                    .next()
-                    .ok_or("--wave-mode needs 3band, rgb or single")?;
-                wave_mode = Mode::ALL
-                    .into_iter()
-                    .find(|m| m.name() == name)
-                    .ok_or(format!(
-                        "unknown waveform mode {name:?} (3band, rgb, single)"
-                    ))?;
-            }
-            "--perform" => {
-                perform.get_or_insert_with(PerfState::default);
-            }
-            "--pad-mode" => {
-                let p = perform.get_or_insert_with(PerfState::default);
-                match args.next().as_deref() {
-                    Some("hotcue") => {}
-                    Some("beatjump") => p.mode = perform::PadMode::BeatJump,
-                    Some("delete") => p.delete_armed = true,
-                    other => {
-                        return Err(format!("bad pad mode {other:?} (hotcue, beatjump, delete)"));
-                    }
-                }
-            }
-            "--hot-cues" => {
-                let list = args
-                    .next()
-                    .ok_or("--hot-cues needs seconds, comma-separated")?;
-                hot_cues = list
-                    .split(',')
-                    .map(|x| {
-                        x.trim()
-                            .parse::<f64>()
-                            .map_err(|_| format!("bad time {x:?}"))
-                    })
-                    .collect::<Result<_, _>>()?;
-            }
-            "--play" => play = true,
-            "--theme" => {
-                let name = args.next().ok_or("--theme needs a name")?;
-                theme = Theme::named(&name).ok_or_else(|| {
-                    let names: Vec<_> = Theme::all().iter().map(|t| t.name).collect();
-                    format!("unknown theme {name:?} (themes: {})", names.join(", "))
-                })?;
-            }
-            "--library" => {
-                library = Some(LibraryChoice::Folder(PathBuf::from(
-                    args.next().ok_or("--library needs a folder")?,
-                )))
-            }
-            "--no-library" => library = Some(LibraryChoice::Ram),
-            "--browse" => browse = true,
-            "--source" => {
-                source = Some(match args.next().as_deref() {
-                    Some("usb") => Source::Folders,
-                    Some("library") => Source::Library,
-                    Some("taglist") => Source::TagList,
-                    other => return Err(format!("bad source {other:?} (usb, library)")),
-                });
-                browse = true;
-            }
-            "--sort" => {
-                let name = args.next().unwrap_or_default();
-                sort = Some(
-                    Sort::ALL
-                        .into_iter()
-                        .find(|s| s.label().eq_ignore_ascii_case(&name))
-                        .ok_or(format!("bad sort {name:?}"))?,
-                );
-                browse = true;
-            }
-            "--info" => {
-                info = true;
-                browse = true;
-            }
-            "--info-screen" => info_screen = true,
-            "--open" => {
-                open = Some(args.next().ok_or("--open needs names, /-separated")?);
-                browse = true;
-            }
-            "--menu" => {
-                menu = true;
-                open.get_or_insert_with(String::new);
-                browse = true;
-            }
-            "--analyze-all" => {
-                analyze_all = true;
-                source = Some(Source::Library);
-                browse = true;
-            }
-            "--scan" => {
-                scan = true;
-                browse = true;
-            }
-            "--search" => {
-                search = Some(args.next().ok_or("--search needs a query")?);
-                browse = true;
-            }
-            "--auto-cue" => {
-                let v = args.next().ok_or("--auto-cue needs off or a level in dB")?;
-                auto_cue = AutoCue::parse(&v).ok_or(format!("bad auto cue {v:?}"))?;
-            }
-            "--run-for" => {
-                let s = args.next().ok_or("--run-for needs seconds")?;
-                run_for = Some(s.parse().map_err(|_| format!("bad time {s:?}"))?);
-            }
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
-            _ if file.is_none() => file = Some(PathBuf::from(arg)),
+            _ if a.file.is_none() => a.file = Some(PathBuf::from(arg)),
             _ => return Err("only one file, please".into()),
         }
     }
@@ -215,37 +88,199 @@ pub fn parse() -> Result<Args, String> {
             .iter()
             .map(|t| t.name)
             .collect();
-        theme = theme.with_waveform_theme(&name).ok_or_else(|| {
+        a.theme = a.theme.with_waveform_theme(&name).ok_or_else(|| {
             format!(
                 "unknown waveform theme {name:?} (themes: {})",
                 names.join(", ")
             )
         })?;
     }
-    Ok(Args {
-        file,
-        request,
-        fullscreen,
-        standin,
-        screenshot,
-        at,
-        play,
-        run_for,
-        theme,
-        wave_mode,
-        library,
-        auto_cue,
-        perform,
-        browse,
-        source,
-        sort,
-        search,
-        scan,
-        info,
-        info_screen,
-        analyze_all,
-        open,
-        menu,
-        hot_cues,
-    })
+    Ok(a)
+}
+
+impl Args {
+    /// Everything as it is without options.
+    fn defaults() -> Self {
+        Args {
+            file: None,
+            request: StreamRequest::default(),
+            fullscreen: false,
+            standin: cfg!(feature = "standin"),
+            screenshot: None,
+            at: None,
+            play: false,
+            run_for: None,
+            theme: Theme::default(),
+            wave_mode: Mode::ThreeBand,
+            library: None,
+            auto_cue: AutoCue::default(),
+            perform: None,
+            browse: false,
+            source: None,
+            sort: None,
+            search: None,
+            scan: false,
+            info: false,
+            info_screen: false,
+            analyze_all: false,
+            open: None,
+            menu: false,
+            hot_cues: Vec::new(),
+        }
+    }
+}
+
+/// A time option's seconds.
+fn seconds(s: &str) -> Result<f64, String> {
+    s.parse().map_err(|_| format!("bad time {s:?}"))
+}
+
+/// The audio device, the window and what to do with the frames: true if `arg` was one.
+fn output(a: &mut Args, arg: &str, args: &mut Rest) -> Result<bool, String> {
+    match arg {
+        "--device" => a.request.device = Some(args.next().ok_or("--device needs a name")?),
+        "--buffer" => {
+            let n = args.next().ok_or("--buffer needs a frame count")?;
+            a.request.buffer_frames = Some(n.parse().map_err(|_| format!("bad buffer {n:?}"))?);
+        }
+        "--fullscreen" => a.fullscreen = true,
+        "--no-standin" => a.standin = false,
+        "--screenshot" => {
+            a.screenshot = Some(PathBuf::from(
+                args.next().ok_or("--screenshot needs a path")?,
+            ))
+        }
+        "--run-for" => a.run_for = Some(seconds(&args.next().ok_or("--run-for needs seconds")?)?),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The theme and the waveform mode: true if `arg` was one.
+fn look(a: &mut Args, arg: &str, args: &mut Rest) -> Result<bool, String> {
+    match arg {
+        "--theme" => {
+            let name = args.next().ok_or("--theme needs a name")?;
+            a.theme = Theme::named(&name).ok_or_else(|| {
+                let names: Vec<_> = Theme::all().iter().map(|t| t.name).collect();
+                format!("unknown theme {name:?} (themes: {})", names.join(", "))
+            })?;
+        }
+        "--wave-mode" => {
+            let name = args
+                .next()
+                .ok_or("--wave-mode needs 3band, rgb or single")?;
+            a.wave_mode = Mode::ALL
+                .into_iter()
+                .find(|m| m.name() == name)
+                .ok_or(format!(
+                    "unknown waveform mode {name:?} (3band, rgb, single)"
+                ))?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The deck and the performance screen at start: true if `arg` was one.
+fn deck(a: &mut Args, arg: &str, args: &mut Rest) -> Result<bool, String> {
+    match arg {
+        "--at" => a.at = Some(seconds(&args.next().ok_or("--at needs seconds")?)?),
+        "--play" => a.play = true,
+        "--perform" => {
+            a.perform.get_or_insert_with(PerfState::default);
+        }
+        "--pad-mode" => {
+            let p = a.perform.get_or_insert_with(PerfState::default);
+            match args.next().as_deref() {
+                Some("hotcue") => {}
+                Some("beatjump") => p.mode = perform::PadMode::BeatJump,
+                Some("delete") => p.delete_armed = true,
+                other => {
+                    return Err(format!("bad pad mode {other:?} (hotcue, beatjump, delete)"));
+                }
+            }
+        }
+        "--hot-cues" => {
+            let list = args
+                .next()
+                .ok_or("--hot-cues needs seconds, comma-separated")?;
+            a.hot_cues = list
+                .split(',')
+                .map(|x| {
+                    x.trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("bad time {x:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        "--auto-cue" => {
+            let v = args.next().ok_or("--auto-cue needs off or a level in dB")?;
+            a.auto_cue = AutoCue::parse(&v).ok_or(format!("bad auto cue {v:?}"))?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The library and the browse and INFO screens at start: true if `arg` was one. Most of
+/// these start on the browse screen.
+fn browse(a: &mut Args, arg: &str, args: &mut Rest) -> Result<bool, String> {
+    match arg {
+        "--library" => {
+            a.library = Some(LibraryChoice::Folder(PathBuf::from(
+                args.next().ok_or("--library needs a folder")?,
+            )))
+        }
+        "--no-library" => a.library = Some(LibraryChoice::Ram),
+        "--info-screen" => a.info_screen = true,
+        "--browse" => a.browse = true,
+        "--source" => {
+            a.source = Some(match args.next().as_deref() {
+                Some("usb") => Source::Folders,
+                Some("library") => Source::Library,
+                Some("taglist") => Source::TagList,
+                other => return Err(format!("bad source {other:?} (usb, library)")),
+            });
+            a.browse = true;
+        }
+        "--sort" => {
+            let name = args.next().unwrap_or_default();
+            a.sort = Some(
+                Sort::ALL
+                    .into_iter()
+                    .find(|s| s.label().eq_ignore_ascii_case(&name))
+                    .ok_or(format!("bad sort {name:?}"))?,
+            );
+            a.browse = true;
+        }
+        "--info" => {
+            a.info = true;
+            a.browse = true;
+        }
+        "--open" => {
+            a.open = Some(args.next().ok_or("--open needs names, /-separated")?);
+            a.browse = true;
+        }
+        "--menu" => {
+            a.menu = true;
+            a.open.get_or_insert_with(String::new);
+            a.browse = true;
+        }
+        "--analyze-all" => {
+            a.analyze_all = true;
+            a.source = Some(Source::Library);
+            a.browse = true;
+        }
+        "--scan" => {
+            a.scan = true;
+            a.browse = true;
+        }
+        "--search" => {
+            a.search = Some(args.next().ok_or("--search needs a query")?);
+            a.browse = true;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }

@@ -96,104 +96,26 @@ impl App {
     /// Start the engine and the library as `args` ask, load the file if one was given, and
     /// set up the screens; on failure, the exit code (the reason is printed).
     pub fn start(args: Args) -> Result<Self, ExitCode> {
-        // On the dev host a folder stands in for the stick: its root, with our library in it.
-        let root = std::env::var_os("LIBRARY_DIR").map(PathBuf::from);
-        if let Some(r) = &root
-            && !r.is_dir()
-        {
-            eprintln!("dj-ui: LIBRARY_DIR {} is not a folder", r.display());
-            return Err(ExitCode::from(2));
-        }
-        if args.file.is_none() && root.is_none() {
-            eprintln!("dj-ui: no file given, and LIBRARY_DIR is not set");
-            eprintln!("{}", args::USAGE);
-            return Err(ExitCode::from(2));
-        }
-        let library = match (args.library.clone(), &root) {
-            (Some(choice), _) => choice,
-            (None, Some(r)) => LibraryChoice::Folder(r.join(engined::persist::LIBRARY_DIR)),
-            (None, None) => LibraryChoice::Auto,
-        };
-        // A stick with no library is asked about once, before mounting makes one.
-        let ask_scan = args.library.is_none()
-            && root.as_ref().is_some_and(|r| {
-                !r.join(engined::persist::LIBRARY_DIR)
-                    .join("library.db")
-                    .exists()
-            });
-        let backend = CpalBackend::new();
-        let options = Options {
-            library,
-            auto_cue: args.auto_cue,
-            ..Options::default()
-        };
-        let mut player = match Player::start(&backend, &args.request, options) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("dj-ui: {e}");
-                return Err(ExitCode::FAILURE);
-            }
-        };
-        eprintln!(
-            "{} Hz, {} ch, buffer {}, {}",
-            player.format.sample_rate,
-            player.format.channels,
-            player
-                .buffer_frames()
-                .map_or("default".into(), |n| format!("{n} frames")),
-            player.device_name()
-        );
-        if args.scan {
-            player.scan();
-        }
-        if let Some(file) = &args.file {
-            if let Err(e) = player.load(file) {
-                eprintln!("dj-ui: {}: {e}", file.display());
-                return Err(ExitCode::FAILURE);
-            }
-            let sr = f64::from(player.format.sample_rate);
-            for (i, &at) in args.hot_cues.iter().enumerate().take(engine_core::HOT_CUES) {
-                player.send(DeckCommand::Seek(at * sr));
-                player.send(DeckCommand::HotCue(i));
-            }
-            if let Some(at) = args.at {
-                player.send(DeckCommand::Seek(at * sr));
-            }
-            if args.play {
-                player.send(DeckCommand::Play);
-            }
-        }
+        let root = stick_root(&args)?;
+        let (mut player, ask_scan) = start_player(&args, root.as_deref())?;
+        load_startup(&mut player, &args)?;
         let sr = player.format.sample_rate;
         let track = match args.file.as_deref() {
             Some(f) => Track::new(f, None, sr),
             None => Track::none(sr),
         };
         let deck = DeckSnapshot::read(&player);
-        let mut browser = root.map(|r| Browser::new(r, ROWS));
-        if let Some(b) = browser.as_mut() {
+        let browser = root.map(|r| {
+            let mut b = Browser::new(r, ROWS);
             if let Some(s) = args.sort {
                 b.set_sort(s);
             }
             if let Some(s) = args.source {
                 b.set_source(s);
             }
-        }
-        let mut screens = Screens {
-            screen: if args.perform.is_some() {
-                ScreenKind::Performance
-            } else if args.info_screen {
-                ScreenKind::Info
-            } else if args.browse || args.file.is_none() {
-                ScreenKind::Browse
-            } else {
-                ScreenKind::Main
-            },
-            perform: args.perform.unwrap_or_default(),
-            ..Screens::default()
-        };
-        screens.browse.keyboard = args.search.is_some();
-        screens.browse.side = args.info;
-        screens.browse.ask_scan = ask_scan && !args.scan;
+            b
+        });
+        let screens = startup_screens(&args, ask_scan);
         Ok(App {
             pointer_on: PointerOn::Device,
             #[cfg(feature = "standin")]
@@ -339,4 +261,108 @@ impl App {
                 .browse
                 .settled(b, &LibraryView::read(&self.player))
     }
+}
+
+/// The folder that stands in for the stick on the dev host (`LIBRARY_DIR`), if any: its root,
+/// with our library in it. Without it a file is needed.
+fn stick_root(args: &Args) -> Result<Option<PathBuf>, ExitCode> {
+    let root = std::env::var_os("LIBRARY_DIR").map(PathBuf::from);
+    if let Some(r) = &root
+        && !r.is_dir()
+    {
+        eprintln!("dj-ui: LIBRARY_DIR {} is not a folder", r.display());
+        return Err(ExitCode::from(2));
+    }
+    if args.file.is_none() && root.is_none() {
+        eprintln!("dj-ui: no file given, and LIBRARY_DIR is not set");
+        eprintln!("{}", args::USAGE);
+        return Err(ExitCode::from(2));
+    }
+    Ok(root)
+}
+
+/// Start the player with the library `args` (or the stick) asks for; also whether to ask
+/// "scan this stick?" (a stick with no library is asked once, before mounting makes one).
+fn start_player(args: &Args, root: Option<&Path>) -> Result<(Player, bool), ExitCode> {
+    let library = match (args.library.clone(), root) {
+        (Some(choice), _) => choice,
+        (None, Some(r)) => LibraryChoice::Folder(r.join(engined::persist::LIBRARY_DIR)),
+        (None, None) => LibraryChoice::Auto,
+    };
+    let ask_scan = args.library.is_none()
+        && root.is_some_and(|r| {
+            !r.join(engined::persist::LIBRARY_DIR)
+                .join("library.db")
+                .exists()
+        });
+    let backend = CpalBackend::new();
+    let options = Options {
+        library,
+        auto_cue: args.auto_cue,
+        ..Options::default()
+    };
+    let player = match Player::start(&backend, &args.request, options) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("dj-ui: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    eprintln!(
+        "{} Hz, {} ch, buffer {}, {}",
+        player.format.sample_rate,
+        player.format.channels,
+        player
+            .buffer_frames()
+            .map_or("default".into(), |n| format!("{n} frames")),
+        player.device_name()
+    );
+    Ok((player, ask_scan))
+}
+
+/// `--scan`, and the file with `--hot-cues`, `--at` and `--play`.
+fn load_startup(player: &mut Player, args: &Args) -> Result<(), ExitCode> {
+    if args.scan {
+        player.scan();
+    }
+    let Some(file) = &args.file else {
+        return Ok(());
+    };
+    if let Err(e) = player.load(file) {
+        eprintln!("dj-ui: {}: {e}", file.display());
+        return Err(ExitCode::FAILURE);
+    }
+    let sr = f64::from(player.format.sample_rate);
+    for (i, &at) in args.hot_cues.iter().enumerate().take(engine_core::HOT_CUES) {
+        player.send(DeckCommand::Seek(at * sr));
+        player.send(DeckCommand::HotCue(i));
+    }
+    if let Some(at) = args.at {
+        player.send(DeckCommand::Seek(at * sr));
+    }
+    if args.play {
+        player.send(DeckCommand::Play);
+    }
+    Ok(())
+}
+
+/// The screen to start on, and the screens' state as the command line sets it up.
+fn startup_screens(args: &Args, ask_scan: bool) -> Screens {
+    let mut screens = Screens {
+        screen: if args.perform.is_some() {
+            ScreenKind::Performance
+        } else if args.info_screen {
+            ScreenKind::Info
+        } else if args.browse || args.file.is_none() {
+            ScreenKind::Browse
+        } else {
+            ScreenKind::Main
+        },
+        perform: args.perform.unwrap_or_default(),
+        ..Screens::default()
+    };
+    screens.browse.keyboard = args.search.is_some();
+    screens.browse.side = args.info;
+    screens.browse.ask_scan = ask_scan && !args.scan;
+    screens
 }
