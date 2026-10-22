@@ -67,14 +67,14 @@ impl Default for CueState {
 impl CueState {
     /// `position` snapped to the grid at the quantize resolution; unchanged without a grid or
     /// with quantize off.
-    pub fn snap(&self, grid: Option<&DeckGrid>, position: f64) -> f64 {
+    pub(crate) fn snap(&self, grid: Option<&DeckGrid>, position: f64) -> f64 {
         match (grid, self.quantize) {
             (Some(g), Some(res)) => g.quantize(position, res),
             _ => position,
         }
     }
 
-    pub fn cue_press(&mut self, t: &mut Transport, grid: Option<&DeckGrid>) {
+    pub(crate) fn cue_press(&mut self, t: &mut Transport, grid: Option<&DeckGrid>) {
         if t.is_playing() {
             t.pause();
             t.seek(self.cue);
@@ -88,7 +88,7 @@ impl CueState {
         }
     }
 
-    pub fn cue_release(&mut self, t: &mut Transport) {
+    pub(crate) fn cue_release(&mut self, t: &mut Transport) {
         if self.previewing {
             self.previewing = false;
             t.pause();
@@ -97,16 +97,16 @@ impl CueState {
     }
 
     /// PLAY pressed: while previewing, keep playing (release no longer returns).
-    pub fn play_pressed(&mut self) {
+    pub(crate) fn play_pressed(&mut self) {
         self.previewing = false;
     }
 
     /// Real-time cue: set the cue at the current position without moving the playhead.
-    pub fn set_cue_here(&mut self, t: &Transport, grid: Option<&DeckGrid>) {
+    pub(crate) fn set_cue_here(&mut self, t: &Transport, grid: Option<&DeckGrid>) {
         self.cue = self.snap(grid, t.position()).clamp(0.0, t.length());
     }
 
-    pub fn hot_cue(&mut self, index: usize, t: &mut Transport, grid: Option<&DeckGrid>) {
+    pub(crate) fn hot_cue(&mut self, index: usize, t: &mut Transport, grid: Option<&DeckGrid>) {
         let Some(&slot) = self.hot.get(index) else {
             return;
         };
@@ -130,14 +130,14 @@ impl CueState {
         }
     }
 
-    pub fn delete_hot_cue(&mut self, index: usize) {
+    pub(crate) fn delete_hot_cue(&mut self, index: usize) {
         if let Some(slot) = self.hot.get_mut(index) {
             *slot = None;
         }
     }
 
     /// Hot cues in use, as a bit mask (bit 0 = A).
-    pub fn hot_mask(&self) -> u8 {
+    pub(crate) fn hot_mask(&self) -> u8 {
         self.hot
             .iter()
             .enumerate()

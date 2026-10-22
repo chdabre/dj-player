@@ -8,38 +8,13 @@ use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::cue::TrackCues;
+use crate::command::{
+    COMMAND_CAPACITY, Command, MAX_COMMANDS_PER_CALLBACK, RETIRE_CAPACITY, Retired,
+};
 use crate::deck::{BlockOutcome, Deck, DeckCommand, MAX_BLOCK_FRAMES};
-use crate::grid::DeckGrid;
-use crate::source::{CHANNELS, Source};
-use crate::state::{DeckState, LoadMeter};
-
-/// Capacity of the command ring.
-pub const COMMAND_CAPACITY: usize = 256;
-/// Most commands applied per callback, so command handling has a fixed upper bound.
-pub const MAX_COMMANDS_PER_CALLBACK: usize = 64;
-/// Capacity of the ring carrying replaced sources out of the callback.
-pub const RETIRE_CAPACITY: usize = 16;
-
-/// Something the callback replaced and hands back to be freed elsewhere.
-#[derive(Debug)]
-pub enum Retired {
-    Source(Arc<Source>),
-    Grid(Arc<DeckGrid>),
-    Cues(Arc<TrackCues>),
-}
-
-/// A command into the engine.
-#[derive(Debug, Clone)]
-pub enum Command {
-    Deck { deck: usize, cmd: DeckCommand },
-}
-
-impl Command {
-    pub fn deck(deck: usize, cmd: DeckCommand) -> Self {
-        Command::Deck { deck, cmd }
-    }
-}
+use crate::handle::EngineHandle;
+use crate::source::CHANNELS;
+use crate::state::DeckState;
 
 /// Engine configuration, fixed for the lifetime of an engine instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,35 +45,6 @@ impl std::fmt::Debug for Engine {
     }
 }
 
-/// The control side: send commands, read state, collect retired sources.
-pub struct EngineHandle {
-    config: EngineConfig,
-    commands: Producer<Command>,
-    retired: Consumer<Retired>,
-    decks: Box<[Arc<DeckState>]>,
-    load: Arc<LoadMeter>,
-}
-
-impl std::fmt::Debug for EngineHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineHandle")
-            .field("config", &self.config)
-            .finish_non_exhaustive()
-    }
-}
-
-/// The command ring was full; the command is handed back.
-#[derive(Debug)]
-pub struct CommandRingFull(pub Command);
-
-impl std::fmt::Display for CommandRingFull {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("engine command ring is full")
-    }
-}
-
-impl std::error::Error for CommandRingFull {}
-
 impl Engine {
     /// Build an engine and its handle. Allocates everything the callback will ever need.
     pub fn new(config: EngineConfig) -> (Engine, EngineHandle) {
@@ -121,13 +67,7 @@ impl Engine {
             mix: vec![0.0; MAX_BLOCK_FRAMES * CHANNELS].into_boxed_slice(),
             deck_buf: vec![0.0; MAX_BLOCK_FRAMES * CHANNELS].into_boxed_slice(),
         };
-        let handle = EngineHandle {
-            config,
-            commands: cmd_tx,
-            retired: retire_rx,
-            decks: states,
-            load: Arc::new(LoadMeter::default()),
-        };
+        let handle = EngineHandle::new(config, cmd_tx, retire_rx, states);
         (engine, handle)
     }
 
@@ -273,49 +213,12 @@ fn write_master(mix: &[f32], out: &mut [f32], channels: usize) {
     }
 }
 
-impl EngineHandle {
-    pub fn config(&self) -> EngineConfig {
-        self.config
-    }
-
-    /// Queue a command for the next callback.
-    // A full ring hands the command back by value; boxing it would allocate for nothing.
-    #[allow(clippy::result_large_err)]
-    pub fn send(&mut self, cmd: Command) -> Result<(), CommandRingFull> {
-        self.commands
-            .push(cmd)
-            .map_err(|rtrb::PushError::Full(c)| CommandRingFull(c))
-    }
-
-    #[allow(clippy::result_large_err)]
-    pub fn send_deck(&mut self, deck: usize, cmd: DeckCommand) -> Result<(), CommandRingFull> {
-        self.send(Command::deck(deck, cmd))
-    }
-
-    pub fn deck_state(&self, deck: usize) -> &Arc<DeckState> {
-        &self.decks[deck]
-    }
-
-    /// The load meter. The backend's callback wrapper records into it.
-    pub fn load_meter(&self) -> &Arc<LoadMeter> {
-        &self.load
-    }
-
-    /// Drop sources and grids the callback has retired. Call regularly from a non-real-time thread.
-    /// Returns how many were freed.
-    pub fn collect_retired(&mut self) -> usize {
-        let mut n = 0;
-        while let Ok(src) = self.retired.pop() {
-            drop(src);
-            n += 1;
-        }
-        n
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cue::TrackCues;
+    use crate::grid::DeckGrid;
+    use crate::source::Source;
 
     fn engine(channels: usize) -> (Engine, EngineHandle) {
         Engine::new(EngineConfig {

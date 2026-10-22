@@ -10,11 +10,16 @@ publish = false
 [lib]
 bench = false
 
+[features]
+# Test and bench helpers (`render`); the crate's own tests and benches turn it on.
+testing = []
+
 [dependencies]
 rtrb.workspace = true
 engine-stretch.workspace = true
 
 [dev-dependencies]
+engine-core = { path = ".", features = ["testing"] }
 assert_no_alloc.workspace = true
 hound.workspace = true
 criterion.workspace = true

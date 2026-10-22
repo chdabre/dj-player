@@ -6,33 +6,35 @@
 //!
 //! - [`Source`]: resident sample store with per-chunk ready flags.
 //! - [`Transport`]: playhead, rate, direction and the slip shadow playhead.
-//! - [`Scaler`]: cubic-Hermite reader at fractional positions, any rate.
-//! - [`Keylock`]: the keylock path through a time-stretcher (Bungee), aligned with
-//!   the playhead.
+//! - The scaler: cubic-Hermite reader at fractional positions, any rate.
+//! - The keylock: the keylock path through a time-stretcher (Bungee), aligned with the
+//!   playhead.
 //! - [`Deck`]: the three together.
 //! - [`Engine`]: owns the decks; [`Engine::process`] is the audio callback body.
 
-pub mod cue;
-pub mod deck;
-pub mod engine;
-pub mod grid;
-pub mod keylock;
-pub mod looping;
+mod command;
+mod cue;
+mod deck;
+mod engine;
+mod fade;
+mod grid;
+mod handle;
+mod keylock;
+mod looping;
+#[cfg(feature = "testing")]
 pub mod render;
-pub mod scaler;
-pub mod source;
-pub mod state;
-pub mod transport;
+mod scaler;
+mod source;
+mod state;
+mod transport;
 
+pub use command::{Command, CommandRingFull};
 pub use cue::{CueState, HOT_CUES, QUANTIZE_RESOLUTIONS, TrackCues};
-pub use deck::{BlockOutcome, DECLICK_FRAMES, Deck, DeckCommand, MAX_BLOCK_FRAMES};
-pub use engine::{Command, CommandRingFull, Engine, EngineConfig, EngineHandle, Retired};
+pub use deck::{DECLICK_FRAMES, Deck, DeckCommand, MAX_BLOCK_FRAMES};
+pub use engine::{Engine, EngineConfig};
 pub use grid::{DeckGrid, FALLBACK_BPM};
-pub use keylock::{Keylock, MAX_STRETCH_RATE};
-pub use looping::{BEAT_JUMPS, BEAT_LOOPS, LoopControl};
-pub use scaler::Scaler;
-pub use source::{CHANNELS, Frame, FrameSource, SliceSource, Source, SourceWriter};
+pub use handle::EngineHandle;
+pub use looping::{BEAT_JUMPS, BEAT_LOOPS};
+pub use source::{CHANNELS, Frame, FrameSource, Source, SourceWriter};
 pub use state::{AtomicF64, DeckState, LoadMeter, LoadReport};
-pub use transport::{
-    Loop, MAX_SEGMENTS, MIN_LOOP_FRAMES, Segment, Segments, SlipAction, Transport,
-};
+pub use transport::{Loop, Transport};

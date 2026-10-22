@@ -11,16 +11,16 @@ use crate::source::{CHANNELS, Frame, FrameSource};
 use crate::transport::Segment;
 
 #[derive(Debug, Default, Clone)]
-pub struct Scaler;
+pub(crate) struct Scaler;
 
 impl Scaler {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 
     /// Inclusive range of source frame indices that rendering `frames` output frames of
     /// `segment` will read, including the interpolation neighbours.
-    pub fn span(segment: Segment, frames: usize) -> (i64, i64) {
+    pub(crate) fn span(segment: Segment, frames: usize) -> (i64, i64) {
         if frames == 0 {
             let i = segment.start.floor() as i64;
             return (i, i);
@@ -36,7 +36,7 @@ impl Scaler {
 
     /// Render `out.len() / 2` interleaved stereo frames of `segment` from `source`, overwriting
     /// `out`. Real-time safe: no allocation, no locks.
-    pub fn render<S: FrameSource + ?Sized>(
+    pub(crate) fn render<S: FrameSource + ?Sized>(
         &mut self,
         source: &S,
         segment: Segment,
@@ -50,7 +50,7 @@ impl Scaler {
 
     /// The interpolated frame at fractional source position `pos`.
     #[inline]
-    pub fn sample_at<S: FrameSource + ?Sized>(source: &S, pos: f64) -> Frame {
+    fn sample_at<S: FrameSource + ?Sized>(source: &S, pos: f64) -> Frame {
         let floor = pos.floor();
         let i = floor as i64;
         let t = (pos - floor) as f32;
@@ -71,7 +71,7 @@ impl Scaler {
 
 /// 4-point, 3rd-order Hermite (Catmull-Rom) interpolation between `y0` and `y1`, `t` in [0, 1).
 #[inline]
-pub fn hermite(t: f32, ym1: f32, y0: f32, y1: f32, y2: f32) -> f32 {
+fn hermite(t: f32, ym1: f32, y0: f32, y1: f32, y2: f32) -> f32 {
     let c1 = 0.5 * (y1 - ym1);
     let c2 = ym1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
     let c3 = 0.5 * (y2 - ym1) + 1.5 * (y0 - y1);
@@ -81,7 +81,21 @@ pub fn hermite(t: f32, ym1: f32, y0: f32, y1: f32, y2: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::SliceSource;
+
+    /// Interleaved stereo samples in a plain slice, readable by the scaler.
+    #[derive(Debug, Clone, Copy)]
+    struct SliceSource<'a>(&'a [f32]);
+
+    impl FrameSource for SliceSource<'_> {
+        fn frame(&self, index: i64) -> Frame {
+            let frames = (self.0.len() / CHANNELS) as i64;
+            if index < 0 || index >= frames {
+                return [0.0; CHANNELS];
+            }
+            let i = index as usize * CHANNELS;
+            [self.0[i], self.0[i + 1]]
+        }
+    }
 
     /// Stereo ramp: left = index, right = -index.
     fn ramp(frames: usize) -> Vec<f32> {

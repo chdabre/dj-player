@@ -22,9 +22,9 @@ pub const BEAT_LOOPS: [f64; 6] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
 pub const BEAT_JUMPS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct LoopControl {
+pub(crate) struct LoopControl {
     /// IN pressed, OUT not yet.
-    pub pending_in: Option<f64>,
+    pub(crate) pending_in: Option<f64>,
 }
 
 /// Where `beats` beats from `position` lands, on the grid or at the fallback tempo.
@@ -44,7 +44,7 @@ fn length_beats(grid: Option<&DeckGrid>, sample_rate: u32, l: Loop) -> f64 {
 }
 
 impl LoopControl {
-    pub fn loop_in(&mut self, t: &Transport, grid: Option<&DeckGrid>, cues: &mut CueState) {
+    pub(crate) fn loop_in(&mut self, t: &Transport, grid: Option<&DeckGrid>, cues: &mut CueState) {
         if t.active_loop().is_some() {
             return;
         }
@@ -55,7 +55,7 @@ impl LoopControl {
         }
     }
 
-    pub fn loop_out(&mut self, t: &mut Transport, grid: Option<&DeckGrid>, cues: &CueState) {
+    pub(crate) fn loop_out(&mut self, t: &mut Transport, grid: Option<&DeckGrid>, cues: &CueState) {
         let Some(start) = self.pending_in else {
             return;
         };
@@ -65,7 +65,7 @@ impl LoopControl {
         }
     }
 
-    pub fn reloop_exit(&mut self, t: &mut Transport) {
+    pub(crate) fn reloop_exit(&mut self, t: &mut Transport) {
         if t.active_loop().is_some() {
             t.exit_loop();
         } else {
@@ -73,7 +73,7 @@ impl LoopControl {
         }
     }
 
-    pub fn beat_loop(
+    pub(crate) fn beat_loop(
         &mut self,
         beats: f64,
         t: &mut Transport,
@@ -89,7 +89,7 @@ impl LoopControl {
     }
 
     /// LOOP 1/2X (`factor` 0.5) or LOOP 2X (`factor` 2.0) on the active or stored loop.
-    pub fn resize(
+    pub(crate) fn resize(
         &mut self,
         factor: f64,
         t: &mut Transport,
@@ -114,7 +114,7 @@ impl LoopControl {
         }
     }
 
-    pub fn beat_jump(
+    pub(crate) fn beat_jump(
         &mut self,
         beats: f64,
         t: &mut Transport,

@@ -20,12 +20,12 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub const CHANNELS: usize = 2;
 
 /// Default chunk length in frames (~0.34 s at 48 kHz).
-pub const DEFAULT_CHUNK_FRAMES: usize = 16_384;
+const DEFAULT_CHUNK_FRAMES: usize = 16_384;
 
 /// One stereo frame.
 pub type Frame = [f32; CHANNELS];
 
-/// Anything the [`crate::Scaler`] can read frames from by integer index.
+/// Anything the scaler can read frames from by integer index.
 ///
 /// Indices outside the stored range must return silence.
 pub trait FrameSource {
@@ -178,22 +178,6 @@ impl FrameSource for Source {
             f32::from_bits(self.samples[i].load(Ordering::Relaxed)),
             f32::from_bits(self.samples[i + 1].load(Ordering::Relaxed)),
         ]
-    }
-}
-
-/// Interleaved stereo samples in a plain slice, readable by the scaler (tests, benches).
-#[derive(Debug, Clone, Copy)]
-pub struct SliceSource<'a>(pub &'a [f32]);
-
-impl FrameSource for SliceSource<'_> {
-    #[inline]
-    fn frame(&self, index: i64) -> Frame {
-        let frames = (self.0.len() / CHANNELS) as i64;
-        if index < 0 || index >= frames {
-            return [0.0; CHANNELS];
-        }
-        let i = index as usize * CHANNELS;
-        [self.0[i], self.0[i + 1]]
     }
 }
 
