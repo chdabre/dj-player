@@ -32,7 +32,7 @@ pub use command::{Command, CommandRingFull};
 pub use cue::{CueState, HOT_CUES, QUANTIZE_RESOLUTIONS, TrackCues};
 pub use deck::{DECLICK_FRAMES, Deck, DeckCommand, MAX_BLOCK_FRAMES};
 pub use engine::{Engine, EngineConfig};
-pub use grid::{DeckGrid, FALLBACK_BPM};
+pub use grid::{DeckGrid, FALLBACK_BPM, beat_period};
 pub use handle::EngineHandle;
 pub use looping::{BEAT_JUMPS, BEAT_LOOPS};
 pub use source::{CHANNELS, Frame, FrameSource, Source, SourceWriter};

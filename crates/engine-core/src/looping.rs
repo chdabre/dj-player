@@ -12,7 +12,7 @@
 //! Without a grid, beat lengths come from [`FALLBACK_BPM`], and nothing is quantized.
 
 use crate::cue::CueState;
-use crate::grid::{DeckGrid, FALLBACK_BPM};
+use crate::grid::{DeckGrid, FALLBACK_BPM, beat_period};
 use crate::transport::{Loop, MIN_LOOP_FRAMES, Transport};
 
 /// Auto beat loop lengths the reference offers, in beats.
@@ -31,7 +31,7 @@ pub(crate) struct LoopControl {
 fn beats_from(grid: Option<&DeckGrid>, sample_rate: u32, position: f64, beats: f64) -> f64 {
     match grid {
         Some(g) => g.offset(position, beats),
-        None => position + beats * 60.0 / FALLBACK_BPM * f64::from(sample_rate),
+        None => position + beats * beat_period(FALLBACK_BPM, f64::from(sample_rate)),
     }
 }
 
@@ -39,7 +39,7 @@ fn beats_from(grid: Option<&DeckGrid>, sample_rate: u32, position: f64, beats: f
 fn length_beats(grid: Option<&DeckGrid>, sample_rate: u32, l: Loop) -> f64 {
     match grid {
         Some(g) => g.beat_at(l.end) - g.beat_at(l.start),
-        None => l.len() / (60.0 / FALLBACK_BPM * f64::from(sample_rate)),
+        None => l.len() / beat_period(FALLBACK_BPM, f64::from(sample_rate)),
     }
 }
 

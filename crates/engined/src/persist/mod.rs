@@ -7,10 +7,9 @@ mod records;
 mod worker;
 
 pub use crate::config::device_id;
-pub use locate::stored_path;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
@@ -21,8 +20,12 @@ use library::{
 };
 use waveform::compute::Waveform;
 
-/// The name of our library folder at the root of a stick.
-pub const LIBRARY_DIR: &str = "DJPLAYER";
+pub use library::{LIBRARY_DIR, stored_path};
+
+/// True if the stick (or folder) at `root` already has our library.
+pub fn has_library(root: &Path) -> bool {
+    library::has_library(&root.join(LIBRARY_DIR))
+}
 
 /// Which library the player mounts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

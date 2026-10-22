@@ -138,23 +138,23 @@ pub(super) fn merge(
         [f, i],
     )?;
     c.execute(
-        "INSERT INTO hot_cues(track, slot, at, end_at, color, comment, updated_at, device) \
+        concat!(
+            "INSERT INTO hot_cues(track, slot, at, end_at, color, comment, updated_at, device) \
          SELECT ?2, slot, at, end_at, color, comment, updated_at, device FROM hot_cues h \
          WHERE track = ?1 AND NOT EXISTS (SELECT 1 FROM hot_cues s WHERE s.track = ?2 \
-         AND s.slot = h.slot AND s.updated_at >= h.updated_at) \
-         ON CONFLICT(track, slot) DO UPDATE SET at = excluded.at, end_at = excluded.end_at, \
-         color = excluded.color, comment = excluded.comment, updated_at = excluded.updated_at, \
-         device = excluded.device",
+         AND s.slot = h.slot AND s.updated_at >= h.updated_at)",
+            hot_cue_upsert!()
+        ),
         [f, i],
     )?;
     c.execute(
-        "INSERT INTO analysis(track, analyzer, version, params, blob, created, updated_at, \
+        concat!(
+            "INSERT INTO analysis(track, analyzer, version, params, blob, created, updated_at, \
          device) SELECT ?2, analyzer, version, params, blob, created, updated_at, device \
          FROM analysis a WHERE track = ?1 AND NOT EXISTS (SELECT 1 FROM analysis s \
-         WHERE s.track = ?2 AND s.analyzer = a.analyzer AND s.updated_at >= a.updated_at) \
-         ON CONFLICT(track, analyzer) DO UPDATE SET version = excluded.version, \
-         params = excluded.params, blob = excluded.blob, created = excluded.created, \
-         updated_at = excluded.updated_at, device = excluded.device",
+         WHERE s.track = ?2 AND s.analyzer = a.analyzer AND s.updated_at >= a.updated_at)",
+            analysis_upsert!()
+        ),
         [f, i],
     )?;
     c.execute(

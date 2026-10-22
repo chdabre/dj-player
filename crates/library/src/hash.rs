@@ -10,6 +10,8 @@
 //!   rate. A tag edit changes the file hash but not this.
 
 use std::fmt;
+use std::io::Read;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -27,6 +29,23 @@ impl FileHash {
         let mut h = ContentHasher::new();
         h.update(bytes);
         h.finish()
+    }
+
+    /// The hash of the file at `path`, read in [`BLOCK`]s, and its size in bytes.
+    pub fn of_file(path: &Path) -> std::io::Result<(Self, u64)> {
+        let mut f = std::fs::File::open(path)?;
+        let mut h = ContentHasher::new();
+        let mut buf = vec![0u8; BLOCK];
+        let mut size = 0u64;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            size += n as u64;
+        }
+        Ok((h.finish(), size))
     }
 }
 

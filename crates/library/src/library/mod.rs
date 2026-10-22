@@ -15,6 +15,25 @@
 //! - `identity`: finding, creating and merging tracks.
 //! - `read`: tracks and the listing. `blobs`: the content-addressed files.
 
+/// The `ON CONFLICT` clause that overwrites a hot cue slot: one spelling for the single write
+/// (`ops`) and the merge (`identity`), so a new column is added in one place.
+macro_rules! hot_cue_upsert {
+    () => {
+        " ON CONFLICT(track, slot) DO UPDATE SET at = excluded.at, end_at = excluded.end_at, \
+         color = excluded.color, comment = excluded.comment, updated_at = excluded.updated_at, \
+         device = excluded.device"
+    };
+}
+
+/// The same for an analysis result.
+macro_rules! analysis_upsert {
+    () => {
+        " ON CONFLICT(track, analyzer) DO UPDATE SET version = excluded.version, \
+         params = excluded.params, blob = excluded.blob, created = excluded.created, \
+         updated_at = excluded.updated_at, device = excluded.device"
+    };
+}
+
 mod blobs;
 mod edits;
 mod identity;

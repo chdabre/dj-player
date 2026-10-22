@@ -45,16 +45,6 @@ pub(super) fn mount(
     Ok(loc)
 }
 
-/// `file` relative to `root`, `/`-separated and NFC; a file outside the root keeps its
-/// absolute path (a hint only: identity is the hash).
-pub fn stored_path(file: &Path, root: Option<&Path>) -> String {
-    let abs = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
-    let rel = root
-        .and_then(|r| r.canonicalize().ok())
-        .and_then(|r| abs.strip_prefix(r).ok().map(Path::to_path_buf));
-    library::normalize_path(&rel.unwrap_or(abs).to_string_lossy())
-}
-
 /// True if a file can be made and removed in `dir`.
 fn writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".write-probe-{}", std::process::id()));
@@ -188,18 +178,6 @@ fn locate(choice: &LibraryChoice, file: &Path, device: DeviceId) -> Result<Locat
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn paths_are_stored_relative_to_the_library_root() {
-        let dir = std::env::temp_dir().join(format!("engined-paths-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("Music")).unwrap();
-        let f = dir.join("Music").join("a.mp3");
-        std::fs::write(&f, b"x").unwrap();
-        assert_eq!(stored_path(&f, Some(&dir)), "Music/a.mp3");
-        let outside = stored_path(&f, Some(&dir.join("elsewhere")));
-        assert!(outside.ends_with("/Music/a.mp3") && outside.starts_with('/'));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn the_system_disk_is_not_removable() {

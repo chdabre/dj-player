@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use engine_core::{DeckGrid, FALLBACK_BPM, HOT_CUES};
+use engine_core::{DeckGrid, FALLBACK_BPM, HOT_CUES, beat_period};
 use engined::persist::{Listing, Playlists};
 use engined::{BatchProgress, Player};
 
@@ -133,7 +133,7 @@ impl DeckSnapshot {
         }
         Some(match self.grid() {
             Some(g) => g.beat_at(b) - g.beat_at(a),
-            None => (b - a) / self.sample_rate * FALLBACK_BPM / 60.0,
+            None => (b - a) / beat_period(FALLBACK_BPM, self.sample_rate),
         })
     }
 
@@ -142,7 +142,7 @@ impl DeckSnapshot {
     pub fn zoom_span(&self, zoom_beats: f64) -> f64 {
         match self.grid() {
             Some(g) => zoom_beats * g.period(),
-            None => zoom_beats * 60.0 / FALLBACK_BPM * self.sample_rate,
+            None => zoom_beats * beat_period(FALLBACK_BPM, self.sample_rate),
         }
     }
 

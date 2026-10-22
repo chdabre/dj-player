@@ -251,14 +251,11 @@ fn set_analysis(
     dev: &[u8],
     now: i64,
 ) -> rusqlite::Result<()> {
-    c.prepare_cached(
+    c.prepare_cached(concat!(
         "INSERT INTO analysis(track, analyzer, version, params, blob, created, \
-         updated_at, device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-         ON CONFLICT(track, analyzer) DO UPDATE SET version = excluded.version, \
-         params = excluded.params, blob = excluded.blob, \
-         created = excluded.created, updated_at = excluded.updated_at, \
-         device = excluded.device",
-    )?
+             updated_at, device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        analysis_upsert!()
+    ))?
     .execute(params![
         &resolve(c, t)?.0[..],
         name,
@@ -318,14 +315,11 @@ fn set_hot_cue(
             .execute(params![&resolve(c, t)?.0[..], slot as i64])?;
         return Ok(());
     };
-    c.prepare_cached(
+    c.prepare_cached(concat!(
         "INSERT INTO hot_cues(track, slot, at, end_at, color, comment, updated_at, \
-         device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-         ON CONFLICT(track, slot) DO UPDATE SET at = excluded.at, \
-         end_at = excluded.end_at, color = excluded.color, \
-         comment = excluded.comment, updated_at = excluded.updated_at, \
-         device = excluded.device",
-    )?
+             device) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        hot_cue_upsert!()
+    ))?
     .execute(params![
         &resolve(c, t)?.0[..],
         slot as i64,

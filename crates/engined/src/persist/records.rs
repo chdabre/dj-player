@@ -1,18 +1,18 @@
 //! What the worker does to records: find or make a file's record, keep its tag cache, store
 //! waveforms and analysis results, and publish the listing and the playlists.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use library::{
-    AnalysisRef, ContentHasher, Edit, FileHash, FileIdentity, Library, Track, TrackId, TrackTags,
-    WaveformRef,
+    AnalysisRef, Edit, FileHash, FileIdentity, Library, Track, TrackId, TrackTags, WaveformRef,
 };
 use waveform::compute::Waveform;
 
-use super::locate::{Located, stored_path};
+use library::stored_path;
+
+use super::locate::Located;
 use super::{FreshAnalysis, Listing, Loaded, Playlists, Reply};
 
 pub(super) fn store_waveform(
@@ -36,12 +36,7 @@ pub(super) fn store_analysis(
     say: &dyn Fn(String),
 ) {
     for f in fresh {
-        let a = AnalysisRef {
-            version: f.version,
-            params: f.params,
-            blob: lib.put_blob(&f.blob),
-            created: library::rfc3339(library::system_ms()),
-        };
+        let a = AnalysisRef::new(f.version, f.params, lib.put_blob(&f.blob));
         if let Err(e) = lib.apply(Edit::SetAnalysis(track, f.name, a)) {
             say(format!("library: {e}"));
         }
@@ -169,7 +164,7 @@ pub(super) fn open(
     say: &dyn Fn(String),
 ) -> Result<(TrackId, bool), String> {
     let (identity, size) =
-        hash_file(file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
+        FileHash::of_file(file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
     let path = stored_path(file, loc.root.as_deref());
     let found = loc
         .lib
@@ -213,21 +208,4 @@ pub(super) fn loaded(lib: &mut Library, track: TrackId, serial: u64) -> Loaded {
         waveform,
         analysis,
     }
-}
-
-/// Dropbox content hash and size of a file, read in 4 MiB blocks.
-fn hash_file(path: &Path) -> std::io::Result<(FileHash, u64)> {
-    let mut f = std::fs::File::open(path)?;
-    let mut h = ContentHasher::new();
-    let mut buf = vec![0u8; library::hash::BLOCK];
-    let mut size = 0u64;
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        size += n as u64;
-    }
-    Ok((h.finish(), size))
 }

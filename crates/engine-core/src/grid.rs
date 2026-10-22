@@ -11,6 +11,11 @@
 /// loops; 120 was chosen on 2026-10-22 as the plainer default, the same everywhere.)
 pub const FALLBACK_BPM: f64 = 120.0;
 
+/// Frames per beat at `bpm` and `sample_rate` frames per second.
+pub fn beat_period(bpm: f64, sample_rate: f64) -> f64 {
+    60.0 / bpm * sample_rate
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeckGrid {
     /// Beat positions in engine frames, strictly increasing.
@@ -38,7 +43,7 @@ impl DeckGrid {
             return None;
         }
         Some(Self {
-            period: 60.0 / bpm * sr,
+            period: beat_period(bpm, sr),
             beats: beats.into_boxed_slice(),
             bar_pos: bar_pos.into_boxed_slice(),
             bpm,
@@ -48,7 +53,7 @@ impl DeckGrid {
     /// A constant-tempo grid: a downbeat at `first` frames, `bpm`, 4/4, covering `length`.
     pub fn constant(first: f64, bpm: f64, length: f64, sample_rate: u32) -> Option<Self> {
         let sr = f64::from(sample_rate);
-        let period = 60.0 / bpm * sr;
+        let period = beat_period(bpm, sr);
         let n = ((length - first) / period).ceil().max(2.0) as usize;
         Self::from_seconds(
             (0..n).map(|k| ((first + k as f64 * period) / sr, (k % 4) as u8 + 1)),

@@ -101,7 +101,7 @@ pub struct PlaylistEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileIdentity {
     /// Relative to the library's root (the folder holding `DJPLAYER/`), `/`-separated and
-    /// NFC-normalised (see [`crate::normalize_path`]). A hint for finding the file, never
+    /// NFC-normalised (see `normalize_path`). A hint for finding the file, never
     /// its identity.
     pub path: String,
     pub size: u64,
@@ -204,6 +204,18 @@ pub struct AnalysisRef {
     pub blob: BlobId,
     /// RFC 3339 UTC.
     pub created: String,
+}
+
+impl AnalysisRef {
+    /// A result made now.
+    pub fn new(version: String, params: String, blob: BlobId) -> Self {
+        Self {
+            version,
+            params,
+            blob,
+            created: crate::time::rfc3339(crate::time::system_ms()),
+        }
+    }
 }
 
 /// A track's waveform: DJWF blobs, whose headers carry their parameters and timeline.

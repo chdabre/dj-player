@@ -289,12 +289,8 @@ fn start_player(args: &Args, root: Option<&Path>) -> Result<(Player, bool), Exit
         (None, Some(r)) => LibraryChoice::Folder(r.join(engined::persist::LIBRARY_DIR)),
         (None, None) => LibraryChoice::Auto,
     };
-    let ask_scan = args.library.is_none()
-        && root.is_some_and(|r| {
-            !r.join(engined::persist::LIBRARY_DIR)
-                .join("library.db")
-                .exists()
-        });
+    let ask_scan =
+        args.library.is_none() && root.is_some_and(|r| !engined::persist::has_library(r));
     let backend = CpalBackend::new();
     let options = Options {
         library,
