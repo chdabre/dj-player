@@ -45,19 +45,6 @@ const ANALYZE_CHIP: (f32, f32) = (576.0, 124.0);
 /// Where the keyboard goes: over the status band and the bottom strip.
 const KEYBOARD: Rect = Rect::new(106.0, 395.0, 915.0, 202.0);
 
-/// What the browse controls (knob, BACK, keys) ask of the browser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Nav {
-    Up,
-    Down,
-    /// The knob pushed: open the browser, or load / open the selection.
-    Push,
-    Back,
-    /// TAG TRACK: onto the tag list; a long press takes it off.
-    Tag,
-    Untag,
-}
-
 /// The on-screen keyboard's special keys, as characters.
 pub const BACKSPACE: char = '\u{8}';
 pub const CLEAR: char = '\u{18}';

@@ -4,4 +4,6 @@
 
 pub mod effects;
 pub mod engine;
+pub mod keymap;
+pub mod surface;
 pub mod track;

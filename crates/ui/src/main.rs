@@ -26,6 +26,9 @@
 mod app;
 mod browse;
 mod clock;
+// Without the stand-in only the dev keyboard reports controls, until the RP2040 reader exists.
+#[cfg_attr(not(feature = "standin"), allow(dead_code))]
+mod input;
 mod kit;
 mod perform;
 mod playlists;
@@ -57,8 +60,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::app::effects::{Effect, Effects};
 use crate::app::engine::DeckSnapshot;
+use crate::app::keymap::{self, KeyContext, Shortcut};
+use crate::app::surface::Surface;
 use crate::app::track::{Track, track_title};
-use crate::browse::{BrowseView, InfoView, ModalView, Nav, ROW_H, ROWS, Row, RowKind};
+use crate::browse::{BrowseView, InfoView, ModalView, ROW_H, ROWS, Row, RowKind};
+use crate::input::{ControlEvent, Nav};
 use crate::kit::Rect;
 use crate::playlists::{Action, Editing, Modal};
 use crate::render::Gfx;
@@ -82,8 +88,6 @@ const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames>] [
                      [--search <query>] [--scan] [--info] [--info-screen] [--analyze-all] \
                      [--source usb|library|taglist] [--open <a/b>] [--menu]\n\
                      LIBRARY_DIR=<dir> browses <dir> as a USB stick's root; the file is then optional.";
-const SEEK_SECONDS: f64 = 5.0;
-const RATE_STEP: f64 = 0.01;
 const ZOOM_STEPS: [f64; 4] = [8.0, 16.0, 32.0, 64.0];
 
 struct Args {
@@ -418,12 +422,10 @@ fn main() -> ExitCode {
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    #[cfg(feature = "standin")]
-    let sample_rate = player.format.sample_rate;
     let mut app = App {
         pointer_on: PointerOn::Device,
         #[cfg(feature = "standin")]
-        standin: args.standin.then(|| standin::Standin::new(sample_rate)),
+        standin: args.standin.then(standin::Standin::new),
         #[cfg(feature = "standin")]
         shell_scene: Scene::default(),
         last_frame: None,
@@ -438,6 +440,7 @@ fn main() -> ExitCode {
         side: args.info,
         editing: Editing::default(),
         effects: Vec::new(),
+        surface: Surface::new(sr),
         shift: browse::Shift::Off,
         pending_analyze_all: args.analyze_all,
         pending_open: args.open.clone(),
@@ -537,6 +540,8 @@ struct App {
     editing: Editing,
     /// What input asked the engine and the library to do, carried out after each event.
     effects: Effects,
+    /// What the player's controls do (fader range, jog, held buttons), whoever presses them.
+    surface: Surface,
     /// The on-screen keyboard's shift.
     shift: browse::Shift,
     /// `--analyze-all` still to start.
@@ -587,6 +592,16 @@ impl App {
         self.effects.push(Effect::Deck(cmd));
     }
 
+    /// A control of the player did something (stand-in, keyboard, or the hardware).
+    fn control(&mut self, e: ControlEvent) {
+        let mut navs = Vec::new();
+        self.surface
+            .event(e, &self.deck, &mut self.effects, &mut navs);
+        for n in navs {
+            self.nav(n);
+        }
+    }
+
     /// Carry out the effects input asked for, in order.
     fn apply_effects(&mut self) {
         for effect in std::mem::take(&mut self.effects) {
@@ -631,17 +646,15 @@ impl App {
             && let Some((sx, sy)) = gfx.to_shell(x, y)
         {
             self.pointer_on = PointerOn::Shell;
-            let view = self.shell_view();
             let alt = alt || self.modifiers.shift_key();
-            let cmds = self
+            let events = self
                 .standin
                 .as_mut()
-                .map(|s| s.press(sx, sy, alt, &view))
+                .map(|s| s.press(sx, sy, alt))
                 .unwrap_or_default();
-            for c in cmds {
-                self.send(c);
+            for e in events {
+                self.control(e);
             }
-            self.drain_nav();
             return;
         }
         let _ = alt;
@@ -653,14 +666,13 @@ impl App {
         #[cfg(feature = "standin")]
         if self.pointer_on == PointerOn::Shell {
             let point = self.gfx.as_ref().and_then(|g| g.to_shell(x, y));
-            let cmds = match (point, self.standin.as_mut()) {
+            let events = match (point, self.standin.as_mut()) {
                 (Some((sx, sy)), Some(s)) => s.drag(sx, sy),
                 _ => Vec::new(),
             };
-            for c in cmds {
-                self.send(c);
+            for e in events {
+                self.control(e);
             }
-            self.drain_nav();
             return;
         }
         self.drag(x, y);
@@ -669,15 +681,14 @@ impl App {
     fn pointer_up(&mut self) {
         #[cfg(feature = "standin")]
         if self.pointer_on == PointerOn::Shell {
-            let cmds = self
+            let events = self
                 .standin
                 .as_mut()
                 .map(|s| s.release())
                 .unwrap_or_default();
-            for c in cmds {
-                self.send(c);
+            for e in events {
+                self.control(e);
             }
-            self.drain_nav();
             self.pointer_on = PointerOn::Device;
             return;
         }
@@ -697,6 +708,9 @@ impl App {
             hot_cues: d.hot_cues,
             rate: d.rate,
             position: d.position / d.sample_rate,
+            range: self.surface.range(),
+            vinyl: self.surface.vinyl(),
+            jog: self.surface.jog(),
         }
     }
 
@@ -977,10 +991,13 @@ impl App {
             && let Some(gfx) = &self.gfx
             && !gfx.on_device(x, y)
         {
-            if let (Some((sx, sy)), Some(s)) = (gfx.to_shell(x, y), self.standin.as_mut()) {
-                s.wheel(sx, sy, rows);
+            let turn = match (gfx.to_shell(x, y), self.standin.as_mut()) {
+                (Some((sx, sy)), Some(s)) => s.wheel(sx, sy, rows),
+                _ => None,
+            };
+            if let Some(e) = turn {
+                self.control(e);
             }
-            self.drain_nav();
             return;
         }
         let _ = (x, y);
@@ -988,19 +1005,6 @@ impl App {
             && let Some(b) = self.browser.as_mut()
         {
             b.scroll_by(rows as isize);
-        }
-    }
-
-    /// Act on the stand-in's browse controls.
-    #[cfg(feature = "standin")]
-    fn drain_nav(&mut self) {
-        let navs = self
-            .standin
-            .as_mut()
-            .map(standin::Standin::take_nav)
-            .unwrap_or_default();
-        for n in navs {
-            self.nav(n);
         }
     }
 
@@ -1401,87 +1405,69 @@ impl App {
         self.send(DeckCommand::Seek(f * self.deck.length));
     }
 
+    /// A key of the dev keyboard. Text fields (naming, the search) take the keys first; the
+    /// rest is the keymap's.
     fn key(&mut self, event_loop: &ActiveEventLoop, key: &KeyEvent) {
-        let down = key.state == ElementState::Pressed;
-        // CUE is the one key with a release action: holding at the cue previews.
-        if let Key::Character(c) = &key.logical_key
-            && c.eq_ignore_ascii_case("c")
-        {
-            if !key.repeat {
-                self.send(if down {
-                    DeckCommand::CuePress
-                } else {
-                    DeckCommand::CueRelease
-                });
-            }
+        if key.repeat {
             return;
         }
-        if !down || key.repeat {
-            return;
-        }
-        let sr = f64::from(self.player.format.sample_rate);
+        let key = keymap::KeyPress::from(key);
+        let pressed = key.pressed;
         let browsing = self.screen == ScreenKind::Browse;
         if browsing && self.ask_scan {
-            match &key.logical_key {
-                Key::Named(NamedKey::Enter) => self.answer_scan(true),
-                Key::Named(NamedKey::Escape) => self.answer_scan(false),
-                _ => {}
+            if pressed {
+                match &key.key {
+                    Key::Named(NamedKey::Enter) => self.answer_scan(true),
+                    Key::Named(NamedKey::Escape) => self.answer_scan(false),
+                    _ => {}
+                }
             }
             return;
         }
         // While naming, the keyboard types the name: Enter names it, Esc gives up.
         if browsing && self.editing.naming() {
-            match &key.logical_key {
-                Key::Named(NamedKey::Backspace) => self.type_name(browse::BACKSPACE),
-                Key::Named(NamedKey::Space) => self.type_name(' '),
-                Key::Named(NamedKey::Enter) => self.type_name(browse::DONE),
-                Key::Named(NamedKey::Escape) => self.editing.modal = None,
-                Key::Character(c) => c.chars().for_each(|ch| self.type_name(ch)),
-                _ => {}
+            if !pressed {
+                return;
+            }
+            if key.key == Key::Named(NamedKey::Escape) {
+                self.editing.modal = None;
+            }
+            for c in keymap::typed(&key) {
+                self.type_name(c);
             }
             return;
         }
-        // TAG TRACK: x (shift: remove).
-        if let Key::Character(c) = &key.logical_key
-            && c.eq_ignore_ascii_case("x")
-            && self.editing.modal.is_none()
-            && !(browsing && self.keyboard)
-        {
-            return self.tag_track(self.modifiers.shift_key());
-        }
-        // While the search keyboard is up, the keyboard types.
+        // While the search keyboard is up, the keys type; Enter and Esc still browse.
         if browsing && self.keyboard {
-            match &key.logical_key {
-                Key::Named(NamedKey::Backspace) => return self.type_char(browse::BACKSPACE),
-                Key::Named(NamedKey::Space) => return self.type_char(' '),
-                Key::Character(c) => {
-                    for ch in c.chars() {
-                        self.type_char(ch);
+            let chars = keymap::typed(&key);
+            if !chars.is_empty() && chars != [browse::DONE] {
+                if pressed {
+                    for c in chars {
+                        self.type_char(c);
                     }
-                    return;
                 }
-                _ => {}
+                return;
             }
         }
-        if self.screen == ScreenKind::Info
-            && let Key::Character(c) = &key.logical_key
-            && c == "i"
-        {
-            return self.toggle_info();
-        }
-        if browsing && let Key::Character(c) = &key.logical_key {
-            match c.as_str() {
-                "/" => return self.search(),
-                "i" => return self.toggle_info(),
-                _ => {}
+        let ctx = KeyContext {
+            browsing,
+            info: self.screen == ScreenKind::Info,
+            shift: self.modifiers.shift_key(),
+        };
+        let Some(shortcut) = keymap::shortcut(&key, ctx) else {
+            return;
+        };
+        match shortcut {
+            Shortcut::Control(e) => self.control(e),
+            Shortcut::Deck(d) => self.send(d.command(self.deck.sample_rate)),
+            Shortcut::Nav(n) => self.nav(n),
+            Shortcut::Perform => {
+                self.screen = match self.screen {
+                    ScreenKind::Performance => ScreenKind::Main,
+                    _ => ScreenKind::Performance,
+                };
             }
-        }
-        let nav = match &key.logical_key {
-            Key::Named(NamedKey::ArrowUp) if browsing => Some(Nav::Up),
-            Key::Named(NamedKey::ArrowDown) if browsing => Some(Nav::Down),
-            Key::Named(NamedKey::Enter) if browsing => Some(Nav::Push),
-            Key::Named(NamedKey::Escape | NamedKey::Backspace) => Some(Nav::Back),
-            Key::Named(NamedKey::Tab) => {
+            Shortcut::ToggleBrowse => {
                 if self.browser.is_some() {
                     self.screen = if browsing {
                         ScreenKind::Main
@@ -1489,80 +1475,29 @@ impl App {
                         ScreenKind::Browse
                     };
                 }
-                return;
             }
-            _ => None,
-        };
-        if let Some(n) = nav {
-            self.nav(n);
-            return;
-        }
-        let cmd = match &key.logical_key {
-            Key::Named(NamedKey::Space) => DeckCommand::TogglePlay,
-            Key::Named(NamedKey::ArrowLeft) => DeckCommand::SeekRelative(-SEEK_SECONDS * sr),
-            Key::Named(NamedKey::ArrowRight) => DeckCommand::SeekRelative(SEEK_SECONDS * sr),
-            Key::Character(c) => {
-                let c = c.as_str();
-                match c {
-                    "q" => return event_loop.exit(),
-                    "d" => {
-                        self.debug = !self.debug;
-                        return;
-                    }
-                    "m" => {
-                        eprintln!("{}", self.player.memory());
-                        return;
-                    }
-                    "p" => {
-                        self.screen = match self.screen {
-                            ScreenKind::Performance => ScreenKind::Main,
-                            _ => ScreenKind::Performance,
-                        };
-                        return;
-                    }
-                    "w" => {
-                        self.wave_settings.mode = match self.wave_settings.mode {
-                            Mode::ThreeBand => Mode::Rgb,
-                            Mode::Rgb => Mode::Single,
-                            Mode::Single => Mode::ThreeBand,
-                        };
-                        return;
-                    }
-                    "f" => {
-                        if let Some(g) = &self.gfx {
-                            let w = g.window();
-                            w.set_fullscreen(match w.fullscreen() {
-                                Some(_) => None,
-                                None => Some(Fullscreen::Borderless(None)),
-                            });
-                        }
-                        return;
-                    }
-                    "+" | "=" => DeckCommand::NudgeRate(RATE_STEP),
-                    "-" | "_" => DeckCommand::NudgeRate(-RATE_STEP),
-                    "0" => DeckCommand::SetRate(1.0),
-                    "k" => DeckCommand::ToggleKeylock,
-                    "r" => DeckCommand::ToggleReverse,
-                    "s" => DeckCommand::ToggleSlip,
-                    "z" => DeckCommand::SetQuantize((self.deck.quantize <= 0.0).then_some(1.0)),
-                    "i" => DeckCommand::LoopIn,
-                    "o" => DeckCommand::LoopOut,
-                    "l" => DeckCommand::ReloopExit,
-                    "b" => DeckCommand::BeatLoop(4.0),
-                    "[" => DeckCommand::LoopResize(0.5),
-                    "]" => DeckCommand::LoopResize(2.0),
-                    "," => DeckCommand::BeatJump(-4.0),
-                    "." => DeckCommand::BeatJump(4.0),
-                    _ => match hot_cue_key(key) {
-                        Some(i) if self.modifiers.shift_key() => DeckCommand::DeleteHotCue(i),
-                        Some(i) => DeckCommand::HotCue(i),
-                        None => return,
-                    },
+            Shortcut::Search => self.search(),
+            Shortcut::Info => self.toggle_info(),
+            Shortcut::Debug => self.debug = !self.debug,
+            Shortcut::Memory => eprintln!("{}", self.player.memory()),
+            Shortcut::WaveMode => {
+                self.wave_settings.mode = match self.wave_settings.mode {
+                    Mode::ThreeBand => Mode::Rgb,
+                    Mode::Rgb => Mode::Single,
+                    Mode::Single => Mode::ThreeBand,
+                };
+            }
+            Shortcut::Fullscreen => {
+                if let Some(g) = &self.gfx {
+                    let w = g.window();
+                    w.set_fullscreen(match w.fullscreen() {
+                        Some(_) => None,
+                        None => Some(Fullscreen::Borderless(None)),
+                    });
                 }
             }
-            _ => return,
-        };
-        self.send(cmd);
+            Shortcut::Quit => event_loop.exit(),
+        }
     }
 
     /// Draw one frame; true when the app should exit (a screenshot was taken).
@@ -1572,20 +1507,8 @@ impl App {
             .last_frame
             .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         self.last_frame = Some(now);
-        #[cfg(feature = "standin")]
-        {
-            let cmds = self
-                .standin
-                .as_mut()
-                .map(|s| s.tick(dt))
-                .unwrap_or_default();
-            for c in cmds {
-                self.send(c);
-            }
-        }
-        #[cfg(not(feature = "standin"))]
-        let _ = dt;
-        // The stand-in's held controls act before the deck is read, as a press would.
+        self.surface.tick(dt, &mut self.effects);
+        // Held controls act before the deck is read, as a press would.
         self.apply_effects();
         self.deck = DeckSnapshot::read(&self.player);
         let sr = self.deck.sample_rate;
@@ -1746,25 +1669,6 @@ fn info_fields(path: &Path, tags: &engined::browse::Tags) -> Vec<(&'static str, 
         ("KEY", or_dash(tags.key.clone())),
         ("GENRE", or_dash(tags.genre.clone())),
     ]
-}
-
-/// The digit keys 1–8 (by position, so shift and layout do not matter) are hot cues A–H.
-fn hot_cue_key(key: &KeyEvent) -> Option<usize> {
-    use winit::keyboard::{KeyCode, PhysicalKey};
-    const DIGITS: [KeyCode; 8] = [
-        KeyCode::Digit1,
-        KeyCode::Digit2,
-        KeyCode::Digit3,
-        KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
-        KeyCode::Digit7,
-        KeyCode::Digit8,
-    ];
-    match key.physical_key {
-        PhysicalKey::Code(code) => DIGITS.iter().position(|&d| d == code),
-        PhysicalKey::Unidentified(_) => None,
-    }
 }
 
 fn write_png(
