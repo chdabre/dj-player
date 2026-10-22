@@ -2,7 +2,7 @@
 
 A housekeeping pass across every crate, done after the UI refactor (`ui-architecture.md`) and before the next features land: the Rekordbox overlay, history and play counts, memory cue CALL, hot cue bank B, a second deck sharing one library per stick, and the RP2040 reader. It also answers when the UI and the player become two processes.
 
-**Status:** proposal; nothing here is built yet.
+**Status:** done (2026-10-22), on the `structure` branch, one or more commits per step. What was built, and where it differs from the proposal below, is under "Outcome" at the end.
 
 ## What hurts today
 
@@ -174,5 +174,46 @@ After step 8:
 
 ## Open questions
 
-- **`player-api` or `engine-api`?** The port carries library and browse traffic as well as the engine's, so "player" fits better.
+- **`player-api` or `engine-api`?** The port carries library and browse traffic as well as the engine's, so "player" fits better. *(Decided: `player-api`.)*
 - **`Edit` as one type or `TrackEdit` / `PlaylistEdit`?** It stays one type for now; split it when history and tag edits arrive, if the match keeps growing.
+
+## Outcome (2026-10-22)
+
+All eight steps are in. Every step passed `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test --workspace` on its own; the UI also with `--no-default-features`, `engine-analysis` with no and all features. The 13 `--screenshot` scenarios (main, stand-in, perform with its pad modes, info, browse, side panel, library, search, menu, tag list, RGB) match the pre-refactor screenshots byte for byte after each UI-facing step. The device test (`cargo test -p engined --test player -- --ignored`) passes.
+
+**The crates now** (no cycles):
+
+- `surface`: controls and their frames.
+- `rekordbox`: the leaf reader.
+- `engine-core`, `engine-stretch`, `engine-media`, `engine-io`: the engine.
+- `engine-analysis`: analyzers, the player's chain and its result codec, the Rekordbox adapter.
+- `waveform`.
+- `library`: also `library::stick`.
+- `player-api`: the port.
+- `browser`: the browse screen's model.
+- `engined`: implements the port.
+- `ui`.
+
+No source file outside tests is over about 600 lines; `waveform/src/blob.rs` is 610. The functions still over 100 lines are:
+
+- `Theme::reference` (data);
+- `engined::controls::Surface::event` (101 lines, one `match`);
+- `waveform-preview`'s `run` (a dev tool);
+- tests.
+
+**Where it differs from the proposal:**
+
+- **Step 4:** `persist` is now `store`. `stick.rs` went first into `engined`, then (step 7) into `library` as `library::stick`, because the browser left `engined` and the library's scan walks the stick too.
+- **Step 5:** `XmlTrack` keeps Rekordbox's key text (`tonality`), not our `Key`, so the crate needs nothing from analysis. `engine-analysis` reads it through `XmlTrackExt`.
+- **Step 6:** `ControlEvent` keeps the units it had: radians, the fader at -1..1, and the dev `alt` flag. Its frame encoding carries those. Raw encoder counts and ADC values come with the RP2040 protocol, converted where the board is read. `Jog` moved into `surface`, since the port shows it.
+- **Step 7, the browser:** it did not become requests and replies. Its navigation (levels, cursor, sort, search) is view state, and the files it reads are on the same stick on the same host. So it is its own crate, `browser`, on the UI's side; only the library's listing and playlists cross the port.
+- **Step 7, the port's types:** `player-api` re-exports `engine-core`'s and `library`'s types rather than defining wire types. A socket transport will need a serialisable command type: `DeckCommand` also has engine-only variants (`Load`, `SetGrid`, `SetCues`).
+- **Step 7, startup:** the UI still depends on `engined`, but only `app/start.rs` and the CLI options name it.
+- **Step 8:** `Deck` is one field, not a list. The second deck makes it a list, gives the `Port` a deck index, and gives each side its own `controls::Surface`. `deck_busy` (which holds ANALYZE ALL back) is still one flag for the player.
+
+**Still open from this plan:**
+
+- **Waveform rates:** check that `batch.rs`'s waveform (built at the file rate) matches the live tap's (built at the engine rate).
+- **`select::Policy`:** decide whether it becomes the merge when Rekordbox values join our analyzers'. It is kept for the overlay.
+- **The `testing` features:** test-only `pub` items in `engined` (`LibraryWorker::spawn_as`, `Reply`, `Loaded`) are not yet behind a `testing` feature. `engine-core` and `rekordbox` have theirs.
+- **The screen-independent overlay stack** in the UI (`ui-architecture.md` step 6).
