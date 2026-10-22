@@ -39,11 +39,46 @@ pub(super) const SCAN_CHIP: (f32, f32) = (706.0, 84.0);
 
 pub(super) const ANALYZE_CHIP: (f32, f32) = (576.0, 124.0);
 
+/// The chips' touch targets run from the section's top to the first row.
+const CHIP_HIT: (f32, f32) = (66.0, LIST_Y - 66.0);
+
 pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
     let t = ui.t;
     let Rect { x, y, w, h } = HEADER;
-    // The chips' touch targets run from the section's top to the first row.
-    let (hit_y, hit_h) = (66.0, LIST_Y - 66.0);
+    let (hit_y, hit_h) = CHIP_HIT;
+    let pressed_back = ui.pressed == Some(Target::Browse(BrowseTarget::Back));
+    ui.scene.fill(x, y + h - 1.0, w, 1.0, t.color.button_edge);
+    let chips_left = chips(ui, b);
+    let label = match &b.header_override {
+        Some(h) => h.clone(),
+        None if b.at_root => b.header.clone(),
+        None => format!("‹  {}", b.header),
+    };
+    ui.text(
+        label,
+        x + PAD,
+        y + (h - t.font.row * t.font.line_height) * 0.5,
+        t.text.row.semibold().max_width(chips_left - x - 2.0 * PAD),
+    );
+    if !b.at_root {
+        // Up to the chips (or the progress text left of them).
+        let back_w = chips_left - x - 6.0;
+        if pressed_back {
+            ui.scene.fill(x, y, back_w, h - 1.0, t.color.button_pressed);
+        }
+        ui.hit(
+            Target::Browse(BrowseTarget::Back),
+            Rect::new(x, hit_y, back_w, hit_h),
+        );
+    }
+}
+
+/// The header's chips and progress, from the right; returns where they start (the path
+/// ends before it).
+fn chips(ui: &mut Ui, b: &BrowseView) -> f32 {
+    let t = ui.t;
+    let Rect { y, h, .. } = HEADER;
+    let (hit_y, hit_h) = CHIP_HIT;
     let mut chips_left = SORT_CHIP.0;
     let chip = |ui: &mut Ui, target: Target, (cx, cw): (f32, f32), label: &str, on: bool| {
         ui.button_styled(
@@ -60,8 +95,6 @@ pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
             last.rect.h = hit_h;
         }
     };
-    let pressed_back = ui.pressed == Some(Target::Browse(BrowseTarget::Back));
-    ui.scene.fill(x, y + h - 1.0, w, 1.0, t.color.button_edge);
     chip(
         ui,
         Target::Browse(BrowseTarget::Search),
@@ -124,28 +157,7 @@ pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
         );
         chips_left = SORT_CHIP.0 - 150.0;
     }
-    let label = match &b.header_override {
-        Some(h) => h.clone(),
-        None if b.at_root => b.header.clone(),
-        None => format!("‹  {}", b.header),
-    };
-    ui.text(
-        label,
-        x + PAD,
-        y + (h - t.font.row * t.font.line_height) * 0.5,
-        t.text.row.semibold().max_width(chips_left - x - 2.0 * PAD),
-    );
-    if !b.at_root {
-        // Up to the chips (or the progress text left of them).
-        let back_w = chips_left - x - 6.0;
-        if pressed_back {
-            ui.scene.fill(x, y, back_w, h - 1.0, t.color.button_pressed);
-        }
-        ui.hit(
-            Target::Browse(BrowseTarget::Back),
-            Rect::new(x, hit_y, back_w, hit_h),
-        );
-    }
+    chips_left
 }
 
 pub(super) fn list(ui: &mut Ui, b: &BrowseView) {
@@ -179,88 +191,96 @@ pub(super) fn list(ui: &mut Ui, b: &BrowseView) {
         );
     }
     for (i, row) in b.rows.iter().enumerate().take(ROWS) {
-        let y = LIST_Y + i as f32 * ROW_H;
-        let selected = b.selected == Some(i);
-        if selected {
-            ui.scene
-                .fill(JACKET_X, y, right - JACKET_X, ROW_H, t.color.row_selected);
-        }
-        ui.scene.fill(
-            TITLE_X,
-            y + ROW_H - 1.0,
-            right - TITLE_X,
-            1.0,
-            t.color.row_rule,
-        );
-        jacket(ui, row, y);
-        let weight = if selected {
-            Weight::SemiBold
-        } else {
-            Weight::Regular
-        };
-        let text_y = y + (ROW_H - t.font.row * t.font.line_height) * 0.5;
-        let title_color = if row.missing {
-            t.color.dim
-        } else if row.loaded {
-            t.color.accent_text
-        } else {
-            t.color.text
-        };
-        if row.tagged {
-            // The tag mark, in the title's left padding.
-            let d = 6.0;
-            ui.scene.rounded(
-                TITLE_X + 2.0,
-                y + (ROW_H - d) * 0.5,
-                d,
-                d,
-                d * 0.5,
-                t.color.cue,
-                0.0,
-                t.color.cue,
-            );
-        }
-        cell(
-            ui,
-            &row.title,
-            TITLE_X + PAD,
-            text_y,
-            title_w,
-            weight,
-            title_color,
-        );
-        if b.side.is_some() {
-            ui.hit(
-                Target::Browse(BrowseTarget::Row(i as u8)),
-                Rect::new(JACKET_X, y, right - JACKET_X, ROW_H),
-            );
-            continue;
-        }
-        let detail_w = if row.detail.is_empty() { 0.0 } else { DETAIL_W };
-        cell(
-            ui,
-            &row.artist,
-            ARTIST_X + PAD,
-            text_y,
-            ARTIST_W - 2.0 * PAD - detail_w,
-            weight,
-            t.color.text,
-        );
-        if !row.detail.is_empty() {
-            // As large and as bold as the title and artist.
-            ui.text(
-                row.detail.clone(),
-                ARTIST_X + ARTIST_W - PAD,
-                text_y,
-                t.text.row.weight(weight).right(),
-            );
-        }
-        ui.hit(
-            Target::Browse(BrowseTarget::Row(i as u8)),
-            Rect::new(JACKET_X, y, ARTIST_X + ARTIST_W - JACKET_X, ROW_H),
-        );
+        list_row(ui, b, i, row, title_w);
     }
     scroll_bar(ui, b, list_h);
+}
+
+/// Shown row `i`: the cursor, the rule, the jacket, the title and (without the info panel)
+/// the artist and details.
+fn list_row(ui: &mut Ui, b: &BrowseView, i: usize, row: &Row, title_w: f32) {
+    let t = ui.t;
+    let right = list_right(b);
+    let y = LIST_Y + i as f32 * ROW_H;
+    let selected = b.selected == Some(i);
+    if selected {
+        ui.scene
+            .fill(JACKET_X, y, right - JACKET_X, ROW_H, t.color.row_selected);
+    }
+    ui.scene.fill(
+        TITLE_X,
+        y + ROW_H - 1.0,
+        right - TITLE_X,
+        1.0,
+        t.color.row_rule,
+    );
+    jacket(ui, row, y);
+    let weight = if selected {
+        Weight::SemiBold
+    } else {
+        Weight::Regular
+    };
+    let text_y = y + (ROW_H - t.font.row * t.font.line_height) * 0.5;
+    let title_color = if row.missing {
+        t.color.dim
+    } else if row.loaded {
+        t.color.accent_text
+    } else {
+        t.color.text
+    };
+    if row.tagged {
+        // The tag mark, in the title's left padding.
+        let d = 6.0;
+        ui.scene.rounded(
+            TITLE_X + 2.0,
+            y + (ROW_H - d) * 0.5,
+            d,
+            d,
+            d * 0.5,
+            t.color.cue,
+            0.0,
+            t.color.cue,
+        );
+    }
+    cell(
+        ui,
+        &row.title,
+        TITLE_X + PAD,
+        text_y,
+        title_w,
+        weight,
+        title_color,
+    );
+    if b.side.is_some() {
+        ui.hit(
+            Target::Browse(BrowseTarget::Row(i as u8)),
+            Rect::new(JACKET_X, y, right - JACKET_X, ROW_H),
+        );
+        return;
+    }
+    let detail_w = if row.detail.is_empty() { 0.0 } else { DETAIL_W };
+    cell(
+        ui,
+        &row.artist,
+        ARTIST_X + PAD,
+        text_y,
+        ARTIST_W - 2.0 * PAD - detail_w,
+        weight,
+        t.color.text,
+    );
+    if !row.detail.is_empty() {
+        // As large and as bold as the title and artist.
+        ui.text(
+            row.detail.clone(),
+            ARTIST_X + ARTIST_W - PAD,
+            text_y,
+            t.text.row.weight(weight).right(),
+        );
+    }
+    ui.hit(
+        Target::Browse(BrowseTarget::Row(i as u8)),
+        Rect::new(JACKET_X, y, ARTIST_X + ARTIST_W - JACKET_X, ROW_H),
+    );
 }
 
 /// The list's right edge: the artist column's, or the title column's with the info panel.

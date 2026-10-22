@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use engined::browse::{Browser, Kind, Source, Tags};
+use engined::browse::{Browser, Entry, Kind, Source, Tags};
 use library::PlaylistKind;
 
 use super::editing::Modal;
@@ -21,72 +21,12 @@ impl BrowseState {
             .iter()
             .skip(l.top)
             .take(ROWS)
-            .map(|e| match e.kind {
-                Kind::Folder | Kind::Playlist(_) => Row {
-                    kind: match e.kind {
-                        Kind::Playlist(id) => match b.playlists().and_then(|p| p.get(id)) {
-                            Some(p) if p.kind == PlaylistKind::Folder => RowKind::Folder,
-                            _ => RowKind::List,
-                        },
-                        _ => RowKind::Folder,
-                    },
-                    title: e.name.clone(),
-                    artist: String::new(),
-                    detail: String::new(),
-                    loaded: false,
-                    art: None,
-                    tagged: false,
-                    missing: false,
-                },
-                Kind::Track => {
-                    let tags = b.info(&e.path);
-                    let tags = tags.as_ref();
-                    let detail = [
-                        tags.and_then(|t| t.bpm).map(|b| format!("{b:.1}")),
-                        tags.and_then(|t| t.key.clone()),
-                        tags.and_then(|t| t.duration).map(length),
-                    ];
-                    Row {
-                        kind: RowKind::Track,
-                        title: track_title(&e.path, tags),
-                        artist: tags.and_then(|t| t.artist.clone()).unwrap_or_default(),
-                        detail: detail.into_iter().flatten().collect::<Vec<_>>().join("   "),
-                        loaded: loaded == Some(e.path.as_path()),
-                        art: b.art(&e.path),
-                        tagged: b.is_tagged(&e.path),
-                        missing: e.path.as_os_str().is_empty(),
-                    }
-                }
-            })
+            .map(|e| row(b, e, loaded))
             .collect();
         let library = b.source() == Source::Library;
-        let top = if library {
-            "LIBRARY".to_string()
-        } else if b.source() == Source::TagList {
-            "TAG LIST".to_string()
-        } else {
-            b.root()
-                .file_name()
-                .map_or("USB".into(), |n| n.to_string_lossy().into_owned())
-        };
-        let mut header = std::iter::once(top.as_str())
-            .chain(b.trail())
-            .collect::<Vec<_>>()
-            .join("  /  ");
         let query = b.search_query();
-        if let Some(q) = query {
-            header = format!("{header}:  {q}{}", if self.keyboard { "▏" } else { "" });
-        }
-        let empty = match (&l.error, l.entries.is_empty()) {
-            (Some(e), _) => Some(format!("Can't read this folder: {e}")),
-            (None, true) if query.is_some() => Some("Nothing matches".into()),
-            (None, true) if library => Some(
-                "No tracks in the library yet: scan the USB, or load tracks from its folders"
-                    .into(),
-            ),
-            (None, true) => Some("No folders or tracks here".into()),
-            _ => None,
-        };
+        let header = header(b, query, self.keyboard);
+        let empty = empty(b, query, library);
         let scan = lib.scan.filter(|&(done, total)| done < total || total == 0);
         let side = self.side.then(|| info_view(b, library, loaded)).flatten();
         BrowseView {
@@ -150,6 +90,83 @@ impl BrowseState {
                 .skip(l.top)
                 .take(ROWS)
                 .all(|e| e.kind == Kind::Folder || b.is_read(&e.path))
+    }
+}
+
+/// A shown row of the list: a folder or playlist, or a track with its tags.
+fn row(b: &Browser, e: &Entry, loaded: Option<&Path>) -> Row {
+    match e.kind {
+        Kind::Folder | Kind::Playlist(_) => Row {
+            kind: match e.kind {
+                Kind::Playlist(id) => match b.playlists().and_then(|p| p.get(id)) {
+                    Some(p) if p.kind == PlaylistKind::Folder => RowKind::Folder,
+                    _ => RowKind::List,
+                },
+                _ => RowKind::Folder,
+            },
+            title: e.name.clone(),
+            artist: String::new(),
+            detail: String::new(),
+            loaded: false,
+            art: None,
+            tagged: false,
+            missing: false,
+        },
+        Kind::Track => {
+            let tags = b.info(&e.path);
+            let tags = tags.as_ref();
+            let detail = [
+                tags.and_then(|t| t.bpm).map(|b| format!("{b:.1}")),
+                tags.and_then(|t| t.key.clone()),
+                tags.and_then(|t| t.duration).map(length),
+            ];
+            Row {
+                kind: RowKind::Track,
+                title: track_title(&e.path, tags),
+                artist: tags.and_then(|t| t.artist.clone()).unwrap_or_default(),
+                detail: detail.into_iter().flatten().collect::<Vec<_>>().join("   "),
+                loaded: loaded == Some(e.path.as_path()),
+                art: b.art(&e.path),
+                tagged: b.is_tagged(&e.path),
+                missing: e.path.as_os_str().is_empty(),
+            }
+        }
+    }
+}
+
+/// Where the list is: the source, then the folders down to it, and the search with its
+/// cursor while the keyboard is up.
+fn header(b: &Browser, query: Option<&str>, keyboard: bool) -> String {
+    let top = if b.source() == Source::Library {
+        "LIBRARY".to_string()
+    } else if b.source() == Source::TagList {
+        "TAG LIST".to_string()
+    } else {
+        b.root()
+            .file_name()
+            .map_or("USB".into(), |n| n.to_string_lossy().into_owned())
+    };
+    let mut header = std::iter::once(top.as_str())
+        .chain(b.trail())
+        .collect::<Vec<_>>()
+        .join("  /  ");
+    if let Some(q) = query {
+        header = format!("{header}:  {q}{}", if keyboard { "▏" } else { "" });
+    }
+    header
+}
+
+/// What the list says when it has no rows.
+fn empty(b: &Browser, query: Option<&str>, library: bool) -> Option<String> {
+    let l = b.level();
+    match (&l.error, l.entries.is_empty()) {
+        (Some(e), _) => Some(format!("Can't read this folder: {e}")),
+        (None, true) if query.is_some() => Some("Nothing matches".into()),
+        (None, true) if library => Some(
+            "No tracks in the library yet: scan the USB, or load tracks from its folders".into(),
+        ),
+        (None, true) => Some("No folders or tracks here".into()),
+        _ => None,
     }
 }
 
