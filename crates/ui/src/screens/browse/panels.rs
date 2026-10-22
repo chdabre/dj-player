@@ -6,7 +6,7 @@ use super::*;
 /// large as the panel is tall, and beside it the names, large BPM / key / time / rating
 /// readouts and the comment, using the whole width. (The canvas's "Info" artboard puts the
 /// fields in a narrow list and leaves a third of the panel empty.)
-pub(super) fn info_panel(ui: &mut Ui, i: &InfoView) {
+pub(crate) fn info_panel(ui: &mut Ui, i: &InfoView) {
     let t = ui.t;
     let line_y = |y: f32, h: f32, size: f32| y + (h - size * t.font.line_height) * 0.5;
     // Header bar.

@@ -23,10 +23,11 @@ mod view;
 #[cfg(test)]
 pub use keyboard::key_count;
 pub use keyboard::{BACKSPACE, CLEAR, DONE, SHIFT, Shift, key_char};
+pub(crate) use panels::info_panel;
 pub use state::BrowseState;
 #[cfg(test)]
 pub use state::Focus;
-pub use view::{OnDeck, info_screen};
+pub(crate) use view::info_fields;
 // The parts' layout constants and drawing, for each other (`use super::*`).
 use keyboard::*;
 use list::*;
@@ -163,8 +164,6 @@ pub struct BrowseView {
     /// The level holds tracks: the list has its title and artist columns. Without (folders
     /// only, the library menu) it is one column, with no divider.
     pub has_tracks: bool,
-    /// The INFO screen: a track's details instead of the list.
-    pub info: Option<InfoView>,
     /// INFO in the browser: the selected track's details beside the list.
     pub side: Option<InfoView>,
     /// The tag list is shown (the TAG LIST tab lit).
@@ -188,26 +187,18 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
         Target::Chrome(ChromeTarget::Usb)
     };
     rail(ui, v, lit);
-    match &b.info {
-        Some(info) => {
-            tabs(ui, Some(Target::Chrome(ChromeTarget::Info)));
-            info_panel(ui, info);
-        }
-        None => {
-            tabs(
-                ui,
-                Some(if b.tag_list {
-                    Target::Chrome(ChromeTarget::TagList)
-                } else {
-                    Target::Chrome(ChromeTarget::Browse)
-                }),
-            );
-            header(ui, b);
-            list(ui, b);
-            if let Some(side) = &b.side {
-                side_panel(ui, side);
-            }
-        }
+    tabs(
+        ui,
+        Some(if b.tag_list {
+            Target::Chrome(ChromeTarget::TagList)
+        } else {
+            Target::Chrome(ChromeTarget::Browse)
+        }),
+    );
+    header(ui, b);
+    list(ui, b);
+    if let Some(side) = &b.side {
+        side_panel(ui, side);
     }
     if b.keyboard {
         keyboard(ui, b.shift);
@@ -217,11 +208,10 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
         bottom(ui, v, overview);
     }
     // A modal or the scan question goes over the list, which dims and stops taking touches.
-    let modal_up = b.info.is_none() && b.modal.is_some();
-    if modal_up || b.ask_scan {
+    if b.modal.is_some() || b.ask_scan {
         ui.on(Layer::Overlay, |ui| {
             ui.scrim(LIST_AREA);
-            if let Some(m) = b.modal.as_ref().filter(|_| modal_up) {
+            if let Some(m) = &b.modal {
                 modal(ui, m);
             }
             if b.ask_scan {

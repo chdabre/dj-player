@@ -441,6 +441,7 @@ mod tests {
             ("screens/chrome.rs", include_str!("screens/chrome.rs")),
             ("screens/deck.rs", include_str!("screens/deck.rs")),
             ("screens/main.rs", include_str!("screens/main.rs")),
+            ("screens/info.rs", include_str!("screens/info.rs")),
             ("screens/perform.rs", include_str!("screens/perform.rs")),
             (
                 "screens/browse/mod.rs",

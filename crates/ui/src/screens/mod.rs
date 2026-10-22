@@ -15,6 +15,7 @@
 pub mod browse;
 pub mod chrome;
 pub mod deck;
+pub mod info;
 pub mod main;
 pub mod perform;
 
@@ -82,6 +83,8 @@ pub struct View<'a> {
     pub save: Option<SaveState>,
     /// The browse screen's list, when there is something to browse.
     pub browse: Option<&'a crate::screens::browse::BrowseView>,
+    /// The INFO screen's track.
+    pub info: Option<&'a crate::screens::browse::InfoView>,
 }
 
 /// What the status band says about the library.
@@ -293,7 +296,13 @@ pub fn build(view: &View, theme: &Theme, overview: &mut OverviewCache, scene: &m
         debug_line(&mut ui, view);
         return ui.into_hits();
     }
-    if matches!(view.screen, ScreenKind::Browse | ScreenKind::Info)
+    if view.screen == ScreenKind::Info
+        && let Some(i) = view.info
+    {
+        info::build(&mut ui, view, i, overview);
+        return ui.into_hits();
+    }
+    if view.screen == ScreenKind::Browse
         && let Some(b) = view.browse
     {
         // No timing overlay here: it would cover the list.
@@ -361,7 +370,59 @@ mod tests {
             perf: PerfState::default(),
             save: Some(SaveState::Unsaved),
             browse: None,
+            info: None,
         }
+    }
+
+    #[test]
+    fn info_screen_fits_and_shows_the_rating_and_the_whole_title() {
+        use crate::screens::browse::InfoView;
+        let info = InfoView {
+            source: "USB",
+            position: "TRACK 004/040".into(),
+            fields: vec![
+                ("TITLE", "A title far too long for its column ".repeat(4)),
+                ("ARTIST", "Artist".into()),
+                ("ALBUM", "Album".into()),
+                ("TIME", "5:12".into()),
+                ("BPM", "128.0".into()),
+                ("KEY", "8A".into()),
+            ],
+            rating: Some(3),
+            comment: Some("word ".repeat(80)),
+            ..InfoView::default()
+        };
+        let d = deck(None);
+        let mut v = view(&d);
+        v.screen = ScreenKind::Info;
+        v.info = Some(&info);
+        let mut scene = Scene::default();
+        let hits = build(
+            &v,
+            &Theme::default(),
+            &mut OverviewCache::default(),
+            &mut scene,
+        );
+        for r in scene.rects() {
+            assert!(
+                r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
+                "{r:?}"
+            );
+        }
+        assert!(
+            hits.iter()
+                .any(|h| h.target == Target::Chrome(ChromeTarget::Info))
+        );
+        assert!(
+            scene.texts().any(|t| t.text == "★★★☆☆"),
+            "the rating shows as stars"
+        );
+        let title = &info.fields[0].1;
+        assert!(
+            scene
+                .texts()
+                .any(|t| &t.text == title && t.max_width.is_some())
+        );
     }
 
     #[test]
@@ -474,25 +535,6 @@ mod tests {
                 }),
                 ..base.clone()
             },
-            BrowseView {
-                library: true,
-                info: Some(InfoView {
-                    source: "USB",
-                    position: "TRACK 004/040".into(),
-                    fields: vec![
-                        ("TITLE", "A title far too long for its column ".repeat(4)),
-                        ("ARTIST", "Artist".into()),
-                        ("ALBUM", "Album".into()),
-                        ("TIME", "5:12".into()),
-                        ("BPM", "128.0".into()),
-                        ("KEY", "8A".into()),
-                    ],
-                    rating: Some(3),
-                    comment: Some("word ".repeat(80)),
-                    ..InfoView::default()
-                }),
-                ..base.clone()
-            },
         ];
         for b in &variants {
             let d = deck(None);
@@ -537,8 +579,7 @@ mod tests {
                 .iter()
                 .filter(|h| matches!(h.target, Target::Browse(BrowseTarget::Row(_))))
                 .collect();
-            let listing = b.info.is_none();
-            assert_eq!(rows.len(), if listing { ROWS } else { 0 });
+            assert_eq!(rows.len(), ROWS);
             // Under a modal or the question the rows stay, dimmed, and take no touch.
             let covered = b.ask_scan || b.modal.is_some();
             assert!(rows.iter().all(|h| hits.blocked(h) == covered));
@@ -569,19 +610,14 @@ mod tests {
             if let Some(h) = &b.header_override {
                 assert!(scene.texts().any(|t| &t.text == h));
             }
-            assert_eq!(
-                has(Target::Browse(BrowseTarget::Back)),
-                !b.at_root && listing
-            );
+            assert_eq!(has(Target::Browse(BrowseTarget::Back)), !b.at_root);
             assert_eq!(
                 has(Target::Browse(BrowseTarget::Scan)),
-                b.library && b.scan.is_none() && listing
+                b.library && b.scan.is_none()
             );
             assert_eq!(has(Target::Browse(BrowseTarget::ScanYes)), b.ask_scan);
-            let analyze = listing
-                && b.library
-                && b.scan.is_none()
-                && (b.unanalysed > 0 || b.analyzing.is_some());
+            let analyze =
+                b.library && b.scan.is_none() && (b.unanalysed > 0 || b.analyzing.is_some());
             assert_eq!(has(Target::Browse(BrowseTarget::AnalyzeAll)), analyze);
             if b.analyzing.is_some() {
                 assert!(scene.texts().any(|t| t.text == "ANALYZING 3 / 12"));
@@ -607,7 +643,7 @@ mod tests {
             let divider = scene
                 .rects()
                 .any(|r| r.x == 559.0 && r.y == 103.0 && r.w == 1.0);
-            if b.info.is_none() && !b.ask_scan {
+            if !b.ask_scan {
                 assert_eq!(divider, b.has_tracks || b.side.is_some());
             }
             if b.side.is_some() {
@@ -621,16 +657,6 @@ mod tests {
                 assert!(!scene.texts().any(|t| t.text == "128.0   8A   5:12"));
                 assert!(scene.texts().any(|t| t.text == "★★★☆☆"));
                 assert!(scene.texts().any(|t| t.text == "uk garage"));
-            }
-            if let Some(info) = &b.info {
-                let stars = scene.texts().any(|t| t.text == "★★★☆☆");
-                assert!(stars, "the rating shows as stars");
-                let title = &info.fields[0].1;
-                assert!(
-                    scene
-                        .texts()
-                        .any(|t| &t.text == title && t.max_width.is_some())
-                );
             }
             // Row text is ellipsized to its column.
             assert!(

@@ -64,7 +64,8 @@ use crate::app::track::Track;
 use crate::input::{ControlEvent, Nav};
 use crate::render::Gfx;
 use crate::render::scene::Scene;
-use crate::screens::browse::{self, OnDeck, ROW_H, ROWS};
+use crate::screens::browse::{ROW_H, ROWS};
+use crate::screens::info::{self, OnDeck};
 use crate::screens::perform::{self, PerfState};
 use crate::screens::{Cx, Hits, SaveState, ScreenKind, Screens, View};
 use crate::stats::FrameStats;
@@ -894,13 +895,17 @@ impl App {
         }) && (self.screens.screen != ScreenKind::Browse || self.browse_settled());
         let library = LibraryView::read(&self.player);
         let loaded = self.player.loaded();
-        let browse = match self.screens.screen {
-            ScreenKind::Browse => self.browser.as_ref().map(|b| {
-                self.screens
-                    .browse
-                    .view(b, &library, loaded.map(|d| d.file()))
-            }),
-            ScreenKind::Info => Some(browse::info_screen(
+        let browse = (self.screens.screen == ScreenKind::Browse)
+            .then(|| {
+                self.browser.as_ref().map(|b| {
+                    self.screens
+                        .browse
+                        .view(b, &library, loaded.map(|d| d.file()))
+                })
+            })
+            .flatten();
+        let info = (self.screens.screen == ScreenKind::Info).then(|| {
+            info::view(
                 self.browser.as_ref(),
                 loaded
                     .zip(self.track.tags.as_ref())
@@ -910,9 +915,8 @@ impl App {
                         key: d.analysed.as_ref().and_then(|a| a.key.clone()),
                         tags,
                     }),
-            )),
-            _ => None,
-        };
+            )
+        });
         let view = View {
             deck: &self.deck,
             title: &self.track.title,
@@ -928,6 +932,7 @@ impl App {
                 Persistence::Unsaved { .. } => SaveState::Unsaved,
             }),
             browse: browse.as_ref(),
+            info: info.as_ref(),
             wave: (!self.track.wave.is_empty()).then_some(screens::Wave {
                 entries: &self.track.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),

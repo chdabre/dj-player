@@ -9,7 +9,7 @@ use library::PlaylistKind;
 use super::state::BrowseState;
 use super::{BrowseView, InfoView, ModalView, ROWS, Row, RowKind, length};
 use crate::app::engine::LibraryView;
-use crate::app::track::{LoadedTags, track_title};
+use crate::app::track::track_title;
 use crate::playlists::Modal;
 
 impl BrowseState {
@@ -91,7 +91,6 @@ impl BrowseState {
         let side = self.side.then(|| info_view(b, library, loaded)).flatten();
         BrowseView {
             side,
-            info: None,
             header,
             at_root: b.at_root(),
             library,
@@ -183,54 +182,8 @@ fn info_view(b: &Browser, library: bool, loaded: Option<&Path>) -> Option<InfoVi
     })
 }
 
-/// The loaded track as the INFO screen shows it: its file, its analysis (BPM, key) and its own
-/// tags as read when it loaded.
-pub struct OnDeck<'a> {
-    pub path: &'a Path,
-    pub bpm: Option<f64>,
-    pub key: Option<String>,
-    pub tags: &'a LoadedTags,
-}
-
-/// The INFO screen's view: the loaded track, from its own tags, the library's listing and
-/// the analysis (ours win).
-pub fn info_screen(b: Option<&Browser>, on_deck: Option<OnDeck>) -> BrowseView {
-    let info = match on_deck {
-        Some(d) => {
-            let lt = d.tags;
-            let mut tags = b
-                .and_then(|b| b.info(d.path))
-                .unwrap_or_else(|| lt.tags.clone());
-            tags.bpm = d.bpm.or(tags.bpm);
-            tags.key = d.key.or(tags.key);
-            tags.duration = tags.duration.or(lt.tags.duration);
-            tags.comment = tags.comment.or_else(|| lt.tags.comment.clone());
-            InfoView {
-                source: "USB",
-                position: "ON DECK".into(),
-                folder: false,
-                fields: info_fields(d.path, &tags),
-                rating: tags.rating,
-                art: lt.art.clone(),
-                comment: tags.comment.clone(),
-                loaded: true,
-            }
-        }
-        None => InfoView {
-            source: "USB",
-            position: "NO TRACK".into(),
-            fields: vec![("TITLE", "No track loaded".into())],
-            ..InfoView::default()
-        },
-    };
-    BrowseView {
-        info: Some(info),
-        ..BrowseView::default()
-    }
-}
-
 /// The info panels' fields of a track.
-fn info_fields(path: &Path, tags: &Tags) -> Vec<(&'static str, String)> {
+pub(crate) fn info_fields(path: &Path, tags: &Tags) -> Vec<(&'static str, String)> {
     let or_dash = |v: Option<String>| v.unwrap_or_else(|| "–".into());
     vec![
         ("TITLE", track_title(path, Some(tags))),
