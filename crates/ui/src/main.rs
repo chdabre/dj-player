@@ -55,18 +55,19 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::app::effects::{Effect, Effects};
 use crate::app::engine::DeckSnapshot;
 use crate::app::track::{Track, track_title};
 use crate::browse::{BrowseView, InfoView, ModalView, Nav, ROW_H, ROWS, Row, RowKind};
 use crate::kit::Rect;
-use crate::playlists::{Action, Modal, Naming};
+use crate::playlists::{Action, Editing, Modal};
 use crate::render::Gfx;
 use crate::render::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::WaveSettings;
-use library::{Edit, PlaylistId, PlaylistKind};
+use library::PlaylistKind;
 use waveform::display::Mode;
 
 #[cfg(debug_assertions)]
@@ -435,8 +436,8 @@ fn main() -> ExitCode {
         pending_search: args.search.clone(),
         keyboard: args.search.is_some(),
         side: args.info,
-        modal: None,
-        moving: None,
+        editing: Editing::default(),
+        effects: Vec::new(),
         shift: browse::Shift::Off,
         pending_analyze_all: args.analyze_all,
         pending_open: args.open.clone(),
@@ -531,10 +532,11 @@ struct App {
     keyboard: bool,
     /// The browser's info panel is up beside the list.
     side: bool,
-    /// A modal over the browse list (MENU, ADD TO PLAYLIST, naming, a confirmation).
-    modal: Option<Modal>,
-    /// The playlist entry the knob is moving.
-    moving: Option<library::EntryId>,
+    /// Playlist editing on the browse screen: a modal over the list (MENU, ADD TO PLAYLIST,
+    /// naming, a confirmation), or an entry the knob is moving.
+    editing: Editing,
+    /// What input asked the engine and the library to do, carried out after each event.
+    effects: Effects,
     /// The on-screen keyboard's shift.
     shift: browse::Shift,
     /// `--analyze-all` still to start.
@@ -582,8 +584,41 @@ struct App {
 
 impl App {
     fn send(&mut self, cmd: DeckCommand) {
-        if !self.player.send(cmd) {
-            eprintln!("command ring full, dropped");
+        self.effects.push(Effect::Deck(cmd));
+    }
+
+    /// Carry out the effects input asked for, in order.
+    fn apply_effects(&mut self) {
+        for effect in std::mem::take(&mut self.effects) {
+            match effect {
+                Effect::Deck(cmd) => {
+                    if !self.player.send(cmd) {
+                        eprintln!("command ring full, dropped");
+                    }
+                }
+                Effect::Load(path) => self.load(&path),
+                Effect::Library(edit) => {
+                    self.player.library_edit(edit);
+                }
+                Effect::AddFiles(id, files) => {
+                    self.player.add_files(id, files);
+                }
+                Effect::NewPlaylist {
+                    id,
+                    parent,
+                    name,
+                    files,
+                } => {
+                    self.player.new_playlist(id, parent, name, files);
+                }
+                Effect::Scan => self.player.scan(),
+                Effect::AnalyzeAll(files) => {
+                    if !self.player.analyze_all(files) {
+                        eprintln!("analyze all: nothing to analyse (or no library)");
+                    }
+                }
+                Effect::StopAnalyzeAll => self.player.stop_analyze_all(),
+            }
         }
     }
 
@@ -710,19 +745,19 @@ impl App {
                     b.set_source(Source::TagList);
                 }
                 self.keyboard = false;
-                self.modal = None;
+                self.editing.modal = None;
                 self.screen = ScreenKind::Browse;
             }
             Target::Menu if self.screen == ScreenKind::Browse => self.open_menu(),
             Target::ModalRow(i) => {
-                if let Some(m) = self.modal.as_mut() {
+                if let Some(m) = self.editing.modal.as_mut() {
                     m.select(usize::from(i));
                 }
                 self.modal_push();
                 self.naming_started();
             }
             Target::Info => self.toggle_info(),
-            Target::Scan => self.player.scan(),
+            Target::Scan => self.effects.push(Effect::Scan),
             Target::AnalyzeAll => self.analyze_all(),
             Target::ScanYes => self.answer_scan(true),
             Target::ScanNo => self.answer_scan(false),
@@ -734,7 +769,7 @@ impl App {
                     }
                     let (c, shift) = self.shift.apply(c);
                     self.shift = shift;
-                    if matches!(self.modal, Some(Modal::Name { .. })) {
+                    if self.editing.naming() {
                         self.type_name(c);
                     } else {
                         self.type_char(c);
@@ -857,7 +892,7 @@ impl App {
             return;
         };
         if let Entered::Track(path) = b.enter() {
-            self.load(&path);
+            self.effects.push(Effect::Load(path));
         }
     }
 
@@ -880,7 +915,7 @@ impl App {
             }
             return;
         }
-        if let Some(m) = self.modal.as_mut() {
+        if let Some(m) = self.editing.modal.as_mut() {
             match n {
                 Nav::Up => m.move_by(-1),
                 Nav::Down => m.move_by(1),
@@ -888,16 +923,16 @@ impl App {
                     self.modal_push();
                     self.naming_started();
                 }
-                Nav::Back => self.modal = None,
+                Nav::Back => self.editing.modal = None,
                 Nav::Tag | Nav::Untag => {}
             }
             return;
         }
-        if self.moving.is_some() {
+        if self.editing.moving.is_some() {
             match n {
                 Nav::Up => self.move_entry(-1),
                 Nav::Down => self.move_entry(1),
-                _ => self.moving = None,
+                _ => self.editing.moving = None,
             }
             return;
         }
@@ -971,14 +1006,12 @@ impl App {
 
     /// ANALYZE ALL: analyse every library track without our analysis, in a batch; or stop.
     fn analyze_all(&mut self) {
-        if self.player.batch_progress().is_some() {
-            self.player.stop_analyze_all();
-            return;
-        }
-        let files = self.unanalysed();
-        if !self.player.analyze_all(files) {
-            eprintln!("analyze all: nothing to analyse (or no library)");
-        }
+        let effect = if self.player.batch_progress().is_some() {
+            Effect::StopAnalyzeAll
+        } else {
+            Effect::AnalyzeAll(self.unanalysed())
+        };
+        self.effects.push(effect);
     }
 
     /// The library's tracks without our analysis, one file each, in path order.
@@ -1014,7 +1047,7 @@ impl App {
     fn answer_scan(&mut self, scan: bool) {
         self.ask_scan = false;
         if scan {
-            self.player.scan();
+            self.effects.push(Effect::Scan);
             if let Some(b) = self.browser.as_mut() {
                 b.set_source(Source::Library);
             }
@@ -1078,219 +1111,43 @@ impl App {
         let Some(b) = self.browser.as_ref() else {
             return;
         };
-        let actions = playlists::menu(b);
-        if actions.is_empty() {
+        if !self.editing.open_menu(b) {
             eprintln!("menu: nothing to do here");
             return;
         }
         self.keyboard = false;
-        self.modal = Some(Modal::Menu { actions, cursor: 0 });
     }
 
     /// The modal's push (or a touch on one of its rows).
     fn modal_push(&mut self) {
-        match self.modal.take() {
-            Some(Modal::Menu { actions, cursor }) => {
-                if let Some(a) = actions.get(cursor).cloned() {
-                    self.act(a);
-                }
-            }
-            Some(Modal::Pick {
-                files,
-                lists,
-                cursor,
-            }) => match lists.get(cursor).map(|l| l.1) {
-                Some(Some(id)) => {
-                    self.player.add_files(id, files);
-                }
-                Some(None) => {
-                    self.modal = Some(Modal::Name {
-                        naming: Naming::NewPlaylist {
-                            parent: None,
-                            files,
-                        },
-                        text: String::new(),
-                    });
-                }
-                None => {}
-            },
-            Some(Modal::Confirm { action, cursor, .. }) => {
-                if cursor == 0 {
-                    match action {
-                        Action::Delete(id, _) => {
-                            self.player.library_edit(Edit::DeletePlaylist(id));
-                        }
-                        Action::ClearTagList => {
-                            self.player
-                                .library_edit(Edit::ClearPlaylist(PlaylistId::TAG_LIST));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some(name @ Modal::Name { .. }) => self.modal = Some(name),
-            None => {}
-        }
+        self.editing.push(self.browser.as_mut(), &mut self.effects);
     }
 
     /// Carry out a MENU action (or TAG TRACK's).
     fn act(&mut self, a: Action) {
-        let name = |naming, text: &str| Modal::Name {
-            naming,
-            text: text.to_string(),
-        };
-        match a {
-            Action::Tag(files) => {
-                self.player.add_files(PlaylistId::TAG_LIST, files);
-            }
-            Action::Untag(entries) => {
-                self.player.library_edit(Edit::RemoveEntries(entries));
-            }
-            Action::Remove(entry) => {
-                self.player.library_edit(Edit::RemoveEntries(vec![entry]));
-            }
-            Action::AddTo(files) => {
-                let lists = self
-                    .browser
-                    .as_ref()
-                    .map(playlists::pick_lists)
-                    .unwrap_or_default();
-                self.modal = Some(Modal::Pick {
-                    files,
-                    lists,
-                    cursor: 0,
-                });
-            }
-            Action::Move(entry) => {
-                // Moves follow the list's own order.
-                if let Some(b) = self.browser.as_mut() {
-                    b.set_sort(engined::browse::Sort::Order);
-                }
-                self.moving = Some(entry);
-            }
-            Action::MakePlaylist { files, name: n } => {
-                self.modal = Some(name(
-                    Naming::NewPlaylist {
-                        parent: None,
-                        files,
-                    },
-                    &n,
-                ));
-            }
-            Action::NewPlaylist(parent) => {
-                self.modal = Some(name(
-                    Naming::NewPlaylist {
-                        parent,
-                        files: Vec::new(),
-                    },
-                    "",
-                ));
-            }
-            Action::NewFolder(parent) => self.modal = Some(name(Naming::NewFolder(parent), "")),
-            Action::Rename(id, n) => self.modal = Some(name(Naming::Rename(id), &n)),
-            Action::ConvertTagList => {
-                self.modal = Some(name(Naming::ConvertTagList, "Tagged tracks"));
-            }
-            a @ Action::Delete(..) | a @ Action::ClearTagList => {
-                let question = match &a {
-                    Action::Delete(_, n) => format!("DELETE {n}?"),
-                    _ => "REMOVE ALL FROM THE TAG LIST?".into(),
-                };
-                self.modal = Some(Modal::Confirm {
-                    question,
-                    action: a,
-                    cursor: 1,
-                });
-            }
-        }
+        self.editing
+            .act(a, self.browser.as_mut(), &mut self.effects);
     }
 
     /// A name to type: the keyboard starts with a capital for an empty one.
     fn naming_started(&mut self) {
-        self.shift = match &self.modal {
-            Some(Modal::Name { text, .. }) if text.is_empty() => browse::Shift::Once,
-            _ => browse::Shift::Off,
+        self.shift = if self.editing.naming_empty() {
+            browse::Shift::Once
+        } else {
+            browse::Shift::Off
         };
     }
 
     /// A key typed into a name (on-screen keyboard or a real one); DONE names it.
     fn type_name(&mut self, c: char) {
-        let Some(Modal::Name { naming, text }) = self.modal.as_mut() else {
-            return;
-        };
-        match c {
-            browse::BACKSPACE => {
-                text.pop();
-            }
-            browse::CLEAR => text.clear(),
-            browse::DONE => {
-                let (naming, name) = (naming.clone(), text.trim().to_string());
-                self.modal = None;
-                if !name.is_empty() {
-                    self.named(naming, name);
-                }
-            }
-            c if !c.is_control() => text.push(c),
-            _ => {}
-        }
-    }
-
-    /// What a typed name was for.
-    fn named(&mut self, naming: Naming, name: String) {
-        match naming {
-            Naming::NewPlaylist { parent, files } if files.is_empty() => {
-                self.player.library_edit(Edit::CreatePlaylist {
-                    id: PlaylistId::random(),
-                    parent,
-                    kind: PlaylistKind::List,
-                    name,
-                });
-            }
-            Naming::NewPlaylist { parent, files } => {
-                self.player
-                    .new_playlist(PlaylistId::random(), parent, name, files);
-            }
-            Naming::NewFolder(parent) => {
-                self.player.library_edit(Edit::CreatePlaylist {
-                    id: PlaylistId::random(),
-                    parent,
-                    kind: PlaylistKind::Folder,
-                    name,
-                });
-            }
-            Naming::Rename(id) => {
-                self.player.library_edit(Edit::RenamePlaylist(id, name));
-            }
-            Naming::ConvertTagList => {
-                self.player.library_edit(Edit::ConvertTagList {
-                    id: PlaylistId::random(),
-                    parent: None,
-                    name,
-                });
-            }
-        }
+        self.editing.type_name(c, &mut self.effects);
     }
 
     /// MOVE: the moving entry one place up (`-1`) or down, the cursor with it.
     fn move_entry(&mut self, delta: isize) {
-        let (Some(entry), Some(b)) = (self.moving, self.browser.as_mut()) else {
-            return;
-        };
-        let l = b.level();
-        let Some(i) = l.entries.iter().position(|e| e.entry == Some(entry)) else {
-            self.moving = None;
-            return;
-        };
-        let before = match delta {
-            -1 if i > 0 => Some(l.entries[i - 1].entry),
-            1 if i + 1 < l.entries.len() => Some(l.entries.get(i + 2).and_then(|e| e.entry)),
-            _ => None,
-        };
-        let Some(before) = before else {
-            return;
-        };
-        self.player.library_edit(Edit::MoveEntry { entry, before });
-        b.move_by(delta);
+        if let Some(b) = self.browser.as_mut() {
+            self.editing.move_entry(delta, b, &mut self.effects);
+        }
     }
 
     /// A key typed into the search (on-screen keyboard or a real one).
@@ -1403,11 +1260,10 @@ impl App {
             library,
             sort: b.sort_label(),
             searching: query.is_some(),
-            keyboard: (self.keyboard && query.is_some())
-                || matches!(self.modal, Some(Modal::Name { .. })),
+            keyboard: (self.keyboard && query.is_some()) || self.editing.naming(),
             shift: self.shift,
             tag_list: b.source() == Source::TagList,
-            modal: self.modal.as_ref().and_then(|m| {
+            modal: self.editing.modal.as_ref().and_then(|m| {
                 m.rows().map(|(title, rows, selected)| ModalView {
                     title,
                     rows,
@@ -1415,7 +1271,7 @@ impl App {
                     danger_first: matches!(m, Modal::Confirm { .. }),
                 })
             }),
-            header_override: match (&self.modal, self.moving) {
+            header_override: match (&self.editing.modal, self.editing.moving) {
                 (Some(Modal::Name { naming, text }), _) => {
                     Some(format!("{}:  {text}▏", naming.prompt()))
                 }
@@ -1574,12 +1430,12 @@ impl App {
             return;
         }
         // While naming, the keyboard types the name: Enter names it, Esc gives up.
-        if browsing && matches!(self.modal, Some(Modal::Name { .. })) {
+        if browsing && self.editing.naming() {
             match &key.logical_key {
                 Key::Named(NamedKey::Backspace) => self.type_name(browse::BACKSPACE),
                 Key::Named(NamedKey::Space) => self.type_name(' '),
                 Key::Named(NamedKey::Enter) => self.type_name(browse::DONE),
-                Key::Named(NamedKey::Escape) => self.modal = None,
+                Key::Named(NamedKey::Escape) => self.editing.modal = None,
                 Key::Character(c) => c.chars().for_each(|ch| self.type_name(ch)),
                 _ => {}
             }
@@ -1588,7 +1444,7 @@ impl App {
         // TAG TRACK: x (shift: remove).
         if let Key::Character(c) = &key.logical_key
             && c.eq_ignore_ascii_case("x")
-            && self.modal.is_none()
+            && self.editing.modal.is_none()
             && !(browsing && self.keyboard)
         {
             return self.tag_track(self.modifiers.shift_key());
@@ -1729,6 +1585,8 @@ impl App {
         }
         #[cfg(not(feature = "standin"))]
         let _ = dt;
+        // The stand-in's held controls act before the deck is read, as a press would.
+        self.apply_effects();
         self.deck = DeckSnapshot::read(&self.player);
         let sr = self.deck.sample_rate;
         let speed = self.deck.speed();
@@ -1791,6 +1649,8 @@ impl App {
         if pending_menu {
             self.open_menu();
         }
+        // Before the screen is built, so it shows what they started (a scan, ANALYZE ALL).
+        self.apply_effects();
         // Judged before the scene is built, so a screenshot shows everything it waited for.
         let ready = self.player.loaded().is_none_or(|d| {
             d.analysed.is_some() && d.source.is_complete() && self.track.wave_complete
@@ -1932,42 +1792,9 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gfx.is_some() {
-            return;
-        }
-        let mut attrs = Window::default_attributes()
-            .with_title("dj-ui")
-            .with_inner_size(self.window_size())
-            .with_resizable(true);
-        if self.fullscreen {
-            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
-        }
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                self.error = Some(format!("window: {e}"));
-                return event_loop.exit();
-            }
-        };
-        match Gfx::new(window, event_loop) {
-            Ok(g) => {
-                eprintln!(
-                    "{} ({:?}), {:?}, frame latency 1",
-                    g.adapter_info.name, g.adapter_info.backend, g.present_mode
-                );
-                g.window().request_redraw();
-                self.gfx = Some(g);
-            }
-            Err(e) => {
-                self.error = Some(e);
-                event_loop.exit();
-            }
-        }
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+impl App {
+    /// One window event: input, a redraw, a resize.
+    fn handle(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -2021,6 +1848,47 @@ impl ApplicationHandler for App {
             },
             _ => {}
         }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+        let mut attrs = Window::default_attributes()
+            .with_title("dj-ui")
+            .with_inner_size(self.window_size())
+            .with_resizable(true);
+        if self.fullscreen {
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.error = Some(format!("window: {e}"));
+                return event_loop.exit();
+            }
+        };
+        match Gfx::new(window, event_loop) {
+            Ok(g) => {
+                eprintln!(
+                    "{} ({:?}), {:?}, frame latency 1",
+                    g.adapter_info.name, g.adapter_info.backend, g.present_mode
+                );
+                g.window().request_redraw();
+                self.gfx = Some(g);
+            }
+            Err(e) => {
+                self.error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.handle(event_loop, event);
+        self.apply_effects();
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
