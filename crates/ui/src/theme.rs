@@ -543,6 +543,10 @@ mod tests {
     fn screens_have_no_colour_literals() {
         for (file, src) in [
             ("main.rs", include_str!("main.rs")),
+            ("args.rs", include_str!("args.rs")),
+            ("app/mod.rs", include_str!("app/mod.rs")),
+            ("app/frame.rs", include_str!("app/frame.rs")),
+            ("app/platform.rs", include_str!("app/platform.rs")),
             ("screens/mod.rs", include_str!("screens/mod.rs")),
             ("screens/chrome.rs", include_str!("screens/chrome.rs")),
             ("screens/deck.rs", include_str!("screens/deck.rs")),
