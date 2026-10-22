@@ -23,6 +23,7 @@
 //!
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
 
+mod app;
 mod browse;
 mod clock;
 mod kit;
@@ -39,7 +40,6 @@ mod waves;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use engine_core::DeckCommand;
@@ -55,8 +55,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::app::engine::DeckSnapshot;
+use crate::app::track::{Track, track_title};
 use crate::browse::{BrowseView, InfoView, ModalView, Nav, ROW_H, ROWS, Row, RowKind};
-use crate::clock::PlayheadClock;
 use crate::kit::Rect;
 use crate::playlists::{Action, Modal, Naming};
 use crate::render::Gfx;
@@ -64,10 +65,9 @@ use crate::render::scene::Scene;
 use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
-use crate::waves::{OverviewCache, WaveSettings};
+use crate::waves::WaveSettings;
 use library::{Edit, PlaylistId, PlaylistKind};
-use waveform::compute::Entry;
-use waveform::display::{Mode, TrackGain};
+use waveform::display::Mode;
 
 #[cfg(debug_assertions)]
 #[global_allocator]
@@ -394,10 +394,12 @@ fn main() -> ExitCode {
             player.send(DeckCommand::Play);
         }
     }
-    let title = args
-        .file
-        .as_deref()
-        .map_or(String::new(), |f| track_title(f, None));
+    let sr = player.format.sample_rate;
+    let track = match args.file.as_deref() {
+        Some(f) => Track::new(f, None, sr),
+        None => Track::none(sr),
+    };
+    let deck = DeckSnapshot::read(&player);
     let mut browser = root.map(|r| Browser::new(r, ROWS));
     if let Some(b) = browser.as_mut() {
         if let Some(s) = args.sort {
@@ -424,11 +426,10 @@ fn main() -> ExitCode {
         #[cfg(feature = "standin")]
         shell_scene: Scene::default(),
         last_frame: None,
-        clock: PlayheadClock::new(player.format.sample_rate),
-        last_shown: None,
         scrub: None,
+        deck,
+        track,
         player,
-        title,
         browser,
         // Applied once the library's listing is in (a library search needs it).
         pending_search: args.search.clone(),
@@ -441,7 +442,6 @@ fn main() -> ExitCode {
         pending_open: args.open.clone(),
         pending_menu: args.menu,
         unanalysed_cache: std::cell::RefCell::new(None),
-        loaded_tags: args.file.as_deref().map(LoadedTags::read),
         ask_scan: ask_scan && !args.scan,
         list_drag: None,
         wheel: 0.0,
@@ -462,14 +462,10 @@ fn main() -> ExitCode {
             ScreenKind::Main
         },
         perf: args.perform.unwrap_or_default(),
-        wave: Vec::new(),
-        wave_complete: false,
         wave_settings: WaveSettings {
             mode: args.wave_mode,
             ..WaveSettings::default()
         },
-        track_gain: (1.0, 0),
-        overview: OverviewCache::default(),
         hits: Vec::new(),
         pressed: None,
         cursor: (0.0, 0.0),
@@ -523,6 +519,10 @@ const DRAG_SLOP: f32 = 8.0;
 
 struct App {
     player: Player,
+    /// The deck as of the start of the last frame: what the screen shows and input acts on.
+    deck: DeckSnapshot,
+    /// The loaded track, as the UI holds it.
+    track: Track,
     /// The stick's folder tree, when there is a stick (`LIBRARY_DIR`).
     browser: Option<Browser>,
     /// A `--search` query still to start.
@@ -544,8 +544,6 @@ struct App {
     pending_menu: bool,
     /// The unanalysed track count, and the listing it was counted from.
     unanalysed_cache: std::cell::RefCell<Option<(Arc<engined::persist::Listing>, usize)>>,
-    /// The loaded track's tags and large artwork, for the INFO screen.
-    loaded_tags: Option<LoadedTags>,
     /// Ask whether to scan this stick (it had no library).
     ask_scan: bool,
     list_drag: Option<ListDrag>,
@@ -557,7 +555,6 @@ struct App {
     #[cfg(feature = "standin")]
     shell_scene: Scene,
     last_frame: Option<Instant>,
-    title: String,
     fullscreen: bool,
     screenshot: Option<PathBuf>,
     run_for: Option<Duration>,
@@ -567,12 +564,7 @@ struct App {
     scene: Scene,
     screen: ScreenKind,
     perf: PerfState,
-    wave: Vec<Entry>,
-    wave_complete: bool,
     wave_settings: WaveSettings,
-    /// The track gain, and the entry count it was computed from.
-    track_gain: (f32, usize),
-    overview: OverviewCache,
     hits: Vec<HitBox>,
     /// Touched target, held until release; the overview tracks the drag.
     pressed: Option<Target>,
@@ -580,11 +572,9 @@ struct App {
     modifiers: ModifiersState,
     zoom: usize,
     debug: bool,
-    clock: PlayheadClock,
     /// The hand on the zoom waveform: where the finger was (design x), the frames one design
     /// pixel covers, and the playhead the finger has moved the track to.
     scrub: Option<Scrub>,
-    last_shown: Option<(Instant, f64)>,
     stats: FrameStats,
     overlay: String,
     error: Option<String>,
@@ -662,16 +652,16 @@ impl App {
     /// What the stand-in shows of the deck.
     #[cfg(feature = "standin")]
     fn shell_view(&self) -> standin::ShellView {
-        let st = self.player.state();
+        let d = &self.deck;
         standin::ShellView {
-            playing: st.playing.load(Ordering::Relaxed),
-            reverse: st.reverse.load(Ordering::Relaxed),
-            keylock: st.keylock_enabled.load(Ordering::Relaxed),
-            quantize: st.quantize.load() > 0.0,
-            looping: st.looping.load(Ordering::Relaxed),
-            hot_cues: st.hot_cues.load(Ordering::Relaxed),
-            rate: st.rate.load(),
-            position: st.position.load() / f64::from(self.player.format.sample_rate),
+            playing: d.playing,
+            reverse: d.reverse,
+            keylock: d.keylock,
+            quantize: d.quantize > 0.0,
+            looping: d.looping,
+            hot_cues: d.hot_cues,
+            rate: d.rate,
+            position: d.position / d.sample_rate,
         }
     }
 
@@ -682,7 +672,7 @@ impl App {
             return;
         };
         self.pressed = Some(hit.target);
-        let looping = self.player.state().looping.load(Ordering::Relaxed);
+        let looping = self.deck.looping;
         match hit.target {
             Target::Perform => {
                 self.screen = match self.screen {
@@ -765,8 +755,7 @@ impl App {
             | Target::Bank
             | Target::Pad(_)
             | Target::BeatLoop(_) => {
-                let hot = self.player.state().hot_cues.load(Ordering::Relaxed);
-                let beats = self.loop_beats();
+                let (hot, beats) = (self.deck.hot_cues, self.deck.loop_beats());
                 if let Some(cmd) = perform::press(&mut self.perf, hit.target, hot, beats) {
                     self.send(cmd);
                 }
@@ -779,15 +768,8 @@ impl App {
             Target::Zoom => self.zoom = (self.zoom + 1) % ZOOM_STEPS.len(),
             Target::Overview => self.seek_overview(dx),
             Target::Waveform => {
-                let st = self.player.state();
-                let sr = f64::from(self.player.format.sample_rate);
-                let grid = self
-                    .player
-                    .loaded()
-                    .and_then(|d| d.analysed.as_ref())
-                    .and_then(|a| a.grid.as_deref());
-                let span = screen::zoom_span(grid, ZOOM_STEPS[self.zoom], sr);
-                let shown = self.last_shown.map_or(st.position.load(), |(_, p)| p);
+                let span = self.deck.zoom_span(ZOOM_STEPS[self.zoom]);
+                let shown = self.track.last_shown.map_or(self.deck.position, |(_, p)| p);
                 self.scrub = Some(Scrub {
                     last_x: dx,
                     frames_per_px: span / f64::from(hit.rect.w),
@@ -799,33 +781,12 @@ impl App {
         }
     }
 
-    /// The active loop's length in beats, as the performance screen shows it.
-    fn loop_beats(&self) -> Option<f64> {
-        let st = self.player.state();
-        let (a, b) = (st.loop_start.load(), st.loop_end.load());
-        if !st.looping.load(Ordering::Relaxed) || b <= a {
-            return None;
-        }
-        let grid = self
-            .player
-            .loaded()
-            .and_then(|d| d.analysed.as_ref())
-            .and_then(|x| x.grid.as_deref());
-        Some(match grid {
-            Some(g) => g.beat_at(b) - g.beat_at(a),
-            None => {
-                (b - a) / f64::from(self.player.format.sample_rate) * engine_core::FALLBACK_BPM
-                    / 60.0
-            }
-        })
-    }
-
     fn drag(&mut self, x: f64, y: f64) {
         if let (Some(mut scrub), Some(gfx)) = (self.scrub, &self.gfx) {
             let (dx, _) = gfx.to_design(x, y);
             // The waveform moves with the finger: dragging left plays forward.
             let frames = -f64::from(dx - scrub.last_x) * scrub.frames_per_px;
-            let length = self.player.state().length.load();
+            let length = self.deck.length;
             scrub.shown = (scrub.shown + frames).clamp(0.0, length);
             scrub.last_x = dx;
             self.scrub = Some(scrub);
@@ -967,16 +928,9 @@ impl App {
             return;
         }
         let tags = self.browser.as_ref().and_then(|b| b.info(path));
-        self.title = track_title(path, tags.as_ref());
+        self.track = Track::new(path, tags.as_ref(), self.player.format.sample_rate);
         self.keyboard = false;
-        self.loaded_tags = Some(LoadedTags::read(path));
-        self.wave.clear();
-        self.wave_complete = false;
-        self.track_gain = (1.0, 0);
-        self.overview = OverviewCache::default();
         self.scrub = None;
-        self.last_shown = None;
-        self.clock = PlayheadClock::new(self.player.format.sample_rate);
         self.screen = ScreenKind::Main;
         eprintln!("loaded {}", path.display());
     }
@@ -1518,7 +1472,7 @@ impl App {
     /// and the analysis (ours win).
     fn info_screen_view(&self) -> BrowseView {
         let loaded = self.player.loaded();
-        let info = match (loaded, &self.loaded_tags) {
+        let info = match (loaded, &self.track.tags) {
             (Some(d), Some(lt)) => {
                 let path = d.file();
                 let mut tags = self
@@ -1588,8 +1542,7 @@ impl App {
     fn seek_overview(&mut self, x: f32) {
         let Rect { x: x0, w, .. } = OVERVIEW;
         let f = f64::from(((x - x0) / w).clamp(0.0, 1.0));
-        let length = self.player.state().length.load();
-        self.send(DeckCommand::Seek(f * length));
+        self.send(DeckCommand::Seek(f * self.deck.length));
     }
 
     fn key(&mut self, event_loop: &ActiveEventLoop, key: &KeyEvent) {
@@ -1735,10 +1688,7 @@ impl App {
                     "k" => DeckCommand::ToggleKeylock,
                     "r" => DeckCommand::ToggleReverse,
                     "s" => DeckCommand::ToggleSlip,
-                    "z" => {
-                        let on = self.player.state().quantize.load() > 0.0;
-                        DeckCommand::SetQuantize((!on).then_some(1.0))
-                    }
+                    "z" => DeckCommand::SetQuantize((self.deck.quantize <= 0.0).then_some(1.0)),
                     "i" => DeckCommand::LoopIn,
                     "o" => DeckCommand::LoopOut,
                     "l" => DeckCommand::ReloopExit,
@@ -1779,42 +1729,28 @@ impl App {
         }
         #[cfg(not(feature = "standin"))]
         let _ = dt;
-        let st = Arc::clone(self.player.state());
-        let sr = f64::from(self.player.format.sample_rate);
-        let playing = st.playing.load(Ordering::Relaxed);
-        let reverse = st.reverse.load(Ordering::Relaxed);
-        let rate = st.rate.load();
-        let speed = if playing {
-            rate * if reverse { -1.0 } else { 1.0 }
-        } else {
-            0.0
-        };
-        let mut position = self.clock.update(now, st.position.load(), speed);
+        self.deck = DeckSnapshot::read(&self.player);
+        let sr = self.deck.sample_rate;
+        let speed = self.deck.speed();
+        let mut position = self.track.clock.update(now, self.deck.position, speed);
         if let Some(scrub) = self.scrub {
             // Under the finger the picture follows the hand at once; the audio trails it by the
             // scratch spring's few milliseconds.
             position = scrub.shown;
         }
-        if let Some((t, p)) = self.last_shown
+        if let Some((t, p)) = self.track.last_shown
             && speed != 0.0
         {
             let expected = (now - t).as_secs_f64() * speed * sr;
             self.stats
                 .record_playhead((position - p - expected) / sr * 1e3);
         }
-        self.last_shown = Some((now, position));
-        if !self.wave_complete
-            && let Some(d) = self.player.loaded()
-        {
-            self.wave_complete = d.waveform().update(&mut self.wave);
-        }
-        // Auto gain over what has decoded so far; it settles as the track fills in.
-        let n = self.wave.len();
-        if n != self.track_gain.1 && (self.wave_complete || n >= self.track_gain.1 + 1500) {
-            self.track_gain = (TrackGain::Auto.resolve(&self.wave), n);
+        self.track.last_shown = Some((now, position));
+        if let Some(d) = self.player.loaded() {
+            self.track.update_wave(d.waveform());
         }
         let mut wave_style = self.theme.waveform.style;
-        wave_style.track_gain = self.track_gain.0;
+        wave_style.track_gain = self.track.gain();
         let mut pending_analyze = false;
         let mut pending_menu = false;
         if let Some(b) = self.browser.as_mut() {
@@ -1856,44 +1792,21 @@ impl App {
             self.open_menu();
         }
         // Judged before the scene is built, so a screenshot shows everything it waited for.
-        let ready =
-            self.player.loaded().is_none_or(|d| {
-                d.analysed.is_some() && d.source.is_complete() && self.wave_complete
-            }) && (self.screen != ScreenKind::Browse || self.browse_settled());
-        let loaded = self.player.loaded();
-        let analysed = loaded.and_then(|d| d.analysed.as_ref());
-        let loaded_fraction = loaded.map_or(0.0, |d| {
-            d.source.chunks_ready() as f64 / d.source.chunk_count().max(1) as f64
-        });
+        let ready = self.player.loaded().is_none_or(|d| {
+            d.analysed.is_some() && d.source.is_complete() && self.track.wave_complete
+        }) && (self.screen != ScreenKind::Browse || self.browse_settled());
         let browse = match self.screen {
             ScreenKind::Browse => self.browse_view(),
             ScreenKind::Info => Some(self.info_screen_view()),
             _ => None,
         };
         let view = View {
-            title: &self.title,
-            key: analysed.and_then(|a| a.key.as_deref()),
-            sample_rate: sr,
+            deck: &self.deck,
+            title: &self.track.title,
             position,
-            shadow_position: st.shadow_position.load(),
-            length: st.length.load(),
-            loaded_fraction,
-            rate,
-            slip_enabled: st.slip_enabled.load(Ordering::Relaxed),
-            slip_active: st.slip_active.load(Ordering::Relaxed),
-            keylock: st.keylock_enabled.load(Ordering::Relaxed),
-            quantize: st.quantize.load(),
-            cue: st.cue.load(),
-            hot_cues: st.hot_cues.load(Ordering::Relaxed),
-            looping: st.looping.load(Ordering::Relaxed),
-            loop_start: st.loop_start.load(),
-            loop_end: st.loop_end.load(),
-            grid: analysed.and_then(|a| a.grid.as_deref()),
-            analysing: loaded.is_some() && analysed.is_none(),
             zoom_beats: ZOOM_STEPS[self.zoom],
             pressed: self.pressed,
             debug: self.debug.then_some(self.overlay.as_str()),
-            hot_cue_positions: std::array::from_fn(|i| st.hot_cue_positions[i].load()),
             screen: self.screen,
             perf: self.perf,
             save: self.player.persistence().map(|p| match p {
@@ -1902,15 +1815,20 @@ impl App {
                 Persistence::Unsaved { .. } => SaveState::Unsaved,
             }),
             browse: browse.as_ref(),
-            wave: (!self.wave.is_empty()).then_some(screen::Wave {
-                entries: &self.wave,
+            wave: (!self.track.wave.is_empty()).then_some(screen::Wave {
+                entries: &self.track.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),
                 settings: self.wave_settings,
                 style: wave_style,
             }),
         };
         let build_start = Instant::now();
-        self.hits = screen::build(&view, &self.theme, &mut self.overview, &mut self.scene);
+        self.hits = screen::build(
+            &view,
+            &self.theme,
+            &mut self.track.overview,
+            &mut self.scene,
+        );
         #[cfg(feature = "standin")]
         let shell_view = self.shell_view();
         #[cfg(feature = "standin")]
@@ -1968,32 +1886,6 @@ fn info_fields(path: &Path, tags: &engined::browse::Tags) -> Vec<(&'static str, 
         ("KEY", or_dash(tags.key.clone())),
         ("GENRE", or_dash(tags.genre.clone())),
     ]
-}
-
-/// The loaded track's tags and artwork, read once when it loads (the INFO screen).
-struct LoadedTags {
-    tags: engined::browse::Tags,
-    art: Option<Arc<engined::browse::Thumb>>,
-}
-
-impl LoadedTags {
-    fn read(path: &Path) -> Self {
-        let mut tags = engined::browse::read_tags(path).unwrap_or_default();
-        let art = tags
-            .artwork
-            .take()
-            .and_then(|a| engined::browse::thumbnail(&a.data, engined::browse::LARGE_SIZE))
-            .map(Arc::new);
-        Self { tags, art }
-    }
-}
-
-/// A track's title: its tag, else the file name without extension.
-fn track_title(path: &Path, tags: Option<&engined::browse::Tags>) -> String {
-    tags.and_then(|t| t.title.clone()).unwrap_or_else(|| {
-        path.file_stem()
-            .map_or("[TRACK]".into(), |s| s.to_string_lossy().into_owned())
-    })
 }
 
 /// The digit keys 1–8 (by position, so shift and layout do not matter) are hot cues A–H.

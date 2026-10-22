@@ -7,7 +7,7 @@
 //! reference renderer orders them. Until the first entries exist, the views show the grid and
 //! markers alone.
 
-use engine_core::DeckGrid;
+use crate::app::engine::DeckSnapshot;
 
 use crate::kit::{self, Rect};
 use crate::render::scene::{Gradient, Rgba, Scene};
@@ -107,29 +107,13 @@ pub type HitBox = kit::HitBox<Target>;
 pub const OVERVIEW: Rect = Rect::new(113.0, 502.0, 703.0, 67.0);
 const ZOOM: Rect = Rect::new(113.0, 172.0, 703.0, 211.0);
 
-/// Everything the screen shows, read from the deck once per frame.
+/// Everything the screen shows: the deck as of this frame, and the UI's own state.
 pub struct View<'a> {
+    pub deck: &'a DeckSnapshot,
     pub title: &'a str,
-    pub key: Option<&'a str>,
-    pub sample_rate: f64,
-    /// Interpolated playhead (frames).
+    /// The playhead the screen shows (frames): smoothed between engine updates, or where the
+    /// finger has moved the track.
     pub position: f64,
-    pub shadow_position: f64,
-    pub length: f64,
-    pub loaded_fraction: f64,
-    pub rate: f64,
-    pub slip_enabled: bool,
-    pub slip_active: bool,
-    pub keylock: bool,
-    /// Quantize resolution in beats; 0 = off.
-    pub quantize: f64,
-    pub cue: f64,
-    pub hot_cues: u8,
-    pub looping: bool,
-    pub loop_start: f64,
-    pub loop_end: f64,
-    pub grid: Option<&'a DeckGrid>,
-    pub analysing: bool,
     /// Beats across the zoom view.
     pub zoom_beats: f64,
     pub pressed: Option<Target>,
@@ -137,8 +121,6 @@ pub struct View<'a> {
     pub debug: Option<&'a str>,
     /// The track's waveform so far, if any.
     pub wave: Option<Wave<'a>>,
-    /// Hot cue positions (frames), NaN where empty.
-    pub hot_cue_positions: [f64; engine_core::HOT_CUES],
     pub screen: ScreenKind,
     pub perf: PerfState,
     /// Whether the library is saving edits; `None` until it says.
@@ -236,14 +218,6 @@ pub(crate) fn hot_cue_color(t: &Theme, i: usize) -> Rgba {
     t.color.hot_cue_colors[i % t.color.hot_cue_colors.len()]
 }
 
-/// Frames across the zoom view: `zoom_beats` beats of the grid (120 BPM until there is one).
-pub fn zoom_span(grid: Option<&DeckGrid>, zoom_beats: f64, sample_rate: f64) -> f64 {
-    match grid {
-        Some(g) => zoom_beats * g.period(),
-        None => zoom_beats * 0.5 * sample_rate,
-    }
-}
-
 /// Hot cue `i`'s pad letter: A, B, …
 pub(crate) fn hot_cue_letter(i: usize) -> char {
     (b'A' + (i % 26) as u8) as char
@@ -313,9 +287,9 @@ pub(crate) fn rail_bottom(ui: &mut Ui, v: &View) {
         Rect::new(6.0, 505.0, 88.0, 76.0),
         "SLIP",
         None,
-        v.slip_enabled,
+        v.deck.slip_enabled,
     );
-    if v.slip_active {
+    if v.deck.slip_active {
         // Slipping: the shadow is running; amber edge like the reference's flashing button.
         ui.scene.rounded(
             6.0,
@@ -395,9 +369,9 @@ fn info(ui: &mut Ui, v: &View) {
         t.color.background,
     );
     ui.text(v.title, 132.0, 76.0, t.text.title);
-    let key = v.key.map_or_else(
+    let key = v.deck.key().map_or_else(
         || {
-            if v.analysing {
+            if v.deck.analysing {
                 "KEY …".to_string()
             } else {
                 "KEY –".to_string()
@@ -465,13 +439,13 @@ pub(crate) fn phase(ui: &mut Ui, v: &View, mx: f32, mw: f32, y: f32) {
         y + 1.0,
         t.text.badge.color(t.color.on_badge).center(),
     );
-    let (beat_in_bar, bar_in_phrase, bar, bars_left) = match v.grid {
+    let (beat_in_bar, bar_in_phrase, bar, bars_left) = match v.deck.grid() {
         Some(g) => {
             let beat = g.beat_at(v.position).floor();
             let in_bar = g.bar_position(v.position).max(1);
             let bar_start = beat - f64::from(in_bar - 1);
             let bar = (bar_start / 4.0).floor();
-            let left = ((g.beat_at(v.length) - g.beat_at(v.position)) / 4.0).max(0.0);
+            let left = ((g.beat_at(v.deck.length) - g.beat_at(v.position)) / 4.0).max(0.0);
             (
                 Some(in_bar),
                 Some(bar.rem_euclid(4.0) as u8 + 1),
@@ -536,7 +510,7 @@ pub(crate) fn cue_column(ui: &mut Ui, v: &View, rule: f32, button_h: f32, call_h
         false,
     );
     ui.rule_label("CALL", 828.0, rule + 91.0 + button_h - 58.0, 188.0);
-    let (prev, next) = if v.looping {
+    let (prev, next) = if v.deck.looping {
         ("◀ ½X", "2X ▶")
     } else {
         ("◀", "▶")
@@ -614,7 +588,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
     ui.scene.fill(x0, y0 + h * 0.5, w, 1.0, wf.center_line);
     ui.hit(Target::Waveform, area);
     // Frames per design pixel.
-    let span = zoom_span(v.grid, v.zoom_beats, v.sample_rate);
+    let span = v.deck.zoom_span(v.zoom_beats);
     let fpp = span / f64::from(w);
     let left = v.position - span * 0.5;
     let to_x = |pos: f64| x0 + ((pos - left) / fpp) as f32;
@@ -624,8 +598,8 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
         let draw = crate::waves::zoom(
             wave.entries,
             wave.entries_per_second,
-            v.position / v.sample_rate,
-            fpp / v.sample_rate,
+            v.position / v.deck.sample_rate,
+            fpp / v.deck.sample_rate,
             area,
             &wave.settings,
             &wave.style,
@@ -635,10 +609,13 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
             ..draw
         });
     }
-    if v.looping || v.loop_end > v.loop_start {
-        let (a, b) = (to_x(v.loop_start).max(x0), to_x(v.loop_end).min(x0 + w));
+    if v.deck.looping || v.deck.loop_end > v.deck.loop_start {
+        let (a, b) = (
+            to_x(v.deck.loop_start).max(x0),
+            to_x(v.deck.loop_end).min(x0 + w),
+        );
         if b > a {
-            let (fill, edge) = if v.looping {
+            let (fill, edge) = if v.deck.looping {
                 (wf.loop_color.alpha(wf.loop_fill), wf.loop_color)
             } else {
                 (
@@ -647,7 +624,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
                 )
             };
             ui.scene.fill(a, y0, b - a, h, fill);
-            for e in [to_x(v.loop_start), to_x(v.loop_end)] {
+            for e in [to_x(v.deck.loop_start), to_x(v.deck.loop_end)] {
                 if visible(e) {
                     ui.scene.fill(e - 1.0, y0, 2.0, h, edge);
                 }
@@ -655,7 +632,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
         }
     }
     // Beat grid: ticks along the top and bottom edges, over the waveform.
-    if let Some(g) = v.grid {
+    if let Some(g) = v.deck.grid() {
         let first = g.beat_at(left).ceil() as i64;
         let last = g.beat_at(left + span).floor() as i64;
         for b in first..=last.min(first + 256) {
@@ -673,7 +650,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
         }
     }
     // Hot cues: a line in the pad's colour with its letter in a tag at the bottom.
-    for (i, &at) in v.hot_cue_positions.iter().enumerate() {
+    for (i, &at) in v.deck.hot_cue_positions.iter().enumerate() {
         let x = to_x(at);
         if !at.is_finite() || !visible(x) {
             continue;
@@ -698,7 +675,7 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
             t.text.caption.semibold().color(t.color.on_badge).center(),
         );
     }
-    let cue = to_x(v.cue);
+    let cue = to_x(v.deck.cue);
     if visible(cue) {
         ui.scene.fill(cue - 1.0, y0, 2.0, h, wf.cue);
         ui.scene.rounded(
@@ -712,13 +689,13 @@ pub(crate) fn zoom(ui: &mut Ui, v: &View, area: Rect) {
             wf.cue,
         );
     }
-    if v.slip_active {
-        let s = to_x(v.shadow_position);
+    if v.deck.slip_active {
+        let s = to_x(v.deck.shadow_position);
         if visible(s) {
             ui.scene.fill(s - 1.0, y0, 2.0, h, wf.slip_shadow);
         }
     }
-    let label = match (v.grid, v.analysing) {
+    let label = match (v.deck.grid(), v.deck.analysing) {
         (Some(_), _) => "",
         (None, true) => "ANALYSING…",
         (None, false) => "NO GRID",
@@ -758,7 +735,7 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
         ui.text(save.label(), 160.0, 398.0, t.text.label.color(color));
     }
     ui.text("01", 113.0, 422.0, t.text.readout);
-    let hot = v.hot_cues;
+    let hot = v.deck.hot_cues;
     let pads: String = (0..8u8)
         .map(|i| {
             if hot & (1 << i) != 0 {
@@ -788,7 +765,7 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
     );
 
     ui.text("REMAIN", 351.0, 398.0, t.text.label);
-    let quantize = match v.quantize {
+    let quantize = match v.deck.quantize {
         q if q <= 0.0 => "QUANTIZE : OFF".to_string(),
         q if q >= 1.0 => format!("QUANTIZE : {q}"),
         q => format!("QUANTIZE : 1/{}", (1.0 / q).round()),
@@ -797,19 +774,19 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
         &quantize,
         424.0,
         398.0,
-        t.text.label.color(if v.quantize > 0.0 {
+        t.text.label.color(if v.deck.quantize > 0.0 {
             t.color.cue_text
         } else {
             t.color.dim
         }),
     );
-    let (mmss, ms) = clock((v.length - v.position) / v.sample_rate);
+    let (mmss, ms) = clock((v.deck.length - v.position) / v.deck.sample_rate);
     // Tabular digits: "00:00" at 56 px ends ~118 px in.
     ui.text(mmss, 469.0, 422.0, t.text.readout.right());
     ui.text(ms, 470.0, 437.0, t.text.readout_fraction);
 
     ui.text("TEMPO", 653.0, 398.0, t.text.label);
-    let (edge, color) = if v.keylock {
+    let (edge, color) = if v.deck.keylock {
         (t.color.cue, t.color.cue_text)
     } else {
         (t.color.chip_edge, t.color.dim)
@@ -821,7 +798,7 @@ pub(crate) fn status(ui: &mut Ui, v: &View) {
         edge,
         Rgba::TRANSPARENT,
     );
-    let pct = (v.rate - 1.0) * 100.0;
+    let pct = (v.deck.rate - 1.0) * 100.0;
     let tempo = if pct.abs() < 0.005 {
         "0.00".to_string()
     } else if pct > 0.0 {
@@ -853,14 +830,14 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
     let wf = &t.waveform;
     let Rect { x: x0, y: y0, w, h } = OVERVIEW;
     panel(ui, OVERVIEW, v.wave.map(|w| w.settings.overview_align));
-    if v.length > 0.0 {
-        let to_x = |pos: f64| x0 + (pos / v.length).clamp(0.0, 1.0) as f32 * w;
+    if v.deck.length > 0.0 {
+        let to_x = |pos: f64| x0 + (pos / v.deck.length).clamp(0.0, 1.0) as f32 * w;
         if let Some(wave) = &v.wave {
             let draw = overview.draw(
                 wave.entries,
                 wave.entries_per_second,
-                v.length / v.sample_rate,
-                v.position / v.sample_rate,
+                v.deck.length / v.deck.sample_rate,
+                v.position / v.deck.sample_rate,
                 OVERVIEW,
                 &wave.settings,
                 &wave.style,
@@ -870,14 +847,14 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
                 ..draw
             });
         }
-        if v.loaded_fraction < 1.0 {
-            let lx = to_x(v.loaded_fraction * v.length);
+        if v.deck.loaded_fraction < 1.0 {
+            let lx = to_x(v.deck.loaded_fraction * v.deck.length);
             ui.scene
                 .fill(lx, y0 + h - 3.0, x0 + w - lx, 3.0, wf.loading);
         }
         // 16-bar ticks.
-        if let Some(g) = v.grid {
-            let beats = g.beat_at(v.length).floor() as i64;
+        if let Some(g) = v.deck.grid() {
+            let beats = g.beat_at(v.deck.length).floor() as i64;
             let mut b = 0;
             while b <= beats {
                 let x = to_x(g.position_of(b as f64));
@@ -891,28 +868,28 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
             // Without a waveform the played part is shaded; with one it is dimmed.
             ui.scene.fill(x0, y0 + 8.0, px - x0, h - 16.0, wf.played);
         }
-        if v.loop_end > v.loop_start {
-            let (a, b) = (to_x(v.loop_start), to_x(v.loop_end));
+        if v.deck.loop_end > v.deck.loop_start {
+            let (a, b) = (to_x(v.deck.loop_start), to_x(v.deck.loop_end));
             ui.scene.fill(
                 a,
                 y0,
                 (b - a).max(2.0),
                 h,
-                wf.loop_color.alpha(if v.looping {
+                wf.loop_color.alpha(if v.deck.looping {
                     wf.overview_loop_fill
                 } else {
                     wf.overview_loop_fill_stored
                 }),
             );
         }
-        for (i, &at) in v.hot_cue_positions.iter().enumerate() {
+        for (i, &at) in v.deck.hot_cue_positions.iter().enumerate() {
             if at.is_finite() {
                 let c = hot_cue_color(t, i);
                 ui.scene
                     .rounded(to_x(at) - 2.5, y0, 5.0, 7.0, 1.0, c, 0.0, c);
             }
         }
-        let cx = to_x(v.cue);
+        let cx = to_x(v.deck.cue);
         ui.scene.fill(cx - 1.0, y0, 2.0, h, wf.cue);
         ui.scene.fill(px - 1.0, y0, 2.0, h, wf.playhead);
     }
@@ -956,9 +933,9 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
         t.shape.border,
         t.color.accent,
     );
-    let bpm = v
-        .grid
-        .map_or("--.-".to_string(), |g| format!("{:.1}", g.bpm() * v.rate));
+    let bpm = v.deck.grid().map_or("--.-".to_string(), |g| {
+        format!("{:.1}", g.bpm() * v.deck.rate)
+    });
     ui.text(
         bpm,
         1006.0,
@@ -971,19 +948,15 @@ pub(crate) fn bottom(ui: &mut Ui, v: &View, overview: &mut OverviewCache) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine_core::DeckGrid;
 
-    fn view(grid: Option<&DeckGrid>) -> View<'_> {
-        View {
-            title: "Test",
-            key: Some("Em"),
-            sample_rate: 48_000.0,
+    /// A deck 300 s long, paused at about 21 s in a loop, with hot cues A and C.
+    fn deck(grid: Option<DeckGrid>) -> DeckSnapshot {
+        DeckSnapshot {
+            key: Some("Em".into()),
             position: 1_000_000.0,
-            shadow_position: 0.0,
             length: 48_000.0 * 300.0,
             loaded_fraction: 1.0,
-            rate: 1.0,
-            slip_enabled: false,
-            slip_active: false,
             keylock: true,
             quantize: 1.0,
             cue: 900_000.0,
@@ -991,13 +964,20 @@ mod tests {
             looping: true,
             loop_start: 990_000.0,
             loop_end: 1_090_000.0,
-            grid,
-            analysing: false,
+            grid: grid.map(std::sync::Arc::new),
+            ..DeckSnapshot::empty(48_000.0)
+        }
+    }
+
+    fn view(deck: &DeckSnapshot) -> View<'_> {
+        View {
+            deck,
+            title: "Test",
+            position: deck.position,
             zoom_beats: 16.0,
             pressed: None,
             debug: None,
             wave: None,
-            hot_cue_positions: [f64::NAN; engine_core::HOT_CUES],
             screen: ScreenKind::Main,
             perf: PerfState::default(),
             save: Some(SaveState::Unsaved),
@@ -1134,7 +1114,8 @@ mod tests {
             },
         ];
         for b in &variants {
-            let mut v = view(None);
+            let d = deck(None);
+            let mut v = view(&d);
             v.screen = ScreenKind::Browse;
             v.browse = Some(b);
             let mut scene = Scene::default();
@@ -1261,10 +1242,12 @@ mod tests {
 
     #[test]
     fn everything_stays_on_the_panel_and_targets_do_not_overlap() {
-        let grid = DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap();
+        let d = deck(Some(
+            DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap(),
+        ));
         let mut scene = Scene::default();
         let hits = build(
-            &view(Some(&grid)),
+            &view(&d),
             &Theme::default(),
             &mut OverviewCache::default(),
             &mut scene,
@@ -1295,7 +1278,10 @@ mod tests {
 
     #[test]
     fn performance_screen_fits_and_targets_do_not_overlap() {
-        let grid = DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap();
+        let mut d = deck(Some(
+            DeckGrid::constant(1_000.0, 123.0, 48_000.0 * 300.0, 48_000).unwrap(),
+        ));
+        d.hot_cue_positions[0] = 1_010_000.0;
         let variants = [
             PerfState::default(),
             PerfState {
@@ -1310,10 +1296,9 @@ mod tests {
             },
         ];
         for perf in variants {
-            let mut v = view(Some(&grid));
+            let mut v = view(&d);
             v.screen = ScreenKind::Performance;
             v.perf = perf;
-            v.hot_cue_positions[0] = 1_010_000.0;
             let mut scene = Scene::default();
             let hits = build(
                 &v,
@@ -1359,7 +1344,7 @@ mod tests {
     fn builds_without_a_grid() {
         let mut scene = Scene::default();
         build(
-            &view(None),
+            &view(&deck(None)),
             &Theme::default(),
             &mut OverviewCache::default(),
             &mut scene,

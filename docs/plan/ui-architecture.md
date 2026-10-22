@@ -2,7 +2,7 @@
 
 How `crates/ui` is laid out so that new screens, dialogs and controls can be added without growing one file. It keeps what already works: immediate-mode drawing into a `Scene` once per frame, layouts that are pure functions of a view (tested for fit and overlap, screenshotted with `--screenshot`), and colours and sizes taken from the theme. What changes is where state lives, how input finds its handler, and how the drawing code is split up.
 
-**Status:** steps 1–2 done: `kit/` (`Ui`, `HitBox`, `Rect`, the shared widgets, text styles in the theme) and `render/` (one module per pipeline). The rest is a proposal.
+**Status:** steps 1–3 done: `kit/` (`Ui`, `HitBox`, `Rect`, the shared widgets, text styles in the theme), `render/` (one module per pipeline), and `app/engine.rs` + `app/track.rs` (`DeckSnapshot`, `Track`). The rest is a proposal.
 
 ## What hurts today
 
@@ -27,7 +27,7 @@ The data flows one way, once per frame:
   stand-in, RP2040)       overlay stack)     ▼
                                      UiState changes
  Engine port ──► DeckSnapshot ─┐
- LoadedTrack (wave, tags) ─────┼──► screens draw ──► Scene (layered) + HitBoxes ──► render (wgpu)
+ Track (wave, tags) ───────────┼──► screens draw ──► Scene (layered) + HitBoxes ──► render (wgpu)
  UiState ──────────────────────┘
 ```
 
@@ -59,12 +59,12 @@ crates/ui/src/
   main.rs              args → App → event loop; nothing else (~100 lines)
   args.rs              Args, parse_args, USAGE
   app/
-    mod.rs             App: owns UiState, LoadedTrack, Engine, Gfx; frame() = poll → snapshot → draw → render
+    mod.rs             App: owns UiState, Track, Engine, Gfx; frame() = poll → snapshot → draw → render
     platform.rs        winit ApplicationHandler; WindowEvent → Input (design coords, surface)
     keymap.rs          dev keyboard → Input (the one table of key bindings; hot_cue_key lives here)
     engine.rs          Engine port + DeckSnapshot (the only place that reads DeckState atomics)
     effects.rs         Effect enum and its execution against the port
-    track.rs           LoadedTrack: title, tags, art, wave entries, gain, overview cache, playhead clock
+    track.rs           Track: title, tags, art, wave entries, gain, overview cache, playhead clock
     capture.rs         --screenshot readiness and PNG writing, --run-for
   input.rs             Input, Control, Gesture: the device-independent input vocabulary
   router.rs            focus: hit-test → layer; control/text → top layer first; pressed + gestures
@@ -127,7 +127,7 @@ pub struct Screens {
 ```
 
 - **Screen state is kept while another screen is up.** Switching to MAIN and back leaves the pad bank or the browse panel where it was, as now.
-- **`LoadedTrack` (in `app/track.rs`) is everything derived from the loaded file:** title, tags, art, wave entries, `wave_complete`, track gain, overview cache and playhead clock. Loading a track replaces it with `LoadedTrack::new(path)` in one step, so no field can be left over from the last track.
+- **`Track` (in `app/track.rs`) is everything derived from the loaded file:** title, tags, art, wave entries, `wave_complete`, track gain, overview cache and playhead clock. Loading a track replaces it with `Track::new(path)` in one step, so no field can be left over from the last track.
 - **`DeckSnapshot` is a plain `Copy`-ish struct** read once at the start of the frame: position, rate, flags, cue, loop, hot cues and so on, plus `loop_beats()` and `zoom_span()` as methods. Handlers and drawing both read it. `View`, `ShellView` and the scattered atomics reads go away. In the two-process design the snapshot is filled from the seqlock block, and nothing above `app/engine.rs` changes.
 - **The `Browser` stays the browse model.** It is owned by `App` and lent to handlers through the context, because TAG TRACK and loading reach it from any screen.
 
@@ -167,7 +167,7 @@ pub trait Layer {
 /// What a handler may touch.
 pub struct Cx<'a> {
     pub deck: &'a DeckSnapshot,
-    pub track: Option<&'a LoadedTrack>,
+    pub track: &'a Track,
     pub browser: Option<&'a mut Browser>,
     pub library: LibraryView<'a>,    // listing, playlists, scan / batch progress
     pub effects: &'a mut Vec<Effect>,
@@ -215,7 +215,7 @@ Each step is one commit and passes `cargo fmt`, `cargo clippy --all-targets -- -
 
 1. **`Rect` and text styles.** *(Done.)* Add `kit/rect.rs` and the theme's `TextStyle`s; move the `Ui` helpers from `screen.rs` into `kit/`. Change call sites mechanically. `Ui` and `HitBox` are generic over the target type; `screen.rs` aliases them to `Target` until step 5. The scene's own primitive is now `Quad`. `scene.fill` / `rounded` keep loose coordinates: the scene is the renderer's input, and computed coordinates read better there. The stand-in keeps its tuples until step 8.
 2. **Split the renderer.** *(Done.)* `gfx.rs` + `scene.rs` → `render/`, with no change in behaviour: `rects.rs`, `waves.rs`, `images.rs` and `text.rs` each own their pipeline, buffers and upload; `offscreen.rs` holds the stand-in's device-screen texture and screenshot readback; `mod.rs` keeps `Gfx` (surface, frame composition) and one `quad_pipeline` helper for all four pipelines.
-3. **`DeckSnapshot` and `LoadedTrack`.** Read the atomics once in `app/engine.rs`. `View` takes the snapshot, and `load()` replaces the track in one step. The duplicate `loop_beats` goes.
+3. **`DeckSnapshot` and `Track`.** *(Done.)* Read the atomics once per frame in `app/engine.rs`; `View` holds `&DeckSnapshot` instead of copying its fields, and input handlers act on the snapshot the last frame showed (at most a frame old, and what the user saw). `load()` replaces the `Track` in one step. `loop_beats` and `zoom_span` are snapshot methods, once each. (Our type is `Track`, not `LoadedTrack`, which `engined` already has.)
 4. **`Effect`.** Handlers push effects; `App` executes them. Then move `act`, `modal_push`, `named` and `type_name` out of `App` into `playlists.rs` as functions that return effects.
 5. **`Input`, `keymap.rs` and the router.** The stand-in emits `Input`; `key()` becomes a table. Add the `Layer` trait with screens as layers, and route touch through nested `Target`s.
 6. **Overlays.** `Modal`, `ask_scan`, `moving` and naming become overlays on the stack, and the `if` chains go. The layered scene lands here, and with it the rows under a modal no longer need hiding.

@@ -9,7 +9,7 @@
 //!   tapped again or the mode changes. CALL (stored hot cues to call up) comes with the library.
 //! - **BEAT LOOP:** a 1/2 to 16 beat loop from the playhead; tapping the active length exits.
 
-use engine_core::{BEAT_LOOPS, DeckCommand, FALLBACK_BPM, HOT_CUES};
+use engine_core::{BEAT_LOOPS, DeckCommand, HOT_CUES};
 
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
@@ -97,17 +97,6 @@ pub fn press(
         }
         _ => None,
     }
-}
-
-/// The active loop's length in beats, if a loop is active.
-pub fn loop_beats(v: &View) -> Option<f64> {
-    if !v.looping || v.loop_end <= v.loop_start {
-        return None;
-    }
-    Some(match v.grid {
-        Some(g) => g.beat_at(v.loop_end) - g.beat_at(v.loop_start),
-        None => (v.loop_end - v.loop_start) / v.sample_rate * FALLBACK_BPM / 60.0,
-    })
 }
 
 /// How a pad looks.
@@ -250,7 +239,7 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
 
     ui.rule_label("BEAT LOOP", LOOP_ROW.x, 279.0, LOOP_ROW.w);
     row_frame(ui, LOOP_ROW);
-    let active = loop_beats(v);
+    let active = v.deck.loop_beats();
     for (k, (cell, beats)) in row_cells(LOOP_ROW, BEAT_LOOPS.len())
         .zip(BEAT_LOOPS)
         .enumerate()
@@ -346,7 +335,7 @@ fn pads(ui: &mut Ui, v: &View, perf: PerfState) {
                 if cue >= HOT_CUES {
                     continue;
                 }
-                let set = v.hot_cues & (1 << cue) != 0;
+                let set = v.deck.hot_cues & (1 << cue) != 0;
                 let letter = hot_cue_letter(cue);
                 match (perf.delete_armed, set) {
                     (true, true) => pad(
