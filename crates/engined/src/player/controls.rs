@@ -3,14 +3,14 @@
 
 use surface::{ControlEvent, Nav};
 
-use super::{DECK, Player};
+use super::Player;
 use crate::controls::{DeckNow, Surface};
 
 impl Player {
     /// A control did something: its deck commands go to the deck; what the browse controls
     /// ask of the screen comes back.
     pub fn control(&mut self, e: ControlEvent) -> Vec<Nav> {
-        let st = self.handle.deck_state(DECK);
+        let st = self.handle.deck_state(self.deck.index);
         let deck = DeckNow {
             rate: st.rate.load(),
             quantize_on: st.quantize.load() > 0.0,

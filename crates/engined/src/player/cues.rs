@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use engine_core::{DeckCommand, HOT_CUES, TrackCues};
-use library::{Cue, CueKind, Edit, HotCue, Track};
+use library::{Cue, Edit, Track};
 
-use super::{AutoCue, DECK, Player};
+use super::Player;
+use super::cue_sync::CueSync;
 use crate::store::Loaded;
 
 impl Player {
@@ -17,7 +18,7 @@ impl Player {
         let (Some(t), Some(lib)) = (self.track(), &self.library) else {
             return "no library record yet: memory not stored".into();
         };
-        let st = self.handle.deck_state(DECK);
+        let st = self.handle.deck_state(self.deck.index);
         let sr = f64::from(self.format.sample_rate);
         let cue = if st.looping.load(Ordering::Relaxed) {
             Cue::memory_loop(st.loop_start.load() / sr, st.loop_end.load() / sr)
@@ -35,14 +36,14 @@ impl Player {
     /// Send `cues` for the loaded track to the deck under the next serial. True if sent:
     /// the serial is then the one the deck's applied serial is compared against.
     fn send_cues(&mut self, cues: TrackCues) -> bool {
-        let Some(d) = self.loaded.as_mut() else {
+        let Some(d) = self.deck.loaded.as_mut() else {
             return false;
         };
-        let serial = self.cue_serial + 1;
+        let serial = self.deck.cue_serial + 1;
         let sent = self
             .handle
             .send_deck(
-                DECK,
+                self.deck.index,
                 DeckCommand::SetCues {
                     source_id: d.source.id(),
                     serial,
@@ -51,8 +52,8 @@ impl Player {
             )
             .is_ok();
         if sent {
-            self.cue_serial = serial;
-            d.lib.serial = serial;
+            self.deck.cue_serial = serial;
+            d.lib.cues.sent(serial);
         }
         sent
     }
@@ -61,40 +62,24 @@ impl Player {
     /// (cues the DJ set before the library answered); the next [`Player::poll`] then writes
     /// those to the library, since they differ from what it gave.
     fn restore_cues(&mut self, record: &Track, fill_only: bool) -> bool {
-        let sr = f64::from(self.format.sample_rate);
-        let mut hot = [None; HOT_CUES];
-        for (slot, h) in hot.iter_mut().zip(&record.hot_cues) {
-            *slot = h.as_ref().map(|h| h.at * sr);
-        }
-        let first = record.cues.first().map(|(_, c)| c);
-        let cues = TrackCues {
-            cue: first.map(|c| c.at * sr),
-            hot,
-            stored_loop: first.and_then(|c| match (c.kind, c.end) {
-                (CueKind::Loop, Some(end)) => Some((c.at * sr, end * sr)),
-                _ => None,
-            }),
-            fill_only,
-        };
+        let cues = CueSync::cues_of(record, fill_only, f64::from(self.format.sample_rate));
         if !self.send_cues(cues) {
             return false;
         }
-        if let Some(d) = self.loaded.as_mut() {
-            d.lib.restored = hot;
-            d.lib.known = hot;
-            d.lib.records = std::array::from_fn(|i| record.hot_cues.get(i).cloned().flatten());
+        if let Some(d) = self.deck.loaded.as_mut() {
+            d.lib.cues.restored(record, &cues);
         }
         true
     }
 
     pub(super) fn on_loaded(&mut self, l: Loaded, lines: &mut Vec<String>) {
-        let Some(d) = self.loaded.as_mut().filter(|d| d.serial == l.serial) else {
+        let Some(d) = self.deck.loaded.as_mut().filter(|d| d.serial == l.serial) else {
             return; // for a track no longer on the deck
         };
         let first = d.lib.track.is_none();
         d.lib.track = Some(l.track);
         if first {
-            d.lib.memory_cues = Some(l.record.cues.len());
+            d.lib.cues.memory_cues = Some(l.record.cues.len());
         }
         let hot = l.record.hot_cues.iter().flatten().count();
         let cues = l.record.cues.len();
@@ -102,7 +87,7 @@ impl Player {
         // read (and, with nothing stored, gives the deck a serial to compare against). On a
         // merge, the merged record's cues replace the deck's only if the DJ has not edited
         // them since they were restored.
-        let untouched = d.lib.known == d.lib.restored;
+        let untouched = d.lib.cues.untouched();
         if first || untouched {
             if !self.restore_cues(&l.record, first) {
                 lines.push("command ring full, stored cues dropped".into());
@@ -113,7 +98,7 @@ impl Player {
             }
         }
         if first {
-            let Some(d) = self.loaded.as_mut() else {
+            let Some(d) = self.deck.loaded.as_mut() else {
                 return;
             };
             if let Some(w) = l.waveform {
@@ -131,25 +116,16 @@ impl Player {
     /// cue on. Waits for the library's answer (a stored memory cue wins). Only fills: a cue
     /// point the DJ set meanwhile stays.
     pub(super) fn apply_auto_cue(&mut self, lines: &mut Vec<String>) {
-        let Some(d) = self.loaded.as_mut() else {
+        let Some(d) = self.deck.loaded.as_mut() else {
             return;
         };
-        if d.lib.cue_decided {
+        let waveform = &d.waveform;
+        let Some(at) = d
+            .lib
+            .cues
+            .auto_cue(self.auto_cue, || waveform.first_sound())
+        else {
             return;
-        }
-        let Some(memory) = d.lib.memory_cues else {
-            return; // still waiting for the record
-        };
-        if memory > 0 || self.auto_cue == AutoCue::Off {
-            d.lib.cue_decided = true;
-            return;
-        }
-        let Some(first) = d.waveform.first_sound() else {
-            return;
-        };
-        d.lib.cue_decided = true;
-        let Some(at) = first else {
-            return; // silent all through: no cue point
         };
         let sent = self.send_cues(TrackCues {
             cue: Some(at),
@@ -169,39 +145,18 @@ impl Player {
 
     /// Write hot cue changes made on the deck to the library.
     pub(super) fn write_back_cues(&mut self) {
-        let (Some(d), Some(lib)) = (self.loaded.as_mut(), &self.library) else {
+        let (Some(d), Some(lib)) = (self.deck.loaded.as_mut(), &self.library) else {
             return;
         };
         let Some(t) = d.lib.track else {
             return;
         };
-        let st = self.handle.deck_state(DECK);
-        if st.cues_serial.load(Ordering::Relaxed) != d.lib.serial {
-            // The deck has not applied the stored cues yet.
-            return;
-        }
+        let st = self.handle.deck_state(self.deck.index);
+        let positions = std::array::from_fn(|i| st.hot_cue_positions[i].load());
+        let applied = st.cues_serial.load(Ordering::Relaxed);
         let sr = f64::from(self.format.sample_rate);
-        for (slot, pos) in st.hot_cue_positions.iter().enumerate() {
-            let p = pos.load();
-            let now = (!p.is_nan()).then_some(p);
-            if now != d.lib.known[slot] {
-                d.lib.known[slot] = now;
-                let cue = now.map(|f| {
-                    let at = f / sr;
-                    match d.lib.records[slot].take() {
-                        // Moved: the same cue at its new place. A loop end that would now
-                        // come before the start no longer applies.
-                        Some(old) => HotCue {
-                            at,
-                            end: old.end.filter(|&e| e > at),
-                            ..old
-                        },
-                        None => HotCue::at(at),
-                    }
-                });
-                d.lib.records[slot] = cue.clone();
-                lib.edit(Edit::SetHotCue(t.track, slot, cue));
-            }
+        for (slot, cue) in d.lib.cues.write_back(applied, positions, sr) {
+            lib.edit(Edit::SetHotCue(t.track, slot, cue));
         }
     }
 }

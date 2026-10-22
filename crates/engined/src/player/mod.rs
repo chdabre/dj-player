@@ -2,6 +2,7 @@
 //! and background jobs that feed it.
 
 mod controls;
+mod cue_sync;
 mod cues;
 mod options;
 mod port;
@@ -28,8 +29,16 @@ use crate::store::{self, LibraryWorker, Reply};
 use crate::waveform_live::{LiveWaveform, WaveTap};
 use track::LibState;
 
-/// The deck everything here drives.
-pub(crate) const DECK: usize = 0;
+/// A deck the player drives: its index in the engine, the track on it, and the serial of
+/// the last stored cues sent to it. One for now; the second deck makes this a list, and the
+/// [`player_api::Port`] gains a deck index.
+pub(super) struct Deck {
+    pub(super) index: usize,
+    pub(super) loaded: Option<LoadedTrack>,
+    /// Serial of the last [`DeckCommand::SetCues`] sent, across tracks: the deck's applied
+    /// serial is compared against it.
+    pub(super) cue_serial: u64,
+}
 
 pub struct Player {
     pub format: StreamFormat,
@@ -41,13 +50,10 @@ pub struct Player {
     library: Option<LibraryWorker>,
     auto_cue: AutoCue,
     persistence: Option<Persistence>,
-    /// The track on the deck, if one was loaded.
-    loaded: Option<LoadedTrack>,
-    /// Serial of the last load; library answers for earlier loads are stale.
+    /// The deck and the track on it.
+    deck: Deck,
+    /// Serial of the last load, across decks; library answers for earlier loads are stale.
     loads: u64,
-    /// Serial of the last [`DeckCommand::SetCues`] sent, across tracks: the deck's applied
-    /// serial is compared against it.
-    cue_serial: u64,
     /// The library's tracks, as last published.
     listing: Option<Arc<store::Listing>>,
     /// The library's playlists, as last published.
@@ -109,9 +115,12 @@ impl Player {
             library,
             auto_cue: options.auto_cue,
             persistence: None,
-            loaded: None,
+            deck: Deck {
+                index: 0,
+                loaded: None,
+                cue_serial: 0,
+            },
             loads: 0,
-            cue_serial: 0,
             listing: None,
             playlists: None,
             scan: None,
@@ -137,17 +146,19 @@ impl Player {
             file_rate: loading.info.file_sample_rate,
         });
         self.write_back_cues();
-        self.handle
-            .send_deck(DECK, DeckCommand::Load(Arc::clone(&loading.source)))?;
+        self.handle.send_deck(
+            self.deck.index,
+            DeckCommand::Load(Arc::clone(&loading.source)),
+        )?;
         self.loads += 1;
         if let Some(lib) = &self.library {
-            if let Some(previous) = &self.loaded {
+            if let Some(previous) = &self.deck.loaded {
                 lib.close(previous.serial);
             }
             lib.open(self.loads, file.to_path_buf());
         }
         // Dropping the previous track stops its decode and analysis where they are.
-        self.loaded = Some(LoadedTrack {
+        self.deck.loaded = Some(LoadedTrack {
             info: loading.info,
             source: loading.source,
             loader: Some(loading.thread),
@@ -269,7 +280,7 @@ impl Player {
 
     /// The track on the deck, if any.
     pub fn loaded(&self) -> Option<&LoadedTrack> {
-        self.loaded.as_ref()
+        self.deck.loaded.as_ref()
     }
 
     /// Whether the library is saving this deck's edits; `None` until it has said.
@@ -286,7 +297,7 @@ impl Player {
     }
 
     pub fn state(&self) -> &Arc<DeckState> {
-        self.handle.deck_state(DECK)
+        self.handle.deck_state(self.deck.index)
     }
 
     pub fn load_meter(&self) -> &Arc<LoadMeter> {
@@ -295,19 +306,19 @@ impl Player {
 
     /// The loaded track in its library, once the library found or made its record.
     pub fn track(&self) -> Option<TrackRef> {
-        self.loaded.as_ref().and_then(LoadedTrack::track)
+        self.deck.loaded.as_ref().and_then(LoadedTrack::track)
     }
 
     /// Send a command to the deck; false if the command ring is full.
     pub fn send(&mut self, cmd: DeckCommand) -> bool {
-        self.handle.send_deck(DECK, cmd).is_ok()
+        self.handle.send_deck(self.deck.index, cmd).is_ok()
     }
 
     /// The loaded track has no library record (no library, or the file could not be read):
     /// analyse from scratch, and nothing is stored.
     fn no_record(&mut self) {
-        if let Some(d) = self.loaded.as_mut() {
-            d.lib.memory_cues.get_or_insert(0);
+        if let Some(d) = self.deck.loaded.as_mut() {
+            d.lib.cues.memory_cues.get_or_insert(0);
         }
         self.start_analysis(BTreeMap::new(), false);
     }
@@ -317,7 +328,7 @@ impl Player {
         cached: BTreeMap<String, (AnalysisRef, Vec<u8>)>,
         audio_hash: bool,
     ) {
-        let Some(d) = self.loaded.as_mut() else {
+        let Some(d) = self.deck.loaded.as_mut() else {
             return;
         };
         if d.analysis.is_none() {
@@ -361,7 +372,12 @@ impl Player {
                 Reply::Message(m) => lines.push(m),
                 Reply::Loaded(l) => self.on_loaded(*l, lines),
                 Reply::Unrecorded { serial, reason } => {
-                    if self.loaded.as_ref().is_some_and(|d| d.serial == serial) {
+                    if self
+                        .deck
+                        .loaded
+                        .as_ref()
+                        .is_some_and(|d| d.serial == serial)
+                    {
                         lines.push(format!(
                             "library: {reason}; this track's edits are not stored"
                         ));
@@ -388,7 +404,7 @@ impl Player {
     /// The loaded track's analysis, once it arrives: the grid to the deck, the results to
     /// the library.
     fn poll_analysis(&mut self, lines: &mut Vec<String>) {
-        let Some(d) = self.loaded.as_mut() else {
+        let Some(d) = self.deck.loaded.as_mut() else {
             return;
         };
         let Some(Ok(result)) = d.analysis.as_ref().map(Receiver::try_recv) else {
@@ -402,7 +418,7 @@ impl Player {
                         source_id: d.source.id(),
                         grid: Arc::clone(grid),
                     };
-                    if self.handle.send_deck(DECK, cmd).is_err() {
+                    if self.handle.send_deck(self.deck.index, cmd).is_err() {
                         lines.push("command ring full, grid dropped".into());
                     }
                 }
@@ -423,7 +439,7 @@ impl Player {
 
     /// Store the computed waveform once the decode finished it (once per track).
     fn store_waveform(&mut self) {
-        if let Some(d) = self.loaded.as_mut()
+        if let Some(d) = self.deck.loaded.as_mut()
             && !d.lib.waveform_stored
             && d.lib.track.is_some()
             && let Some(lib) = &self.library
@@ -436,10 +452,10 @@ impl Player {
 
     /// Pass the batch job's results to the library, and hold it while the deck is busy.
     fn poll_batch(&mut self, lines: &mut Vec<String>) {
-        let busy = self
-            .loaded
-            .as_ref()
-            .is_some_and(|d| d.loader.is_some() || (d.analysis.is_some() && d.analysed.is_none()));
+        let busy =
+            self.deck.loaded.as_ref().is_some_and(|d| {
+                d.loader.is_some() || (d.analysis.is_some() && d.analysed.is_none())
+            });
         self.deck_busy.store(busy, Ordering::Relaxed);
         while let Some(event) = self.batch.as_ref().and_then(batch::Batch::try_recv) {
             let Some(progress) = self.batch_progress.as_mut() else {
@@ -460,7 +476,7 @@ impl Player {
 
     /// Report a decode that ended in an error.
     fn poll_loader(&mut self, lines: &mut Vec<String>) {
-        if let Some(d) = self.loaded.as_mut()
+        if let Some(d) = self.deck.loaded.as_mut()
             && d.loader.as_ref().is_some_and(|t| t.is_finished())
             && let Some(Err(e)) = d.loader.take().and_then(|t| t.join().ok())
         {

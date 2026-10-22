@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
-use engine_core::{HOT_CUES, Source};
-use library::{HotCue, TrackRef};
+use engine_core::Source;
+use library::TrackRef;
 
+use super::cue_sync::CueSync;
 use crate::analysis::Analysed;
 use crate::waveform_live::LiveWaveform;
 
@@ -55,18 +56,8 @@ impl LoadedTrack {
 #[derive(Debug, Default)]
 pub(super) struct LibState {
     pub(super) track: Option<TrackRef>,
-    /// Serial of the last stored cues sent to the deck (0 = none yet).
-    pub(super) serial: u64,
-    /// Hot cues (frames) as the library gave them, and as last seen on the deck.
-    pub(super) restored: [Option<f64>; HOT_CUES],
-    pub(super) known: [Option<f64>; HOT_CUES],
-    /// The library's hot cues per slot, so a deck edit (a new position) keeps the rest:
-    /// end, colour, comment and fields this version doesn't know.
-    pub(super) records: [Option<HotCue>; HOT_CUES],
+    /// The deck's cues against the record.
+    pub(super) cues: CueSync,
     /// The waveform is stored, or was sent to be stored.
     pub(super) waveform_stored: bool,
-    /// Memory cues in the record, once the library answered (0 if there is no record).
-    pub(super) memory_cues: Option<usize>,
-    /// The load-time cue point is decided (a memory cue, the first sound, or none).
-    pub(super) cue_decided: bool,
 }
