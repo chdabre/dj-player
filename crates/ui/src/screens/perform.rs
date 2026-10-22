@@ -11,19 +11,20 @@
 
 use engine_core::{BEAT_LOOPS, DeckCommand, HOT_CUES};
 
+use super::chrome::{lower, rail_bottom, rail_panel};
+use super::deck::{bottom, cue_column, hot_cue_color, hot_cue_letter, phase, status, zoom};
+use super::{Target, Ui, View};
 use crate::kit::Rect;
 use crate::render::scene::Rgba;
-use crate::screen::{
-    PadMode, PerfState, Target, Ui, View, bottom, cue_column, hot_cue_color, hot_cue_letter, phase,
-    rail_bottom, status, zoom,
-};
-
 /// Pads per bank.
 pub const PADS: usize = 4;
 
 const ZOOM: Rect = Rect::new(113.0, 95.0, 703.0, 72.0);
+
 const PAD_ROW: Rect = Rect::new(113.0, 180.0, 703.0, 88.0);
+
 const LOOP_ROW: Rect = Rect::new(113.0, 299.0, 703.0, 67.0);
+
 /// Inner padding of a pad row, and the gap between pads.
 const ROW_PAD: f32 = 6.0;
 
@@ -211,13 +212,11 @@ pub(crate) fn build(ui: &mut Ui, v: &View, overview: &mut crate::waves::Overview
     let perf = v.perf;
 
     // Frame: rail, top row, pads section, status band, bottom strip, column dividers.
-    ui.scene.fill(0.0, 0.0, 101.0, 600.0, t.color.background);
-    ui.scene.fill(100.0, 0.0, 1.0, 600.0, t.color.rule);
+    rail_panel(ui);
     ui.section(Rect::new(106.0, 2.0, 915.0, 85.0));
     ui.section(Rect::new(106.0, 90.0, 915.0, 301.0));
-    ui.section(Rect::new(106.0, 395.0, 915.0, 99.0));
-    ui.section(Rect::new(106.0, 498.0, 915.0, 99.0));
-    for (y, h) in [(7.0, 75.0), (95.0, 292.0), (400.0, 89.0), (502.0, 90.0)] {
+    lower(ui);
+    for (y, h) in [(7.0, 75.0), (95.0, 292.0)] {
         ui.scene.fill(822.0, y, 1.0, h, t.color.section_edge);
     }
 
@@ -376,6 +375,26 @@ fn pads(ui: &mut Ui, v: &View, perf: PerfState) {
             }
         }
     }
+}
+
+/// What the performance pads do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PadMode {
+    #[default]
+    HotCue,
+    BeatJump,
+}
+
+/// The performance screen's own state (the UI's, not the deck's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PerfState {
+    pub mode: PadMode,
+    /// Hot cue bank: pads show cues `4 * bank ..`.
+    pub bank: usize,
+    /// Beat jump bank: false = 1 and 4 beats, true = 16 and 32.
+    pub jump_bank: bool,
+    /// DELETE armed: the next pad taps delete hot cues.
+    pub delete_armed: bool,
 }
 
 #[cfg(test)]

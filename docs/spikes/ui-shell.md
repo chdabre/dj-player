@@ -18,7 +18,7 @@ cargo run -p ui --release -- <file> [--play] [--at <s>] [--buffer <frames>] [--f
 cargo run -p ui --release -- <file> --at 60 --screenshot target/tmp/ui-main.png
 ```
 
-- **Screen:** `screen.rs` lays out the main screen ("1 · Normal playback", wireframe canvas version 28) from the canvas's pixel values. It is a pure function from deck state to a scene plus touch targets, and it is unit-tested: everything stays on the panel, touch targets don't overlap, and every target is at least 36 px.
+- **Screen:** `screens/main.rs` (then `screen.rs`) lays out the main screen ("1 · Normal playback", wireframe canvas version 28) from the canvas's pixel values. It is a pure function from deck state to a scene plus touch targets, and it is unit-tested: everything stays on the panel, touch targets don't overlap, and every target is at least 36 px.
 - **Renderer:** `render/` (one module per pipeline). Rectangles are instanced quads; the fragment shader uses a signed distance function for the corner radius, border and anti-aliasing. Colours are sRGB and get linearised for an sRGB surface. Text is glyphon, with Barlow Condensed embedded. Shaped buffers are reused until their text changes. Layout happens in design pixels; one uniform scales and centres it, so a Retina window and the panel draw the same scene. `--screenshot` renders the frame offscreen at exactly 1024×600, which is what the panel will show.
 - **Engine:** the device, decode, analysis and stream wiring moved out of `engined`'s `main.rs` into `engined::Player`, shared by the CLI and the UI. For the spike the UI reads `DeckState` atomics directly. The planned split (UI as a client, a seqlock'd shared-memory block for fast state, a socket for commands) is unchanged; nothing here depends on running in-process.
 - **Input:**
@@ -61,7 +61,7 @@ Until the control surface exists, the window draws the player's physical control
 - **INFO screen** (INFO from any other screen): the loaded track, full width. Laid out denser than the canvas's "Info" artboard (which keeps the fields in a narrow list and leaves a third of the panel empty): a header with source, player and "ON DECK"; the artwork as tall as the panel (273 px, from a 288 px read); beside it title, artist, album · genre, large BPM / KEY / TIME / RATING readouts, and the comment across the rest. Its tags and artwork are read once when the track loads, so it works without a stick too. BACK, Esc, `i` or INFO return to the main screen. The canvas artboard should follow.
 
 - **Model in `engined::browse`:** the folder levels with a cursor and the first shown row each, folders first then tracks (sorted by name, case aside), and a tag reader thread that reads the shown folder's tracks first and keeps the results. No scan, no library writes: a track gets its record when it is loaded. Tests: listing and hiding, navigation with the cursor kept in view, scrolling, tags arriving.
-- **Screen in `browse.rs`:** the rail, the tabs (BROWSE lit), seven 40 px rows (jacket, title, artist with BPM and length at the right), the status band and the overview, as on the main screen. The loaded track's title is in the accent colour; a thin bar shows where the rows are in a long folder. Long titles end in an ellipsis: text can now have a maximum width, ellipsized by cosmic-text.
+- **Screen in `screens/browse/`:** the rail, the tabs (BROWSE lit), seven 40 px rows (jacket, title, artist with BPM and length at the right), the status band and the overview, as on the main screen. The loaded track's title is in the accent colour; a thin bar shows where the rows are in a long folder. Long titles end in an ellipsis: text can now have a maximum width, ellipsized by cosmic-text.
 - **Touch:** tapping a folder opens it; tapping a track selects it, tapping it again loads it (one tap can't replace a playing track by accident). A drag on the list scrolls it with the finger, and the wheel scrolls it. The header goes up a level.
 - **Keys:** ↑ / ↓ move, Enter loads or opens, Esc / Backspace go up (Esc no longer quits; `q` does), Tab toggles the screen. Loading shows the main screen.
 - **Run-time loading:** `Player::start` opens the output with an empty deck and `Player::load` replaces the track: new source, waveform, analysis and library record (`LoadedTrack`), one library worker for the whole session. The hot cues of a track come back when it is loaded again after another (`engined/tests/player.rs`, ignored by default since it needs an audio device).
@@ -96,12 +96,12 @@ Touching the zoom waveform (on either screen) takes the track; dragging moves it
 
 ## Design tokens
 
-Every colour, font size, corner radius and line width the screen uses lives in one `Theme` (`crates/ui/src/theme.rs`), named by role: `button_edge`, `cue`, `readout`, `section_radius`, and so on. `screen.rs` asks the theme and has no colour literals; a test fails if a colour literal turns up in the screens, `kit/` or `render/`. The frame's clear colour comes from the theme too.
+Every colour, font size, corner radius and line width the screen uses lives in one `Theme` (`crates/ui/src/theme.rs`), named by role: `button_edge`, `cue`, `readout`, `section_radius`, and so on. The screens ask the theme and have no colour literals; a test fails if a colour literal turns up in the screens, `kit/` or `render/`. The frame's clear colour comes from the theme too.
 
 - **Default:** `reference`, the wireframe's tokens. Moving to tokens changed no pixel: the 1024×600 screenshot before and after is byte-identical.
 - **Switching:** `--theme <name>` picks a theme. Only `reference` exists so far; a new theme is one more constructor in `Theme::all()`.
 - **Waveforms:** `WaveformTokens` holds the stand-in's colours (grid, cue, loop, playhead, played part). The waveform renderer's own theme (3-band palette blue / orange / white, RGB weights, auto gain as a display setting) joins it when that crate lands, so one theme drives the screen and the waveform shader.
-- **Not tokens:** layout positions and sizes stay in `screen.rs`. They come from the canvas, per screen.
+- **Not tokens:** layout positions and sizes stay in the screen modules (`screens/`). They come from the canvas, per screen.
 
 ## Waveforms
 

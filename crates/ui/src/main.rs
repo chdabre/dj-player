@@ -10,7 +10,7 @@
 //! overlay, f fullscreen, q quit.
 //!
 //! Browsing: `LIBRARY_DIR=<dir>` makes a folder act as the root of a USB stick: the browse
-//! screen lists its folders and tracks, or its library's tracks (`browse.rs`), and its
+//! screen lists its folders and tracks, or its library's tracks (`screens/browse/`), and its
 //! library is `<dir>/DJPLAYER` unless `--library`/`--no-library` say otherwise. A stick with
 //! no library asks once whether to scan it. Without a file the app starts on the browse
 //! screen. Tab (or the BROWSE tab, or the stand-in's knob) opens it; ↑/↓ or the wheel move,
@@ -24,16 +24,14 @@
 //! See docs/spikes/ui-shell.md for what this measures and what it found.
 
 mod app;
-mod browse;
 mod clock;
 // Without the stand-in only the dev keyboard reports controls, until the RP2040 reader exists.
 #[cfg_attr(not(feature = "standin"), allow(dead_code))]
 mod input;
 mod kit;
-mod perform;
 mod playlists;
 mod render;
-mod screen;
+mod screens;
 #[cfg(feature = "standin")]
 mod standin;
 mod stats;
@@ -63,13 +61,14 @@ use crate::app::engine::DeckSnapshot;
 use crate::app::keymap::{self, KeyContext, Shortcut};
 use crate::app::surface::Surface;
 use crate::app::track::{Track, track_title};
-use crate::browse::{BrowseView, InfoView, ModalView, ROW_H, ROWS, Row, RowKind};
 use crate::input::{ControlEvent, Nav};
 use crate::kit::Rect;
 use crate::playlists::{Action, Editing, Modal};
 use crate::render::Gfx;
 use crate::render::scene::Scene;
-use crate::screen::{HitBox, OVERVIEW, PerfState, SaveState, ScreenKind, Target, View};
+use crate::screens::browse::{self, BrowseView, InfoView, ModalView, ROW_H, ROWS, Row, RowKind};
+use crate::screens::deck::OVERVIEW;
+use crate::screens::{HitBox, PerfState, SaveState, ScreenKind, Target, View, perform};
 use crate::stats::FrameStats;
 use crate::theme::Theme;
 use crate::waves::WaveSettings;
@@ -187,7 +186,7 @@ fn parse_args() -> Result<Args, String> {
                 let p = perform.get_or_insert_with(PerfState::default);
                 match args.next().as_deref() {
                     Some("hotcue") => {}
-                    Some("beatjump") => p.mode = screen::PadMode::BeatJump,
+                    Some("beatjump") => p.mode = perform::PadMode::BeatJump,
                     Some("delete") => p.delete_armed = true,
                     other => {
                         return Err(format!("bad pad mode {other:?} (hotcue, beatjump, delete)"));
@@ -1598,7 +1597,7 @@ impl App {
                 Persistence::Unsaved { .. } => SaveState::Unsaved,
             }),
             browse: browse.as_ref(),
-            wave: (!self.track.wave.is_empty()).then_some(screen::Wave {
+            wave: (!self.track.wave.is_empty()).then_some(screens::Wave {
                 entries: &self.track.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),
                 settings: self.wave_settings,
@@ -1606,7 +1605,7 @@ impl App {
             }),
         };
         let build_start = Instant::now();
-        self.hits = screen::build(
+        self.hits = screens::build(
             &view,
             &self.theme,
             &mut self.track.overview,

@@ -9,7 +9,7 @@ use engined::browse::{Browser, Kind, Sort, walk};
 use library::{Edit, EntryId, PlaylistId, PlaylistKind};
 
 use crate::app::effects::Effect;
-use crate::browse::{BACKSPACE, CLEAR, DONE};
+use crate::screens::browse::{BACKSPACE, CLEAR, DONE};
 
 /// Something the MENU (or TAG TRACK) does.
 #[derive(Debug, Clone, PartialEq, Eq)]

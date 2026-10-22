@@ -436,18 +436,40 @@ mod tests {
     #[test]
     fn screens_have_no_colour_literals() {
         for (file, src) in [
-            ("screen.rs", include_str!("screen.rs")),
             ("main.rs", include_str!("main.rs")),
+            ("screens/mod.rs", include_str!("screens/mod.rs")),
+            ("screens/chrome.rs", include_str!("screens/chrome.rs")),
+            ("screens/deck.rs", include_str!("screens/deck.rs")),
+            ("screens/main.rs", include_str!("screens/main.rs")),
+            ("screens/perform.rs", include_str!("screens/perform.rs")),
+            (
+                "screens/browse/mod.rs",
+                include_str!("screens/browse/mod.rs"),
+            ),
+            (
+                "screens/browse/keyboard.rs",
+                include_str!("screens/browse/keyboard.rs"),
+            ),
+            (
+                "screens/browse/list.rs",
+                include_str!("screens/browse/list.rs"),
+            ),
+            (
+                "screens/browse/panels.rs",
+                include_str!("screens/browse/panels.rs"),
+            ),
+            (
+                "screens/browse/modal.rs",
+                include_str!("screens/browse/modal.rs"),
+            ),
+            ("kit/mod.rs", include_str!("kit/mod.rs")),
+            ("kit/rect.rs", include_str!("kit/rect.rs")),
             ("render/mod.rs", include_str!("render/mod.rs")),
             ("render/rects.rs", include_str!("render/rects.rs")),
             ("render/waves.rs", include_str!("render/waves.rs")),
             ("render/images.rs", include_str!("render/images.rs")),
             ("render/text.rs", include_str!("render/text.rs")),
             ("render/offscreen.rs", include_str!("render/offscreen.rs")),
-            ("perform.rs", include_str!("perform.rs")),
-            ("browse.rs", include_str!("browse.rs")),
-            ("kit/mod.rs", include_str!("kit/mod.rs")),
-            ("kit/rect.rs", include_str!("kit/rect.rs")),
         ] {
             let code = src.split("#[cfg(test)]").next().unwrap_or(src);
             for pattern in ["Rgba::hex(", "Rgba(["] {

@@ -7,8 +7,8 @@ use engine_core::DeckCommand;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
-use crate::browse::{BACKSPACE, DONE};
 use crate::input::{Control, ControlEvent, Nav};
+use crate::screens::browse::{BACKSPACE, DONE};
 
 /// Seconds ← / → seek.
 const SEEK_SECONDS: f64 = 5.0;
