@@ -106,11 +106,12 @@ impl DeckSnapshot {
         })
     }
 
-    /// Frames across a zoom view of `zoom_beats` beats (120 BPM until there is a grid).
+    /// Frames across a zoom view of `zoom_beats` beats ([`FALLBACK_BPM`] until there is a
+    /// grid, as the engine's beat loops and jumps).
     pub fn zoom_span(&self, zoom_beats: f64) -> f64 {
         match self.grid() {
             Some(g) => zoom_beats * g.period(),
-            None => zoom_beats * 0.5 * self.sample_rate,
+            None => zoom_beats * 60.0 / FALLBACK_BPM * self.sample_rate,
         }
     }
 
@@ -182,7 +183,8 @@ mod tests {
     #[test]
     fn zoom_span_is_beats_of_the_grid() {
         let mut d = DeckSnapshot::empty(SR);
-        assert_eq!(d.zoom_span(16.0), 8.0 * SR);
+        // 16 beats at the fallback tempo.
+        assert_eq!(d.zoom_span(16.0), 16.0 * 60.0 / FALLBACK_BPM * SR);
         d.grid = DeckGrid::constant(0.0, 125.0, 300.0 * SR, SR as u32).map(Arc::new);
         assert!((d.zoom_span(16.0) - 16.0 * 0.48 * SR).abs() < 1e-6);
     }

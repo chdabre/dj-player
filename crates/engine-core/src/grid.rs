@@ -6,9 +6,10 @@
 //! engine rate, like the transport's. Before the first and after the last beat the grid is
 //! extended at the track tempo, so beat jumps and loops work right up to the track ends.
 
-/// The tempo used for beat lengths when a track has no grid yet (the reference player's
-/// fallback for auto beat loops).
-pub const FALLBACK_BPM: f64 = 130.0;
+/// The tempo used for beat lengths when a track has no grid yet: beat loops and jumps, and the
+/// width of the UI's zoom view in beats. (The reference player uses 130 BPM for auto beat
+/// loops; 120 was chosen on 2026-10-22 as the plainer default, the same everywhere.)
+pub const FALLBACK_BPM: f64 = 120.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeckGrid {

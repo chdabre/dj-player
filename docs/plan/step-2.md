@@ -11,7 +11,7 @@ Behaviours and values come from the XDJ reference spec (Playback & performance).
 3. **Quantize.** On/off, resolution 1/8, 1/4, 1/2, 1 beat. Applies to cue set, loop in/out, hot cue set and call. Without a grid, quantize does nothing.
 4. **Cue.** Set when paused (quantized). CUE while playing jumps back to the cue and pauses. Holding CUE while paused at the cue previews from it; releasing returns to the cue and pauses; PLAY while holding continues playing. Real-time cue: IN while playing sets the cue (and the loop in point).
 5. **Hot cues A–H.** Set on an empty pad at the current position (quantized); calling a set pad jumps there and keeps the play state; delete clears a pad. Hot-cue loops, banks and colours come with the library.
-6. **Loops.** Manual IN / OUT (quantized), RELOOP/EXIT. Auto beat loop of 1/2, 1, 2, 4, 8, 16 beats from the current (quantized) position; IN long-press = 4 beats. LOOP 1/2X and LOOP 2X keep the in point. Without a grid, beat lengths use 130 BPM, as the reference does. A loop is slip-able: the shadow keeps running, and exiting snaps back.
+6. **Loops.** Manual IN / OUT (quantized), RELOOP/EXIT. Auto beat loop of 1/2, 1, 2, 4, 8, 16 beats from the current (quantized) position; IN long-press = 4 beats. LOOP 1/2X and LOOP 2X keep the in point. Without a grid, beat lengths use `FALLBACK_BPM`: 120 BPM (decided 2026-10-22; the reference uses 130), the same for loops, jumps and the zoom view. A loop is slip-able: the shadow keeps running, and exiting snaps back.
 7. **Beat jump.** ±1, 2, 4, 8, 16, 32 beats; with a loop active, it moves the loop instead.
 
 ## Real-time design

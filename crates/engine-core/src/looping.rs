@@ -200,14 +200,14 @@ mod tests {
     }
 
     #[test]
-    fn without_a_grid_beats_are_130_bpm_and_unquantized() {
+    fn without_a_grid_beats_are_the_fallback_tempo_and_unquantized() {
         let cues = CueState::default();
         let mut lc = LoopControl::default();
         let mut t = playing_at(10_123.0);
         lc.beat_loop(1.0, &mut t, None, &cues, SR);
         let l = t.active_loop().unwrap();
         assert_eq!(l.start, 10_123.0);
-        assert!((l.len() - 60.0 / 130.0 * 48_000.0).abs() < 1e-9);
+        assert!((l.len() - 60.0 / FALLBACK_BPM * 48_000.0).abs() < 1e-9);
     }
 
     #[test]
