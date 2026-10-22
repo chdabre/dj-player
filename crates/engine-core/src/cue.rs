@@ -25,8 +25,8 @@ pub const QUANTIZE_RESOLUTIONS: [f64; 4] = [0.125, 0.25, 0.5, 1.0];
 const AT_CUE: f64 = 1.0;
 
 /// A track's stored cues, handed to the deck when the library has them (see
-/// [`crate::DeckCommand::SetCues`]). Frames at the engine rate. Plain data, so the command
-/// carries it without allocating.
+/// [`crate::DeckCommand::SetCues`], behind an `Arc` that the callback retires). Frames at the
+/// engine rate.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TrackCues {
     /// The cue point (the earliest memory cue, as the reference's auto cue at the MEMORY

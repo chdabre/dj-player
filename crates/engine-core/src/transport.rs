@@ -62,8 +62,9 @@ struct Scratch {
 
 /// Time constant of the scratch follower: the playhead is about 2τ behind a moving hand.
 pub const SCRATCH_TIME_S: f64 = 0.01;
-/// Fastest scratch, in either direction (the loop logic assumes at most 4x).
-pub const MAX_SCRATCH_RATE: f64 = 4.0;
+/// Fastest playback, in either direction, by rate or by hand. The loop logic assumes at most
+/// this: see [`MIN_LOOP_FRAMES`].
+pub const MAX_RATE: f64 = 4.0;
 
 /// Shortest loop, in frames. With blocks of at most 1024 frames and rates up to 4x, a block
 /// then wraps at most 8 times.
@@ -111,7 +112,13 @@ impl Segments {
         }
     }
 
+    /// Add a piece. [`MAX_RATE`] and [`MIN_LOOP_FRAMES`] keep a block well under
+    /// [`MAX_SEGMENTS`] pieces; a piece beyond that would be lost.
     fn push(&mut self, offset: usize, segment: Segment) {
+        debug_assert!(
+            self.len < MAX_SEGMENTS,
+            "more loop wraps in one block than allowed"
+        );
         if self.len < MAX_SEGMENTS {
             self.parts[self.len] = (offset, segment);
             self.len += 1;
@@ -404,11 +411,11 @@ impl Transport {
         let v1 = (s.spring - w * c * t) * decay;
         if e1.abs() < 0.5 && v1.abs() < 1e-3 {
             // Coming to rest: land on the target and stop.
-            s.step = (-e0 / t).clamp(-MAX_SCRATCH_RATE, MAX_SCRATCH_RATE);
+            s.step = (-e0 / t).clamp(-MAX_RATE, MAX_RATE);
             s.spring = 0.0;
         } else {
-            s.step = ((e1 - e0) / t).clamp(-MAX_SCRATCH_RATE, MAX_SCRATCH_RATE);
-            s.spring = v1.clamp(-MAX_SCRATCH_RATE, MAX_SCRATCH_RATE);
+            s.step = ((e1 - e0) / t).clamp(-MAX_RATE, MAX_RATE);
+            s.spring = v1.clamp(-MAX_RATE, MAX_RATE);
         }
     }
 
@@ -456,11 +463,11 @@ impl Transport {
         self.seek(self.position + frames);
     }
 
-    /// Set the playback rate (1.0 = normal). Any finite value is allowed, including 0 and
-    /// negative values; NaN and infinities are ignored.
+    /// Set the playback rate (1.0 = normal), clamped to ±[`MAX_RATE`]. 0 and negative values
+    /// are allowed; NaN is ignored.
     pub fn set_rate(&mut self, rate: f64) {
-        if rate.is_finite() {
-            self.rate = rate;
+        if !rate.is_nan() {
+            self.rate = rate.clamp(-MAX_RATE, MAX_RATE);
         }
     }
 
@@ -614,12 +621,12 @@ mod tests {
         // Each block moves the speed at most the smoothing's share of the largest step.
         // A spring with time constant τ changes speed by at most the top speed times one
         // block over τ per block: no steps, whatever the touch updates do.
-        let bound = MAX_SCRATCH_RATE * 128.0 / (SCRATCH_TIME_S * 48_000.0);
+        let bound = MAX_RATE * 128.0 / (SCRATCH_TIME_S * 48_000.0);
         assert!(
             max_change <= bound,
             "speed jumps by {max_change} (bound {bound})"
         );
-        assert!(steps.iter().all(|s| s.abs() <= MAX_SCRATCH_RATE));
+        assert!(steps.iter().all(|s| s.abs() <= MAX_RATE));
     }
 
     #[test]
@@ -759,11 +766,35 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_rate_is_ignored() {
+    fn rate_is_clamped_and_nan_ignored() {
         let mut t = playing();
         t.set_rate(f64::NAN);
-        t.set_rate(f64::INFINITY);
         assert_eq!(t.rate(), 1.0);
+        t.set_rate(f64::INFINITY);
+        assert_eq!(t.rate(), MAX_RATE);
+        t.set_rate(-100.0);
+        assert_eq!(t.rate(), -MAX_RATE);
+    }
+
+    #[test]
+    fn fastest_block_on_shortest_loop_stays_inside() {
+        let mut t = playing();
+        t.set_rate(1000.0);
+        assert!(t.set_loop(Loop {
+            start: 1000.0,
+            end: 1000.0 + MIN_LOOP_FRAMES,
+        }));
+        t.seek(1000.0);
+        let frames = crate::deck::MAX_BLOCK_FRAMES;
+        let parts = t.advance(frames);
+        assert!(parts.count() < MAX_SEGMENTS);
+        for (i, (_, len, seg)) in parts.iter(frames).enumerate() {
+            let last = seg.start + seg.step * (len - 1) as f64;
+            assert!(
+                seg.start >= 1000.0 && last < 1000.0 + MIN_LOOP_FRAMES,
+                "piece {i}"
+            );
+        }
     }
 
     #[test]

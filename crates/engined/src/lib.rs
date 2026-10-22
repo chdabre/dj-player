@@ -515,7 +515,7 @@ impl Player {
                 DeckCommand::SetCues {
                     source_id: d.source.id(),
                     serial,
-                    cues,
+                    cues: Arc::new(cues),
                 },
             )
             .is_ok();
@@ -601,12 +601,12 @@ impl Player {
                 DeckCommand::SetCues {
                     source_id: d.source.id(),
                     serial,
-                    cues: TrackCues {
+                    cues: Arc::new(TrackCues {
                         cue: Some(at),
                         hot: [None; HOT_CUES],
                         stored_loop: None,
                         fill_only: true,
-                    },
+                    }),
                 },
             )
             .is_ok();

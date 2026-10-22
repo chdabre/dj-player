@@ -249,7 +249,7 @@ fn stored_cues_restore_into_the_deck() {
     r.send(DeckCommand::SetCues {
         source_id: id + 1,
         serial: 1,
-        cues,
+        cues: Arc::new(cues),
     });
     r.render(BLOCK);
     let st = r.handle.deck_state(0);
@@ -259,7 +259,7 @@ fn stored_cues_restore_into_the_deck() {
     r.send(DeckCommand::SetCues {
         source_id: id,
         serial: 2,
-        cues,
+        cues: Arc::new(cues),
     });
     r.render(BLOCK);
     let st = r.handle.deck_state(0);
@@ -313,7 +313,7 @@ fn a_first_restore_keeps_what_the_dj_set_meanwhile() {
     r.send(DeckCommand::SetCues {
         source_id: id,
         serial: 1,
-        cues: stored,
+        cues: Arc::new(stored),
     });
     r.render(BLOCK);
     let st = r.handle.deck_state(0);
@@ -328,10 +328,10 @@ fn a_first_restore_keeps_what_the_dj_set_meanwhile() {
     r.send(DeckCommand::SetCues {
         source_id: id,
         serial: 2,
-        cues: TrackCues {
+        cues: Arc::new(TrackCues {
             fill_only: false,
             ..stored
-        },
+        }),
     });
     r.render(BLOCK);
     assert_eq!(r.handle.deck_state(0).hot_cue_positions[1].load(), 96_000.0);

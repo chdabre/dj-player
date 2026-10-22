@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use crate::cue::TrackCues;
 use crate::deck::{BlockOutcome, Deck, DeckCommand, MAX_BLOCK_FRAMES};
 use crate::grid::DeckGrid;
 use crate::source::{CHANNELS, Source};
@@ -25,6 +26,7 @@ pub const RETIRE_CAPACITY: usize = 16;
 pub enum Retired {
     Source(Arc<Source>),
     Grid(Arc<DeckGrid>),
+    Cues(Arc<TrackCues>),
 }
 
 /// A command into the engine.
@@ -179,11 +181,12 @@ impl Engine {
     fn drain_commands(&mut self) {
         for _ in 0..MAX_COMMANDS_PER_CALLBACK {
             // A load hands the old source and grid to the retire ring, a new grid the old
-            // grid; wait for room rather than freeing anything here.
+            // grid, stored cues themselves once read; wait for room rather than freeing
+            // anything here.
             let needs = match self.commands.peek() {
                 Ok(Command::Deck { cmd, .. }) => match cmd {
                     DeckCommand::Load(_) | DeckCommand::Unload => 2,
-                    DeckCommand::SetGrid { .. } => 1,
+                    DeckCommand::SetGrid { .. } | DeckCommand::SetCues { .. } => 1,
                     _ => 0,
                 },
                 Err(_) => return,
@@ -195,43 +198,61 @@ impl Engine {
                 return;
             };
             let Some(d) = self.decks.get_mut(deck) else {
-                // Unknown deck: the command may own a source or grid; retire, never drop.
+                // Unknown deck: the command may own a source, grid or cues; retire, never drop.
                 match cmd {
-                    DeckCommand::Load(src) => {
-                        let _ = self.retire.push(Retired::Source(src));
-                    }
-                    DeckCommand::SetGrid { grid, .. } => {
-                        let _ = self.retire.push(Retired::Grid(grid));
-                    }
+                    DeckCommand::Load(src) => self.retire_now(Retired::Source(src)),
+                    DeckCommand::SetGrid { grid, .. } => self.retire_now(Retired::Grid(grid)),
+                    DeckCommand::SetCues { cues, .. } => self.retire_now(Retired::Cues(cues)),
                     _ => {}
                 }
                 continue;
             };
-            // Room was checked above; the pushes cannot fail.
-            let (old_source, old_grid) = match cmd {
-                DeckCommand::Load(src) => d.swap_source(Some(src)),
-                DeckCommand::Unload => d.swap_source(None),
-                DeckCommand::SetGrid { source_id, grid } => (None, d.set_grid(source_id, grid)),
+            let (old_source, old_grid, cues) = match cmd {
+                DeckCommand::Load(src) => {
+                    let (s, g) = d.swap_source(Some(src));
+                    (s, g, None)
+                }
+                DeckCommand::Unload => {
+                    let (s, g) = d.swap_source(None);
+                    (s, g, None)
+                }
+                DeckCommand::SetGrid { source_id, grid } => {
+                    (None, d.set_grid(source_id, grid), None)
+                }
                 DeckCommand::SetCues {
                     source_id,
                     serial,
-                    ref cues,
+                    cues,
                 } => {
-                    d.set_cues(source_id, serial, cues);
-                    (None, None)
+                    d.set_cues(source_id, serial, &cues);
+                    (None, None, Some(cues))
                 }
                 ref other => {
                     d.apply(other);
-                    (None, None)
+                    (None, None, None)
                 }
             };
             if let Some(s) = old_source {
-                let _ = self.retire.push(Retired::Source(s));
+                self.retire_now(Retired::Source(s));
             }
             if let Some(g) = old_grid {
-                let _ = self.retire.push(Retired::Grid(g));
+                self.retire_now(Retired::Grid(g));
+            }
+            if let Some(c) = cues {
+                self.retire_now(Retired::Cues(c));
             }
         }
+    }
+
+    /// Hand `item` to the retire ring. [`Engine::drain_commands`] checks for room before it
+    /// takes a command, so this never fails; if it did, the item would be freed here, on the
+    /// audio thread.
+    fn retire_now(&mut self, item: Retired) {
+        let pushed = self.retire.push(item);
+        debug_assert!(
+            pushed.is_ok(),
+            "retire ring full: room is checked before each command"
+        );
     }
 }
 
@@ -401,6 +422,36 @@ mod tests {
         assert_eq!(h.deck_state(0).track_bpm.load(), 0.0);
         assert!(h.deck_state(0).beat.load().is_nan());
         assert_eq!(h.collect_retired(), 3, "old source, old grid, stale grid");
+    }
+
+    #[test]
+    fn stored_cues_are_retired_not_dropped() {
+        let (mut e, mut h) = engine(2);
+        let track = constant(48_000, 0.0);
+        let mut out = vec![0.0; 256];
+        h.send_deck(0, DeckCommand::Load(Arc::clone(&track)))
+            .unwrap();
+        e.process(&mut out, 128);
+        h.collect_retired();
+        let applied = Arc::new(TrackCues {
+            cue: Some(100.0),
+            ..TrackCues::default()
+        });
+        let stale = Arc::new(TrackCues::default());
+        let (weak_applied, weak_stale) = (Arc::downgrade(&applied), Arc::downgrade(&stale));
+        for (source_id, cues) in [(track.id(), applied), (track.id() + 1, stale)] {
+            let cmd = DeckCommand::SetCues {
+                source_id,
+                serial: 1,
+                cues,
+            };
+            h.send_deck(0, cmd).unwrap();
+        }
+        e.process(&mut out, 128);
+        assert_eq!(e.deck(0).cues().cue, 100.0);
+        assert!(weak_applied.upgrade().is_some() && weak_stale.upgrade().is_some());
+        assert_eq!(h.collect_retired(), 2, "applied and stale cues");
+        assert!(weak_applied.upgrade().is_none() && weak_stale.upgrade().is_none());
     }
 
     #[test]

@@ -49,7 +49,8 @@ pub enum DeckCommand {
     SetCues {
         source_id: u64,
         serial: u64,
-        cues: TrackCues,
+        /// Retired after it is read, like a grid, so the callback never frees it.
+        cues: Arc<TrackCues>,
     },
     Play,
     Pause,
@@ -325,7 +326,7 @@ impl Deck {
     /// old state would have played.
     pub fn render(&mut self, out: &mut [f32]) -> BlockOutcome {
         let frames = out.len() / CHANNELS;
-        assert!(frames <= MAX_BLOCK_FRAMES, "block too long");
+        debug_assert!(frames <= MAX_BLOCK_FRAMES, "block too long");
         let fade_from = self.fade_from.take();
         let Some(source) = self.source.as_deref() else {
             out.fill(0.0);
