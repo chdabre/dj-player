@@ -1,7 +1,7 @@
 //! Render targets other than the window: the device screen's offscreen texture while the
 //! stand-in shell is on (copied into the shell's display slot), and screenshot readback.
 
-use super::quad_pipeline;
+use super::plane::quad_pipeline;
 
 /// Copies the device layer's offscreen texture into the shell's display slot.
 const BLIT_SHADER: &str = r#"

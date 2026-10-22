@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use super::quad_pipeline;
+use super::plane::quad_pipeline;
 use super::scene::{Image, LAYERS, Scene};
 
 const SHADER: &str = r#"

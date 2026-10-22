@@ -3,8 +3,9 @@
 
 use std::ops::Range;
 
+use super::color;
+use super::plane::quad_pipeline;
 use super::scene::{Gradient, LAYERS, Scene};
-use super::{color, quad_pipeline};
 
 const SHADER: &str = r#"
 struct View { xform: vec4<f32>, size: vec4<f32> };  // scale, offset x, offset y; surface w, h

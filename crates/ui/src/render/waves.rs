@@ -4,7 +4,7 @@
 //! columns under its pixel, so fractional column positions scroll smoothly, and blends a
 //! column's segments in sRGB values, as the CPU reference does.
 
-use super::quad_pipeline;
+use super::plane::quad_pipeline;
 use super::scene::{Layer, Scene};
 
 const SHADER: &str = r#"

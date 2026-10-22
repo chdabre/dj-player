@@ -1,6 +1,7 @@
 //! The renderer: what a [`Scene`] becomes on the GPU. One wgpu pipeline per kind of shape
 //! (rounded rectangles, waveforms, pictures; `rects.rs`, `waves.rs`, `images.rs`) and
-//! glyphon for text (`text.rs`).
+//! glyphon for text (`text.rs`). Each surface's GPU data and the shared quad pipeline are in
+//! `plane.rs`; mapping between window and design pixels is `coords.rs`.
 //!
 //! Layout happens in design pixels (1024×600 for the device screen); the view uniform scales
 //! and centres that onto the target, so the same scene fits a Retina window on the Mac and the
@@ -13,25 +14,28 @@
 //! the slot (`offscreen.rs`). The device screen never knows about the shell, so a device
 //! build simply drops it.
 
+mod coords;
 mod images;
 mod offscreen;
+mod plane;
 mod rects;
 pub mod scene;
 mod text;
 mod waves;
 
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+use coords::transform;
 use images::Images;
 use offscreen::Offscreen;
-use rects::{RectBatch, Rects};
-use scene::{LAYERS, Layer, Rgba, Scene};
-use text::{Fonts, LayerText};
+use plane::PlaneSet;
+use rects::Rects;
+use scene::{Layer, Rgba, Scene};
+use text::Fonts;
 use waves::Waves;
 
 pub const DESIGN_W: f32 = 1024.0;
@@ -59,99 +63,6 @@ pub struct FrameTiming {
 enum Which {
     Device,
     Shell,
-}
-
-/// What one surface's scene needs on the GPU: its view uniform, rectangle instances and text.
-struct Surface {
-    view_buffer: wgpu::Buffer,
-    view_bind: wgpu::BindGroup,
-    rects: RectBatch,
-    /// Text by plane.
-    text: [LayerText; LAYERS],
-}
-
-impl Surface {
-    fn new(device: &wgpu::Device, fonts: &mut Fonts, view_layout: &wgpu::BindGroupLayout) -> Self {
-        let view_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("view"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let view_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("view"),
-            layout: view_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: view_buffer.as_entire_binding(),
-            }],
-        });
-        Self {
-            view_buffer,
-            view_bind,
-            rects: RectBatch::new(device),
-            text: [LayerText::new(device, fonts), LayerText::new(device, fonts)],
-        }
-    }
-}
-
-/// An instanced quad pipeline: a triangle strip of four vertices per instance, drawing into
-/// `format` with `blend`.
-fn quad_pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    source: &str,
-    groups: &[&wgpu::BindGroupLayout],
-    instance: Option<wgpu::VertexBufferLayout>,
-    format: wgpu::TextureFormat,
-    blend: Option<wgpu::BlendState>,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
-    });
-    let groups: Vec<Option<&wgpu::BindGroupLayout>> = groups.iter().copied().map(Some).collect();
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        bind_group_layouts: &groups,
-        ..Default::default()
-    });
-    let buffers: Vec<Option<wgpu::VertexBufferLayout>> = instance.into_iter().map(Some).collect();
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs"),
-            buffers: &buffers,
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleStrip,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        cache: None,
-        multiview_mask: None,
-    })
-}
-
-/// A design of `design` pixels → physical pixels on a `w`×`h` target: (scale, offset x,
-/// offset y). The design is scaled uniformly and centred.
-fn transform(w: u32, h: u32, (dw, dh): (f32, f32)) -> (f32, f32, f32) {
-    let (w, h) = (w as f32, h as f32);
-    let s = (w / dw).min(h / dh);
-    (s, (w - dw * s) * 0.5, (h - dh * s) * 0.5)
 }
 
 /// sRGB colour → what the shader writes (linear for an sRGB target).
@@ -182,8 +93,8 @@ pub struct Gfx {
     images: Images,
     fonts: Fonts,
     offscreen: Offscreen,
-    device_surface: Surface,
-    shell_surface: Surface,
+    device_planes: PlaneSet,
+    shell_planes: PlaneSet,
     /// Where the last frame put the device screen and the shell, in window pixels: the device
     /// screen's (scale, x, y) and the shell's (scale, x, y), for mapping touches.
     device_xform: (f32, f32, f32),
@@ -258,8 +169,8 @@ impl Gfx {
             ..Default::default()
         });
         let mut fonts = Fonts::new(&device, &queue, format);
-        let device_surface = Surface::new(&device, &mut fonts, &view_layout);
-        let shell_surface = Surface::new(&device, &mut fonts, &view_layout);
+        let device_planes = PlaneSet::new(&device, &mut fonts, &view_layout);
+        let shell_planes = PlaneSet::new(&device, &mut fonts, &view_layout);
 
         Ok(Self {
             rects: Rects::new(&device, &view_layout, format),
@@ -267,8 +178,8 @@ impl Gfx {
             images: Images::new(&device, &view_layout, format),
             offscreen: Offscreen::new(&device, format),
             fonts,
-            device_surface,
-            shell_surface,
+            device_planes,
+            shell_planes,
             sampler,
             device,
             queue,
@@ -291,27 +202,6 @@ impl Gfx {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
-    }
-
-    /// Physical pixel position in the window → the device screen's design pixels, as the
-    /// last frame placed it. Outside the device screen (on a shell) it is out of range.
-    pub fn to_design(&self, x: f64, y: f64) -> (f32, f32) {
-        let (s, ox, oy) = self.device_xform;
-        ((x as f32 - ox) / s, (y as f32 - oy) / s)
-    }
-
-    /// True if a window pixel falls on the device screen.
-    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
-    pub fn on_device(&self, x: f64, y: f64) -> bool {
-        let (dx, dy) = self.to_design(x, y);
-        (0.0..DESIGN_W).contains(&dx) && (0.0..DESIGN_H).contains(&dy)
-    }
-
-    /// Window pixel → the shell's design pixels, if a shell was drawn.
-    #[cfg_attr(not(feature = "standin"), allow(dead_code))]
-    pub fn to_shell(&self, x: f64, y: f64) -> Option<(f32, f32)> {
-        self.shell_xform
-            .map(|(s, ox, oy)| ((x as f32 - ox) / s, (y as f32 - oy) / s))
     }
 
     /// Draw the device screen `scene`, inside `shell` if there is one, and present it.
@@ -442,9 +332,9 @@ impl Gfx {
             (0, Default::default())
         };
         let srgb = self.srgb;
-        let surface = match which {
-            Which::Device => &mut self.device_surface,
-            Which::Shell => &mut self.shell_surface,
+        let planes = match which {
+            Which::Device => &mut self.device_planes,
+            Which::Shell => &mut self.shell_planes,
         };
         let (s, ox, oy) = xform;
         let mut view = Vec::with_capacity(32);
@@ -452,9 +342,9 @@ impl Gfx {
         for v in [s, ox, oy, 0.0, w as f32, h as f32, srgb_flag, 0.0] {
             view.extend_from_slice(&v.to_ne_bytes());
         }
-        self.queue.write_buffer(&surface.view_buffer, 0, &view);
-        surface.rects.upload(&self.device, &self.queue, scene, srgb);
-        for (text, plane) in surface.text.iter_mut().zip(&scene.planes) {
+        self.queue.write_buffer(&planes.view_buffer, 0, &view);
+        planes.rects.upload(&self.device, &self.queue, scene, srgb);
+        for (text, plane) in planes.text.iter_mut().zip(&scene.planes) {
             text.prepare(
                 &self.device,
                 &self.queue,
@@ -491,7 +381,7 @@ impl Gfx {
             // below it, then pictures, then text.
             for layer in [Layer::Base, Layer::Overlay] {
                 let p = layer as usize;
-                let rects = surface.rects.planes[p].clone();
+                let rects = planes.rects.planes[p].clone();
                 let waves_here = if layer == Layer::Base { waves } else { 0 };
                 let mut drawn = rects.start;
                 for k in 0..=waves_here {
@@ -501,22 +391,17 @@ impl Gfx {
                         .filter(|_| k < waves_here)
                         .map_or(rects.end, |(at, _)| rects.start + *at as u32);
                     if until > drawn {
-                        self.rects.draw(
-                            &mut pass,
-                            &surface.view_bind,
-                            &surface.rects,
-                            drawn,
-                            until,
-                        );
+                        self.rects
+                            .draw(&mut pass, &planes.view_bind, &planes.rects, drawn, until);
                         drawn = until;
                     }
                     if k < waves_here {
-                        self.waves.draw(&mut pass, &surface.view_bind, k as u32);
+                        self.waves.draw(&mut pass, &planes.view_bind, k as u32);
                     }
                 }
                 self.images
-                    .draw(&mut pass, &surface.view_bind, scene, images[p].clone());
-                surface.text[p].render(&self.fonts.atlas, &mut pass);
+                    .draw(&mut pass, &planes.view_bind, scene, images[p].clone());
+                planes.text[p].render(&self.fonts.atlas, &mut pass);
             }
         }
         encoder.finish()
