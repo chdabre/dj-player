@@ -7,7 +7,9 @@ use std::path::Path;
 use browser::{Browser, Source};
 use soulseek::Snapshot;
 
-use super::{BrowseState, BrowseTarget, DeckDisplay, HitBox, PerfState, ScreenKind, Target};
+use super::{
+    BrowseState, BrowseTarget, DeckDisplay, HitBox, PerfState, ScreenKind, SettingsState, Target,
+};
 use super::{chrome, perform};
 use crate::app::effects::Effects;
 use crate::app::engine::{DeckSnapshot, LibraryView};
@@ -40,6 +42,7 @@ pub struct Screens {
     pub deck: DeckDisplay,
     pub perform: PerfState,
     pub browse: BrowseState,
+    pub settings: SettingsState,
     /// The target the finger is on (drawn pressed), until it lifts or drags the list.
     pub pressed: Option<Target>,
 }
@@ -70,6 +73,7 @@ impl Screens {
                 }
             }
             Target::Browse(t) => self.browse.tap(t, y, cx),
+            Target::Settings(t) => self.settings.tap(t, cx),
         }
     }
 
@@ -99,6 +103,10 @@ impl Screens {
         if self.screen == ScreenKind::Info && n == Nav::Back {
             self.screen = ScreenKind::Main;
             return;
+        }
+        if self.screen == ScreenKind::Settings {
+            let show = self.settings.nav(n, cx);
+            return self.show(show);
         }
         if n == Nav::Tag || n == Nav::Untag {
             let browsing = self.screen == ScreenKind::Browse;
@@ -148,6 +156,15 @@ impl Screens {
         if self.browse.search(cx) {
             self.screen = ScreenKind::Browse;
         }
+    }
+
+    /// MENU on a playback screen: the settings, or back to the main screen.
+    pub fn toggle_settings(&mut self) {
+        self.settings.editing = None;
+        self.screen = match self.screen {
+            ScreenKind::Settings => ScreenKind::Main,
+            _ => ScreenKind::Settings,
+        };
     }
 
     /// INFO: in the browser, the selected track's details beside the list (or not); on any

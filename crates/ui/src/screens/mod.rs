@@ -5,7 +5,7 @@
 //! - `chrome.rs`: the frame every screen shares (rail, tab row, lower bands);
 //! - `deck.rs`: the deck displays the playback screens share (zoom waveform, overview, status
 //!   band, phase meters, cue column);
-//! - `main.rs`, `perform.rs`, `browse/`: the screens.
+//! - `main.rs`, `perform.rs`, `browse/`, `info.rs`, `settings.rs`: the screens.
 //!
 //! The waveforms come from the deck's computed waveform (`waves.rs`), drawn between their
 //! panel and grid and the overlays (loop, cue, slip shadow, playhead), as the waveform crate's
@@ -19,6 +19,7 @@ pub mod info;
 pub mod main;
 pub mod perform;
 pub mod router;
+pub mod settings;
 pub mod view;
 
 use crate::kit;
@@ -31,6 +32,7 @@ pub use chrome::ChromeTarget;
 pub use deck::{DeckDisplay, DeckTarget};
 pub use perform::{PerfState, PerfTarget};
 pub use router::{Cx, Screens, Show};
+pub use settings::{SettingsState, SettingsTarget};
 pub use view::{SaveState, View, Wave};
 
 /// Things on screen that can be touched, by the part of the screen that owns them.
@@ -42,6 +44,7 @@ pub enum Target {
     Deck(DeckTarget),
     Perform(PerfTarget),
     Browse(BrowseTarget),
+    Settings(SettingsTarget),
 }
 
 /// Which screen is up.
@@ -53,6 +56,8 @@ pub enum ScreenKind {
     Browse,
     /// INFO: the loaded track's details.
     Info,
+    /// SETTINGS (MENU from a playback screen).
+    Settings,
 }
 
 /// A touch target on the device screen.
@@ -78,6 +83,12 @@ pub fn build(view: &View, theme: &Theme, overview: &mut OverviewCache, scene: &m
         && let Some(i) = view.info
     {
         info::build(&mut ui, view, i, overview);
+        return ui.into_hits();
+    }
+    if view.screen == ScreenKind::Settings
+        && let Some(s) = view.settings
+    {
+        settings::build(&mut ui, view, s, overview);
         return ui.into_hits();
     }
     if view.screen == ScreenKind::Browse

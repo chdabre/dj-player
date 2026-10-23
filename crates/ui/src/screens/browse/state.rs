@@ -11,8 +11,8 @@ use browser::{Browser, Entered, Kind, Source};
 use player_api::Listing;
 
 use super::{
-    BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, SearchSource, Shift, SoulseekSearch,
-    key_char,
+    BACKSPACE, BrowseTarget, CLEAR, DONE, HitCursor, ROW_H, SHIFT, SearchSource, Shift,
+    SoulseekSearch, key_char,
 };
 use winit::keyboard::{Key, NamedKey};
 
@@ -36,13 +36,14 @@ struct ListDrag {
 }
 
 /// What has the browse screen's input, top first: the question, a name being typed, a modal,
-/// an entry being moved, the search field, or the list.
+/// an entry being moved, the download queue, the search field, or the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     AskScan,
     Naming,
     Modal,
     Moving,
+    Queue,
     Search,
     List,
 }
@@ -64,6 +65,8 @@ pub struct BrowseState {
     pub source: SearchSource,
     /// The SoulSeek search's query and cursor.
     pub soulseek: SoulseekSearch,
+    /// The download queue, in place of the list, with its cursor.
+    pub queue: Option<HitCursor>,
     list_drag: Option<ListDrag>,
     /// The unanalysed track count, and the listing it was counted from.
     unanalysed: RefCell<Option<(Arc<Listing>, usize)>>,
@@ -80,6 +83,8 @@ impl BrowseState {
             Focus::Modal
         } else if self.editing.moving.is_some() {
             Focus::Moving
+        } else if self.queue.is_some() {
+            Focus::Queue
         } else if self.keyboard {
             Focus::Search
         } else {
@@ -127,7 +132,7 @@ impl BrowseState {
                 }
                 true
             }
-            Focus::Modal | Focus::Moving | Focus::List => false,
+            Focus::Modal | Focus::Moving | Focus::Queue | Focus::List => false,
         }
     }
 
@@ -155,6 +160,8 @@ impl BrowseState {
             BrowseTarget::ScanNo => self.answer_scan(false, cx),
             BrowseTarget::Key(i) => self.screen_key(i, cx),
             BrowseTarget::SearchSource(s) => self.set_source(s, cx),
+            BrowseTarget::Queue => self.toggle_queue(),
+            BrowseTarget::Cancel => self.queue_cancel(cx),
             BrowseTarget::Row(row) => {
                 self.list_drag = Some(ListDrag {
                     y,
@@ -218,6 +225,7 @@ impl BrowseState {
                 Nav::Down => self.move_entry(1, cx),
                 _ => self.editing.moving = None,
             },
+            Focus::Queue => self.queue_nav(n, cx),
             Focus::Search | Focus::List => return self.list_nav(n, cx),
         }
         None
@@ -225,7 +233,9 @@ impl BrowseState {
 
     /// Scroll the list by `rows` (the wheel, a drag).
     pub fn scroll_by(&mut self, rows: isize, cx: &mut Cx) {
-        if self.on_soulseek(cx) {
+        if self.queue.is_some() {
+            self.queue_scroll(rows, cx);
+        } else if self.on_soulseek(cx) {
             self.soulseek_scroll(rows, cx);
         } else if let Some(b) = cx.browser.as_deref_mut() {
             b.scroll_by(rows);
@@ -267,6 +277,9 @@ impl BrowseState {
     /// A tap on shown row `row`: a folder opens; a track is selected, and loads if it was
     /// selected already.
     fn tap_row(&mut self, row: usize, cx: &mut Cx) {
+        if self.queue.is_some() {
+            return self.queue_tap(row, cx);
+        }
         if self.on_soulseek(cx) {
             return self.soulseek_tap(row, cx);
         }

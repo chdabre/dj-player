@@ -5,7 +5,7 @@ use std::path::Path;
 
 use browser::{Browser, Entry, Kind, Source, Tags};
 use player_api::PlaylistKind;
-use soulseek::Snapshot;
+use soulseek::{Snapshot, Status};
 
 use super::editing::Modal;
 use super::state::BrowseState;
@@ -78,18 +78,36 @@ impl BrowseState {
             total: l.entries.len(),
             empty,
             has_tracks: l.entries.iter().any(|e| e.kind == Kind::Track),
+            queue_chip: None,
+            queue_lit: false,
+            queue_open: false,
+            cancel: None,
         };
         if query.is_some() && self.source == SearchSource::Soulseek {
             self.soulseek_view(&mut v, soulseek, loaded);
         }
+        self.queue_view(&mut v, soulseek, loaded);
         v
     }
 
     /// The shown rows' tags have all been read, and the library has said what it has (for
     /// screenshots).
-    pub fn settled(&self, b: &Browser, lib: &LibraryView) -> bool {
+    pub fn settled(&self, b: &Browser, lib: &LibraryView, soulseek: Option<&Snapshot>) -> bool {
+        // The queue once a download has finished; SoulSeek's search once hits are in (or it
+        // has given up).
+        if self.queue.is_some() {
+            return soulseek.is_none_or(|s| {
+                s.transfers
+                    .iter()
+                    .any(|q| matches!(q.transfer, soulseek::Transfer::Done(_)))
+            });
+        }
         if b.search_query().is_some() && self.source == SearchSource::Soulseek {
-            return true;
+            return soulseek.is_none_or(|s| match s.status {
+                Status::Idle | Status::Connecting => false,
+                Status::Searching => !s.hits.is_empty(),
+                Status::Done | Status::Failed(_) => true,
+            });
         }
         if (b.source() != Source::Folders && (lib.listing.is_none() || lib.playlists.is_none()))
             || lib.scanning()

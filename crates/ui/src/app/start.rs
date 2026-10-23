@@ -1,6 +1,7 @@
 //! The one place the UI names the player's implementation: it starts `engined`'s [`Player`]
 //! in this process and hands it on as a [`Port`]. A UI talking to a player in another process
-//! would connect here instead.
+//! would connect here instead. The player's settings folder is also the player's
+//! ([`config_dir`]).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -45,4 +46,9 @@ pub(super) fn start_player(
         player.device_name()
     );
     Ok((Box::new(player), ask_scan))
+}
+
+/// The player's settings folder on its own storage (not a stick), if there is one.
+pub(super) fn config_dir() -> Option<std::path::PathBuf> {
+    engined::config::dir()
 }

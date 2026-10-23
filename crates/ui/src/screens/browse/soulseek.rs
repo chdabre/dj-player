@@ -17,6 +17,13 @@ use crate::screens::Cx;
 pub struct SoulseekSearch {
     /// The query being typed (sent with DONE).
     pub query: String,
+    pub hits: HitCursor,
+}
+
+/// A cursor on a list of hits (the search's, or the download queue's) and the first row
+/// shown.
+#[derive(Debug, Default)]
+pub struct HitCursor {
     /// The hit under the cursor, by key: hits re-rank as they come in, and it stays on its
     /// hit. `None`: the first.
     picked: Option<HitKey>,
@@ -24,7 +31,7 @@ pub struct SoulseekSearch {
     top: usize,
 }
 
-impl SoulseekSearch {
+impl HitCursor {
     /// The cursor's index among `hits`.
     pub fn cursor(&self, hits: &[Hit]) -> usize {
         self.picked
@@ -37,7 +44,7 @@ impl SoulseekSearch {
     }
 
     /// The first row shown, kept in range.
-    fn top(&self, hits: &[Hit]) -> usize {
+    pub(super) fn top(&self, hits: &[Hit]) -> usize {
         self.top.min(hits.len().saturating_sub(ROWS))
     }
 
@@ -74,8 +81,8 @@ impl SoulseekSearch {
         self.picked = Some(hits[cursor].key());
     }
 
-    /// A new search: the cursor back to the top.
-    fn restart(&mut self) {
+    /// A new list: the cursor back to the top.
+    pub(super) fn restart(&mut self) {
         self.picked = None;
         self.top = 0;
     }
@@ -119,10 +126,10 @@ impl BrowseState {
             }
             super::CLEAR => q.clear(),
             super::DONE => {
-                if !q.trim().is_empty() && cx.soulseek.is_some() {
+                if !q.trim().is_empty() && cx.soulseek.is_some_and(|s| s.account) {
                     cx.effects
                         .push(Effect::SoulseekSearch(q.trim().to_string()));
-                    self.soulseek.restart();
+                    self.soulseek.hits.restart();
                 }
                 self.keyboard = false;
             }
@@ -137,22 +144,22 @@ impl BrowseState {
     }
 
     pub(super) fn soulseek_move(&mut self, delta: isize, cx: &Cx) {
-        self.soulseek.move_by(delta, Self::hits(cx));
+        self.soulseek.hits.move_by(delta, Self::hits(cx));
     }
 
     pub(super) fn soulseek_scroll(&mut self, delta: isize, cx: &Cx) {
-        self.soulseek.scroll_by(delta, Self::hits(cx));
+        self.soulseek.hits.scroll_by(delta, Self::hits(cx));
     }
 
     /// A tap on shown row `row`: select the hit, and pick it if it was selected already.
     pub(super) fn soulseek_tap(&mut self, row: usize, cx: &mut Cx) {
         let hits = Self::hits(cx);
-        let i = self.soulseek.top(hits) + row;
+        let i = self.soulseek.hits.top(hits) + row;
         if i >= hits.len() {
             return;
         }
-        let again = self.soulseek.cursor(hits) == i;
-        self.soulseek.select(i, hits);
+        let again = self.soulseek.hits.cursor(hits) == i;
+        self.soulseek.hits.select(i, hits);
         if again {
             self.soulseek_pick(cx);
         }
@@ -163,7 +170,7 @@ impl BrowseState {
         let Some(s) = cx.soulseek else {
             return;
         };
-        let Some(hit) = s.hits.get(self.soulseek.cursor(&s.hits)) else {
+        let Some(hit) = s.hits.get(self.soulseek.hits.cursor(&s.hits)) else {
             return;
         };
         let effect = match s.transfer(hit) {
@@ -183,8 +190,8 @@ impl BrowseState {
         loaded: Option<&Path>,
     ) {
         let hits = s.map_or(&[][..], |s| s.hits.as_slice());
-        let top = self.soulseek.top(hits);
-        let cursor = self.soulseek.cursor(hits);
+        let top = self.soulseek.hits.top(hits);
+        let cursor = self.soulseek.hits.cursor(hits);
         v.rows = hits
             .iter()
             .skip(top)
@@ -209,7 +216,7 @@ impl BrowseState {
 
 /// A hit as a row: its name; the download's state, the peer and the size; its quality and
 /// length.
-fn hit_row(h: &Hit, transfer: Option<&Transfer>, loaded: Option<&Path>) -> Row {
+pub(super) fn hit_row(h: &Hit, transfer: Option<&Transfer>, loaded: Option<&Path>) -> Row {
     let state = match transfer {
         None => String::new(),
         Some(Transfer::Queued) => "QUEUED  ·  ".into(),
@@ -244,8 +251,11 @@ fn megabytes(bytes: u64) -> String {
 /// What the list says before there are hits.
 fn empty(s: Option<&Snapshot>) -> String {
     let Some(s) = s else {
-        return "Set SOULSEEK_USERNAME and SOULSEEK_PASSWORD to search SoulSeek".into();
+        return "SoulSeek needs a USB stick to download to".into();
     };
+    if !s.account {
+        return "No SoulSeek account yet: set one in MENU, from the playback screen".into();
+    }
     match &s.status {
         Status::Idle => "Type what to look for, then SEARCH".into(),
         Status::Connecting => "Logging in to SoulSeek…".into(),
@@ -276,7 +286,7 @@ mod tests {
     #[test]
     fn the_cursor_stays_on_its_hit_as_hits_rerank() {
         let mut hs = hits(10);
-        let mut s = SoulseekSearch::default();
+        let mut s = HitCursor::default();
         assert_eq!(s.cursor(&hs), 0);
         s.move_by(3, &hs);
         assert_eq!(s.cursor(&hs), 3);
@@ -317,8 +327,10 @@ mod tests {
 
     #[test]
     fn the_list_says_why_it_is_empty() {
-        assert!(empty(None).contains("SOULSEEK_USERNAME"));
+        assert!(empty(None).contains("USB"));
+        assert!(empty(Some(&Snapshot::default())).contains("MENU"));
         let s = Snapshot {
+            account: true,
             status: Status::Failed("Authentication failed".into()),
             ..Snapshot::default()
         };

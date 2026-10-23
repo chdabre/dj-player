@@ -222,14 +222,17 @@ fn with(
 
 #[test]
 fn soulseek_searches_on_done_and_a_picked_hit_downloads_then_loads() {
-    use soulseek::{Format, Hit, Quality, Snapshot, Status, Transfer};
+    use soulseek::{Format, Hit, Quality, Queued, Snapshot, Status, Transfer};
     use std::sync::Arc;
     use winit::keyboard::{Key, NamedKey, SmolStr};
     let d = deck(None);
     let (mut b, dir) = stick("soulseek");
     let mut fx = Vec::new();
     let mut s = Screens::default();
-    let mut net = Snapshot::default();
+    let mut net = Snapshot {
+        account: true,
+        ..Snapshot::default()
+    };
     s.search(&mut cx(&d, Some(&mut b), &mut fx));
     // What was typed for the stick comes along to SoulSeek.
     typed(
@@ -299,12 +302,14 @@ fn soulseek_searches_on_done_and_a_picked_hit_downloads_then_loads() {
     );
     fx.clear();
     // Under way: pushing again does nothing. Downloaded: it loads.
-    net.transfers.insert(hits[1].key(), Transfer::Queued);
+    net.transfers = vec![Queued {
+        hit: hits[1].clone(),
+        transfer: Transfer::Queued,
+    }];
     with(&mut s, &d, &mut b, &mut fx, &net, Nav::Push);
     assert!(fx.is_empty());
     let file = dir.join("SoulSeek Downloads/y.flac");
-    net.transfers
-        .insert(hits[1].key(), Transfer::Done(file.clone()));
+    net.transfers[0].transfer = Transfer::Done(file.clone());
     with(&mut s, &d, &mut b, &mut fx, &net, Nav::Push);
     assert_eq!(said(&fx), [format!("{:?}", Effect::Load(file))]);
 
@@ -316,7 +321,7 @@ fn soulseek_searches_on_done_and_a_picked_hit_downloads_then_loads() {
 }
 
 #[test]
-fn without_an_account_soulseek_says_so_and_sends_nothing() {
+fn without_a_stick_soulseek_says_so_and_sends_nothing() {
     use winit::keyboard::{Key, NamedKey};
     let d = deck(None);
     let (mut b, dir) = stick("soulseek-none");
@@ -331,7 +336,105 @@ fn without_an_account_soulseek_says_so_and_sends_nothing() {
     );
     assert!(fx.is_empty());
     let v = s.browse.view(&b, &Default::default(), None, None);
-    assert!(v.empty.unwrap().contains("SOULSEEK_USERNAME"));
+    assert!(v.empty.unwrap().contains("USB"));
     assert!(v.header.starts_with("SOULSEEK:  x"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn menu_on_a_playback_screen_opens_the_settings_and_back_leaves_them() {
+    let d = deck(None);
+    let mut fx = Vec::new();
+    let mut s = Screens::default();
+    let menu = hit(Target::Chrome(ChromeTarget::Menu), Rect::default());
+    s.tap(menu, (0.0, 0.0), &mut cx(&d, None, &mut fx));
+    assert_eq!(s.screen, ScreenKind::Settings);
+    s.tap(menu, (0.0, 0.0), &mut cx(&d, None, &mut fx));
+    assert_eq!(s.screen, ScreenKind::Main, "MENU again closes them");
+    s.toggle_perform();
+    s.tap(menu, (0.0, 0.0), &mut cx(&d, None, &mut fx));
+    assert_eq!(s.screen, ScreenKind::Settings, "from PERFORM too");
+    // Tapping USERNAME twice types into it; BACK gives up, then leaves.
+    let row = hit(Target::Settings(SettingsTarget::Row(0)), Rect::default());
+    for _ in 0..2 {
+        s.tap(row, (0.0, 0.0), &mut cx(&d, None, &mut fx));
+    }
+    assert!(s.settings.editing.is_some());
+    s.nav(Nav::Back, &mut cx(&d, None, &mut fx));
+    assert!(s.settings.editing.is_none());
+    s.nav(Nav::Back, &mut cx(&d, None, &mut fx));
+    assert_eq!(s.screen, ScreenKind::Main);
+    assert!(fx.is_empty());
+}
+
+#[test]
+fn the_queue_chip_opens_the_queue_where_cancel_stops_the_selected_download() {
+    use soulseek::{Format, Hit, Quality, Queued, Snapshot, Transfer};
+    let d = deck(None);
+    let (mut b, dir) = stick("queue");
+    let mut fx = Vec::new();
+    let mut s = Screens {
+        screen: ScreenKind::Browse,
+        ..Screens::default()
+    };
+    let file = |name: &str, transfer| Queued {
+        hit: Hit {
+            user: "peer".into(),
+            path: format!("@@share\\{name}"),
+            size: 100,
+            quality: Quality::new(Format::Mp3, &Default::default()),
+            free_slot: true,
+            speed: 1,
+        },
+        transfer,
+    };
+    let done = dir.join("SoulSeek Downloads/b.mp3");
+    let net = Snapshot {
+        account: true,
+        transfers: vec![
+            file(
+                "a.mp3",
+                Transfer::Receiving {
+                    done: 10,
+                    total: 100,
+                },
+            ),
+            file("b.mp3", Transfer::Done(done.clone())),
+        ],
+        ..Snapshot::default()
+    };
+    let tap = |s: &mut Screens, b: &mut browser::Browser, fx: &mut Vec<Effect>, t| {
+        let mut c = cx(&d, Some(b), fx);
+        c.soulseek = Some(&net);
+        s.tap(hit(Target::Browse(t), Rect::default()), (0.0, 0.0), &mut c);
+        s.release(&mut c);
+    };
+    let v = s.browse.view(&b, &Default::default(), Some(&net), None);
+    assert_eq!(v.queue_chip.as_deref(), Some("QUEUE 1 · 10 %"));
+    tap(&mut s, &mut b, &mut fx, BrowseTarget::Queue);
+    let v = s.browse.view(&b, &Default::default(), Some(&net), None);
+    assert!(v.queue_open && v.header == "DOWNLOADS");
+    assert_eq!(v.rows.len(), 2);
+    assert_eq!(v.cancel, Some("CANCEL"));
+    tap(&mut s, &mut b, &mut fx, BrowseTarget::Cancel);
+    assert_eq!(
+        said(&fx),
+        [format!(
+            "{:?}",
+            Effect::CancelDownload(net.transfers[0].hit.key())
+        )]
+    );
+    fx.clear();
+    // The finished one: REMOVE, and a second tap on it loads it.
+    tap(&mut s, &mut b, &mut fx, BrowseTarget::Row(1));
+    let v = s.browse.view(&b, &Default::default(), Some(&net), None);
+    assert_eq!(v.cancel, Some("REMOVE"));
+    tap(&mut s, &mut b, &mut fx, BrowseTarget::Row(1));
+    assert_eq!(said(&fx), [format!("{:?}", Effect::Load(done))]);
+    // BACK closes the queue, not the browser.
+    let mut c = cx(&d, Some(&mut b), &mut fx);
+    c.soulseek = Some(&net);
+    s.nav(Nav::Back, &mut c);
+    assert!(s.browse.queue.is_none() && s.screen == ScreenKind::Browse);
     let _ = std::fs::remove_dir_all(&dir);
 }

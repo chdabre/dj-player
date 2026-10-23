@@ -6,6 +6,7 @@ use browser::{Sort, Source};
 use engined::StreamRequest;
 use engined::{AutoCue, LibraryChoice};
 
+use crate::screens::browse::SearchSource;
 use crate::screens::perform::{self, PerfState};
 use crate::theme::Theme;
 use waveform::display::Mode;
@@ -16,7 +17,8 @@ pub const USAGE: &str = "usage: dj-ui <file> [--device <name>] [--buffer <frames
                      [--screenshot <out.png>] [--library <dir> | --no-library] [--auto-cue off|<dB>] \
                      [--browse] [--source usb|library] [--sort name|title|artist|bpm|key|time] \
                      [--search <query>] [--scan] [--info] [--info-screen] [--analyze-all] \
-                     [--source usb|library|taglist] [--open <a/b>] [--menu]\n\
+                     [--source usb|library|taglist] [--open <a/b>] [--menu] \
+                     [--settings] [--search-source soulseek] [--soulseek-demo] [--queue]\n\
                      LIBRARY_DIR=<dir> browses <dir> as a USB stick's root; the file is then optional.";
 
 pub struct Args {
@@ -53,6 +55,14 @@ pub struct Args {
     /// Open these levels by name (`PLAYLISTS/Peak`), then the MENU if asked.
     pub open: Option<String>,
     pub menu: bool,
+    /// Start on the SETTINGS screen.
+    pub settings: bool,
+    /// What `--search` looks through.
+    pub search_source: Option<SearchSource>,
+    /// SoulSeek on the stand-in network (`soulseek::Demo`), for screenshots.
+    pub soulseek_demo: bool,
+    /// Download the first hits of the SoulSeek search and open the queue.
+    pub queue: bool,
     /// Hot cues to set at start (seconds), for screenshots and demos.
     pub hot_cues: Vec<f64>,
 }
@@ -126,6 +136,10 @@ impl Args {
             open: None,
             menu: false,
             hot_cues: Vec::new(),
+            settings: false,
+            search_source: None,
+            soulseek_demo: false,
+            queue: false,
         }
     }
 }
@@ -274,6 +288,19 @@ fn browse(a: &mut Args, arg: &str, args: &mut Rest) -> Result<bool, String> {
         }
         "--scan" => {
             a.scan = true;
+            a.browse = true;
+        }
+        "--settings" => a.settings = true,
+        "--search-source" => {
+            a.search_source = Some(match args.next().as_deref() {
+                Some("library") => SearchSource::Library,
+                Some("soulseek") => SearchSource::Soulseek,
+                other => return Err(format!("bad search source {other:?} (library, soulseek)")),
+            });
+        }
+        "--soulseek-demo" => a.soulseek_demo = true,
+        "--queue" => {
+            a.queue = true;
             a.browse = true;
         }
         "--search" => {

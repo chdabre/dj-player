@@ -41,6 +41,7 @@ pub fn view(deck: &DeckSnapshot) -> View<'_> {
         save: Some(SaveState::Unsaved),
         browse: None,
         info: None,
+        settings: None,
     }
 }
 

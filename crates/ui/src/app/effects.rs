@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use player_api::DeckCommand;
 use player_api::{Edit, PlaylistId};
-use soulseek::Hit;
+use soulseek::{Credentials, Hit, HitKey};
 
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -34,6 +34,10 @@ pub enum Effect {
     SoulseekSearch(String),
     /// Download this SoulSeek hit into the stick's downloads folder.
     Download(Hit),
+    /// Stop this download (or take a finished one off the queue).
+    CancelDownload(HitKey),
+    /// Keep this SoulSeek account on the player and log in with it (`None`: forget it).
+    SetAccount(Option<Credentials>),
 }
 
 /// Effects in the order they were asked for.

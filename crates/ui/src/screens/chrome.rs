@@ -108,9 +108,10 @@ pub(crate) fn tap(s: &mut Screens, t: ChromeTarget, cx: &mut Cx) {
             s.browse_source(Source::TagList, cx);
         }
         ChromeTarget::Menu if s.screen == ScreenKind::Browse => s.browse.open_menu(cx),
+        ChromeTarget::Menu => s.toggle_settings(),
         ChromeTarget::Info => s.toggle_info(),
         ChromeTarget::Slip => cx.effects.push(Effect::Deck(DeckCommand::ToggleSlip)),
-        ChromeTarget::Menu | ChromeTarget::Link => {}
+        ChromeTarget::Link => {}
     }
 }
 

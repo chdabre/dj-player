@@ -27,7 +27,7 @@ use crate::input::{ControlEvent, Nav};
 use crate::render::Gfx;
 use crate::render::scene::Scene;
 use crate::screens::browse::ROWS;
-use crate::screens::{Cx, Hits, ScreenKind, Screens};
+use crate::screens::{Cx, Hits, ScreenKind, Screens, SettingsState};
 #[cfg(feature = "standin")]
 use crate::standin;
 use crate::stats::FrameStats;
@@ -35,7 +35,7 @@ use crate::theme::Theme;
 use crate::waves::WaveSettings;
 use effects::{Effect, Effects};
 use engine::DeckSnapshot;
-use start::start_player;
+use start::{config_dir, start_player};
 use track::Track;
 
 /// Who got the pointer when it went down: the device screen or the stand-in shell.
@@ -57,9 +57,11 @@ pub struct App {
     track: Track,
     /// The stick's folder tree, when there is a stick (`LIBRARY_DIR`).
     browser: Option<Browser>,
-    /// The SoulSeek client, with a stick and an account (`SOULSEEK_USERNAME`,
-    /// `SOULSEEK_PASSWORD`); it downloads into the stick's [`DOWNLOADS_DIR`].
+    /// The SoulSeek client, with a stick; it downloads into the stick's [`DOWNLOADS_DIR`].
+    /// Its account is set in SETTINGS and kept in `config`.
     soulseek: Option<Soulseek>,
+    /// The player's settings folder.
+    config: Option<PathBuf>,
     /// What it had at the start of the frame: what the screen shows and input acts on.
     soulseek_seen: Option<Snapshot>,
     /// A `--search` query still to start.
@@ -68,6 +70,8 @@ pub struct App {
     screens: Screens,
     /// What input asked the engine and the library to do, carried out after each event.
     effects: Effects,
+    /// `--queue`: download the SoulSeek search's first hits and open the queue, once there.
+    pending_queue: bool,
     /// `--analyze-all` still to start.
     pending_analyze_all: bool,
     /// `--open` levels still to open, and `--menu` still to show.
@@ -112,10 +116,16 @@ impl App {
         };
         let deck = player.deck();
         let on_deck = player.on_deck();
-        let soulseek = root
-            .as_ref()
-            .zip(Credentials::from_env())
-            .map(|(r, c)| Soulseek::start(c, r.join(DOWNLOADS_DIR)));
+        let config = config_dir();
+        let account = Credentials::load(config.as_deref());
+        let soulseek = root.as_ref().map(|r| {
+            let dir = r.join(DOWNLOADS_DIR);
+            if args.soulseek_demo {
+                Soulseek::demo(dir)
+            } else {
+                Soulseek::start(account.clone(), dir)
+            }
+        });
         let browser = root.map(|r| {
             let mut b = Browser::new(r, ROWS);
             if let Some(s) = args.sort {
@@ -126,7 +136,8 @@ impl App {
             }
             b
         });
-        let screens = startup_screens(&args, ask_scan);
+        let mut screens = startup_screens(&args, ask_scan);
+        screens.settings = SettingsState::new(account.as_ref());
         Ok(App {
             pointer_on: PointerOn::Device,
             #[cfg(feature = "standin")]
@@ -140,12 +151,14 @@ impl App {
             player,
             browser,
             soulseek,
+            config,
             soulseek_seen: None,
             // Applied once the library's listing is in (a library search needs it).
             pending_search: args.search.clone(),
             screens,
             effects: Vec::new(),
             pending_analyze_all: args.analyze_all,
+            pending_queue: args.queue,
             pending_open: args.open.clone(),
             pending_menu: args.menu,
             wheel: 0.0,
@@ -253,7 +266,28 @@ impl App {
                         s.download(&hit);
                     }
                 }
+                Effect::CancelDownload(key) => {
+                    if let Some(s) = &self.soulseek {
+                        s.cancel(&key);
+                    }
+                }
+                Effect::SetAccount(account) => self.set_account(account),
             }
+        }
+    }
+
+    /// Keep the SoulSeek account in the settings folder, and log in with it from now on.
+    fn set_account(&mut self, account: Option<Credentials>) {
+        match &self.config {
+            Some(dir) => {
+                if let Err(e) = Credentials::save(account.as_ref(), dir) {
+                    eprintln!("can't keep the SoulSeek account in {}: {e}", dir.display());
+                }
+            }
+            None => eprintln!("no settings folder: the SoulSeek account is kept for this run"),
+        }
+        if let Some(s) = &self.soulseek {
+            s.set_account(account);
         }
     }
 
@@ -278,7 +312,11 @@ impl App {
         };
         self.pending_search.is_none()
             && self.pending_open.is_none()
-            && self.screens.browse.settled(b, &self.player.library())
+            && !self.pending_queue
+            && self
+                .screens
+                .browse
+                .settled(b, &self.player.library(), self.soulseek_seen.as_ref())
     }
 }
 
@@ -341,7 +379,13 @@ fn startup_screens(args: &Args, ask_scan: bool) -> Screens {
         perform: args.perform.unwrap_or_default(),
         ..Screens::default()
     };
-    screens.browse.keyboard = args.search.is_some();
+    screens.browse.keyboard = args.search.is_some() && !args.queue;
+    if let Some(s) = args.search_source {
+        screens.browse.source = s;
+    }
+    if args.settings {
+        screens.screen = ScreenKind::Settings;
+    }
     screens.browse.side = args.info;
     screens.browse.ask_scan = ask_scan && !args.scan;
     screens
