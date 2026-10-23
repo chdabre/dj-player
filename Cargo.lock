@@ -3302,6 +3302,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9676b89cd56310a87b93dec47b11af744f34d5fc9f367b829474eec0a891350d"
 
 [[package]]
+name = "soulseek"
+version = "0.1.0"
+dependencies = [
+ "soulseek-rs-lib",
+]
+
+[[package]]
+name = "soulseek-rs-lib"
+version = "19.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe616956fd53a0e707357af3995902df20fda5af97ea7fba6aec0918a694120d"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "spirv"
 version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4170,6 +4186,7 @@ dependencies = [
  "player-api",
  "png",
  "pollster",
+ "soulseek",
  "waveform",
  "wgpu",
  "winit",
