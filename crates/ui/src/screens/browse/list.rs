@@ -1,4 +1,5 @@
-//! The list and its header: the path and the chips (SEARCH, SORT, SCAN, ANALYZE ALL), seven
+//! The list and its header: the path and the chips (SEARCH, SORT, SCAN, ANALYZE ALL, and
+//! the search's sources), seven
 //! rows with jacket, title, artist and details, and the scroll bar.
 
 use super::*;
@@ -38,6 +39,11 @@ pub(super) const SORT_CHIP: (f32, f32) = (796.0, 114.0);
 pub(super) const SCAN_CHIP: (f32, f32) = (706.0, 84.0);
 
 pub(super) const ANALYZE_CHIP: (f32, f32) = (576.0, 124.0);
+
+/// While searching, the source chips left of SORT: LIBRARY, SOULSEEK.
+pub(super) const LIBRARY_CHIP: (f32, f32) = (586.0, 100.0);
+
+pub(super) const SOULSEEK_CHIP: (f32, f32) = (690.0, 100.0);
 
 /// The chips' touch targets run from the section's top to the first row.
 const CHIP_HIT: (f32, f32) = (66.0, LIST_Y - 66.0);
@@ -102,13 +108,31 @@ fn chips(ui: &mut Ui, b: &BrowseView) -> f32 {
         "SEARCH",
         b.searching,
     );
-    chip(
-        ui,
-        Target::Browse(BrowseTarget::Sort),
-        SORT_CHIP,
-        &format!("SORT: {}", b.sort),
-        false,
-    );
+    // SoulSeek's hits are in quality order.
+    if b.search_source == SearchSource::Library || !b.searching {
+        chip(
+            ui,
+            Target::Browse(BrowseTarget::Sort),
+            SORT_CHIP,
+            &format!("SORT: {}", b.sort),
+            false,
+        );
+    }
+    if b.searching {
+        for (source, pos, label) in [
+            (SearchSource::Library, LIBRARY_CHIP, "LIBRARY"),
+            (SearchSource::Soulseek, SOULSEEK_CHIP, "SOULSEEK"),
+        ] {
+            chip(
+                ui,
+                Target::Browse(BrowseTarget::SearchSource(source)),
+                pos,
+                label,
+                b.search_source == source,
+            );
+        }
+        return LIBRARY_CHIP.0;
+    }
     if b.library && b.can_scan && b.scan.is_none() {
         chip(
             ui,

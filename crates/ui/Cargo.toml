@@ -21,6 +21,7 @@ standin = []
 engined = { path = "../engined" }
 player-api.workspace = true
 browser.workspace = true
+soulseek.workspace = true
 waveform = { workspace = true, default-features = false }
 assert_no_alloc.workspace = true
 wgpu = "30"

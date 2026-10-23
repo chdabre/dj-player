@@ -10,7 +10,10 @@ use std::sync::Arc;
 use browser::{Browser, Entered, Kind, Source};
 use player_api::Listing;
 
-use super::{BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, Shift, key_char};
+use super::{
+    BACKSPACE, BrowseTarget, CLEAR, DONE, ROW_H, SHIFT, SearchSource, Shift, SoulseekSearch,
+    key_char,
+};
 use winit::keyboard::{Key, NamedKey};
 
 use super::editing::Editing;
@@ -57,6 +60,10 @@ pub struct BrowseState {
     pub editing: Editing,
     /// Ask whether to scan this stick (it had no library).
     pub ask_scan: bool,
+    /// What the search looks through (kept from one search to the next).
+    pub source: SearchSource,
+    /// The SoulSeek search's query and cursor.
+    pub soulseek: SoulseekSearch,
     list_drag: Option<ListDrag>,
     /// The unanalysed track count, and the listing it was counted from.
     unanalysed: RefCell<Option<(Arc<Listing>, usize)>>,
@@ -82,7 +89,8 @@ impl BrowseState {
 
     /// A key of a real keyboard, before the shortcuts: true if the focus took it. The
     /// question takes Enter (scan) and Esc; a name takes the keys, Enter names it and Esc gives
-    /// up; the search takes characters, but Enter and Esc still browse.
+    /// up; the search takes characters, but Enter and Esc still browse (except that Enter
+    /// sends a SoulSeek search).
     pub fn key(&mut self, key: &KeyPress, cx: &mut Cx) -> bool {
         let esc = key.key == Key::Named(NamedKey::Escape);
         match self.focus() {
@@ -109,7 +117,7 @@ impl BrowseState {
             }
             Focus::Search => {
                 let chars = keymap::typed(key);
-                if chars.is_empty() || chars == [DONE] {
+                if chars.is_empty() || (chars == [DONE] && !self.on_soulseek(cx)) {
                     return false;
                 }
                 if key.pressed {
@@ -146,6 +154,7 @@ impl BrowseState {
             BrowseTarget::ScanYes => self.answer_scan(true, cx),
             BrowseTarget::ScanNo => self.answer_scan(false, cx),
             BrowseTarget::Key(i) => self.screen_key(i, cx),
+            BrowseTarget::SearchSource(s) => self.set_source(s, cx),
             BrowseTarget::Row(row) => {
                 self.list_drag = Some(ListDrag {
                     y,
@@ -166,10 +175,8 @@ impl BrowseState {
         if d.moved {
             // The list moves with the finger: dragging up shows later rows.
             let want = (-travel / ROW_H).round() as isize;
-            if want != d.scrolled
-                && let Some(b) = cx.browser.as_deref_mut()
-            {
-                b.scroll_by(want - d.scrolled);
+            if want != d.scrolled {
+                self.scroll_by(want - d.scrolled, cx);
                 d.scrolled = want;
             }
         }
@@ -216,8 +223,27 @@ impl BrowseState {
         None
     }
 
+    /// Scroll the list by `rows` (the wheel, a drag).
+    pub fn scroll_by(&mut self, rows: isize, cx: &mut Cx) {
+        if self.on_soulseek(cx) {
+            self.soulseek_scroll(rows, cx);
+        } else if let Some(b) = cx.browser.as_deref_mut() {
+            b.scroll_by(rows);
+        }
+    }
+
     /// The knob and BACK on the list.
     fn list_nav(&mut self, n: Nav, cx: &mut Cx) -> Show {
+        // On SoulSeek the knob is on the hits; BACK leaves the search as it does on the stick.
+        if self.on_soulseek(cx) && n != Nav::Back {
+            match n {
+                Nav::Up => self.soulseek_move(-1, cx),
+                Nav::Down => self.soulseek_move(1, cx),
+                Nav::Push => self.soulseek_pick(cx),
+                _ => {}
+            }
+            return None;
+        }
         let b = cx.browser.as_deref_mut()?;
         match n {
             Nav::Tag | Nav::Untag => {}
@@ -241,6 +267,9 @@ impl BrowseState {
     /// A tap on shown row `row`: a folder opens; a track is selected, and loads if it was
     /// selected already.
     fn tap_row(&mut self, row: usize, cx: &mut Cx) {
+        if self.on_soulseek(cx) {
+            return self.soulseek_tap(row, cx);
+        }
         let Some(b) = cx.browser.as_deref_mut() else {
             return;
         };
@@ -308,6 +337,9 @@ impl BrowseState {
 
     /// A key typed into the search (on-screen keyboard or a real one).
     pub fn type_char(&mut self, c: char, cx: &mut Cx) {
+        if self.on_soulseek(cx) {
+            return self.type_soulseek(c, cx);
+        }
         let Some(b) = cx.browser.as_deref_mut() else {
             return;
         };

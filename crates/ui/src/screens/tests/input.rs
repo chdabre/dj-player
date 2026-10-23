@@ -191,3 +191,147 @@ fn the_search_field_types_but_enter_and_esc_still_browse() {
     assert!(fx.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A key on the browse screen, with SoulSeek's `net`.
+fn typed(
+    s: &mut Screens,
+    d: &crate::app::engine::DeckSnapshot,
+    b: &mut browser::Browser,
+    fx: &mut Vec<Effect>,
+    net: &soulseek::Snapshot,
+    k: winit::keyboard::Key,
+) -> bool {
+    let mut c = cx(d, Some(b), fx);
+    c.soulseek = Some(net);
+    s.browse.key(&key(k), &mut c)
+}
+
+/// A browse control, with SoulSeek's `net`.
+fn with(
+    s: &mut Screens,
+    d: &crate::app::engine::DeckSnapshot,
+    b: &mut browser::Browser,
+    fx: &mut Vec<Effect>,
+    net: &soulseek::Snapshot,
+    n: Nav,
+) {
+    let mut c = cx(d, Some(b), fx);
+    c.soulseek = Some(net);
+    s.nav(n, &mut c);
+}
+
+#[test]
+fn soulseek_searches_on_done_and_a_picked_hit_downloads_then_loads() {
+    use soulseek::{Format, Hit, Quality, Snapshot, Status, Transfer};
+    use std::sync::Arc;
+    use winit::keyboard::{Key, NamedKey, SmolStr};
+    let d = deck(None);
+    let (mut b, dir) = stick("soulseek");
+    let mut fx = Vec::new();
+    let mut s = Screens::default();
+    let mut net = Snapshot::default();
+    s.search(&mut cx(&d, Some(&mut b), &mut fx));
+    // What was typed for the stick comes along to SoulSeek.
+    typed(
+        &mut s,
+        &d,
+        &mut b,
+        &mut fx,
+        &net,
+        Key::Character(SmolStr::new("a")),
+    );
+    let chip = |src| {
+        hit(
+            Target::Browse(BrowseTarget::SearchSource(src)),
+            Rect::default(),
+        )
+    };
+    s.tap(
+        chip(browse::SearchSource::Soulseek),
+        (0.0, 0.0),
+        &mut cx(&d, Some(&mut b), &mut fx),
+    );
+    assert_eq!(s.browse.soulseek.query, "a");
+    // Typing doesn't search; Enter (DONE) does, and the field takes it.
+    typed(
+        &mut s,
+        &d,
+        &mut b,
+        &mut fx,
+        &net,
+        Key::Character(SmolStr::new("b")),
+    );
+    assert!(fx.is_empty());
+    assert!(typed(
+        &mut s,
+        &d,
+        &mut b,
+        &mut fx,
+        &net,
+        Key::Named(NamedKey::Enter)
+    ));
+    assert_eq!(
+        said(&fx),
+        [format!("{:?}", Effect::SoulseekSearch("ab".into()))]
+    );
+    assert!(!s.browse.keyboard, "the keyboard goes down for the hits");
+    fx.clear();
+
+    // Hits arrive; the knob moves down one and pushes: a download.
+    let hits: Vec<Hit> = ["x.mp3", "y.flac"]
+        .iter()
+        .map(|n| Hit {
+            user: "peer".into(),
+            path: format!("@@share\\{n}"),
+            size: 1,
+            quality: Quality::new(Format::of(n).unwrap(), &Default::default()),
+            free_slot: true,
+            speed: 1,
+        })
+        .collect();
+    net.status = Status::Searching;
+    net.hits = Arc::new(hits.clone());
+    with(&mut s, &d, &mut b, &mut fx, &net, Nav::Down);
+    with(&mut s, &d, &mut b, &mut fx, &net, Nav::Push);
+    assert_eq!(
+        said(&fx),
+        [format!("{:?}", Effect::Download(hits[1].clone()))]
+    );
+    fx.clear();
+    // Under way: pushing again does nothing. Downloaded: it loads.
+    net.transfers.insert(hits[1].key(), Transfer::Queued);
+    with(&mut s, &d, &mut b, &mut fx, &net, Nav::Push);
+    assert!(fx.is_empty());
+    let file = dir.join("SoulSeek Downloads/y.flac");
+    net.transfers
+        .insert(hits[1].key(), Transfer::Done(file.clone()));
+    with(&mut s, &d, &mut b, &mut fx, &net, Nav::Push);
+    assert_eq!(said(&fx), [format!("{:?}", Effect::Load(file))]);
+
+    // BACK leaves the search; the source is kept for the next one.
+    with(&mut s, &d, &mut b, &mut fx, &net, Nav::Back);
+    assert!(b.search_query().is_none());
+    assert_eq!(s.browse.source, browse::SearchSource::Soulseek);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn without_an_account_soulseek_says_so_and_sends_nothing() {
+    use winit::keyboard::{Key, NamedKey};
+    let d = deck(None);
+    let (mut b, dir) = stick("soulseek-none");
+    let mut fx = Vec::new();
+    let mut s = Screens::default();
+    s.search(&mut cx(&d, Some(&mut b), &mut fx));
+    s.browse.source = browse::SearchSource::Soulseek;
+    s.browse.soulseek.query = "x".into();
+    s.browse.key(
+        &key(Key::Named(NamedKey::Enter)),
+        &mut cx(&d, Some(&mut b), &mut fx),
+    );
+    assert!(fx.is_empty());
+    let v = s.browse.view(&b, &Default::default(), None, None);
+    assert!(v.empty.unwrap().contains("SOULSEEK_USERNAME"));
+    assert!(v.header.starts_with("SOULSEEK:  x"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use browser::{Browser, Source};
+use soulseek::Snapshot;
 
 use super::{BrowseState, BrowseTarget, DeckDisplay, HitBox, PerfState, ScreenKind, Target};
 use super::{chrome, perform};
@@ -18,6 +19,8 @@ pub struct Cx<'a> {
     pub deck: &'a DeckSnapshot,
     pub browser: Option<&'a mut Browser>,
     pub library: LibraryView<'a>,
+    /// What SoulSeek has, as of this frame; `None` without an account (or a stick).
+    pub soulseek: Option<&'a Snapshot>,
     /// The file on the deck, if any.
     pub loaded: Option<&'a Path>,
     /// The playhead the last frame showed (frames).
@@ -117,10 +120,8 @@ impl Screens {
 
     /// The mouse wheel turned `rows` over the device screen.
     pub fn wheel(&mut self, rows: i32, cx: &mut Cx) {
-        if self.screen == ScreenKind::Browse
-            && let Some(b) = cx.browser.as_deref_mut()
-        {
-            b.scroll_by(rows as isize);
+        if self.screen == ScreenKind::Browse {
+            self.browse.scroll_by(rows as isize, cx);
         }
     }
 

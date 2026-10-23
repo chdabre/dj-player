@@ -122,6 +122,16 @@ fn browse_screen_fits_and_targets_do_not_overlap() {
             ..base.clone()
         },
         BrowseView {
+            searching: true,
+            keyboard: true,
+            library: true,
+            can_scan: true,
+            unanalysed: 12,
+            search_source: browse::SearchSource::Soulseek,
+            header: "SOULSEEK:  burial archangel▏  ·  SEARCHING 120".into(),
+            ..base.clone()
+        },
+        BrowseView {
             has_tracks: false,
             ..base.clone()
         },
@@ -244,12 +254,26 @@ fn browse_screen_fits_and_targets_do_not_overlap() {
             assert!(scene.texts().any(|t| &t.text == h));
         }
         assert_eq!(has(Target::Browse(BrowseTarget::Back)), !b.at_root);
-        assert_eq!(
-            has(Target::Browse(BrowseTarget::Scan)),
-            b.library && b.scan.is_none()
-        );
+        // While searching, the source chips take the library's place.
+        let managing = b.library && b.scan.is_none() && !b.searching;
+        assert_eq!(has(Target::Browse(BrowseTarget::Scan)), managing);
         assert_eq!(has(Target::Browse(BrowseTarget::ScanYes)), b.ask_scan);
-        let analyze = b.library && b.scan.is_none() && (b.unanalysed > 0 || b.analyzing.is_some());
+        let sources = [
+            browse::SearchSource::Library,
+            browse::SearchSource::Soulseek,
+        ];
+        for src in sources {
+            assert_eq!(
+                has(Target::Browse(BrowseTarget::SearchSource(src))),
+                b.searching
+            );
+        }
+        let soulseek = b.searching && b.search_source == browse::SearchSource::Soulseek;
+        assert_eq!(has(Target::Browse(BrowseTarget::Sort)), !soulseek);
+        if soulseek && b.keyboard {
+            assert!(scene.texts().any(|t| t.text == "SEARCH" && t.y > 400.0));
+        }
+        let analyze = managing && (b.unanalysed > 0 || b.analyzing.is_some());
         assert_eq!(has(Target::Browse(BrowseTarget::AnalyzeAll)), analyze);
         if b.analyzing.is_some() {
             assert!(scene.texts().any(|t| t.text == "ANALYZING 3 / 12"));

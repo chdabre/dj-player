@@ -53,6 +53,7 @@ pub fn cx<'a>(
         deck,
         browser,
         library: LibraryView::default(),
+        soulseek: None,
         loaded: None,
         shown: None,
         effects: fx,

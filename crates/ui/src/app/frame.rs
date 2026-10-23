@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use browser::Browser;
 use player_api::Persistence;
+use soulseek::Soulseek;
 
 use super::App;
 use super::capture::write_png;
@@ -45,6 +46,7 @@ impl App {
             .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         self.last_frame = Some(now);
         self.player.tick_controls(dt);
+        self.soulseek_seen = self.soulseek.as_ref().map(Soulseek::snapshot);
         // Held controls act before the deck is read, as a press would.
         self.apply_effects();
         self.deck = self.player.deck();
@@ -172,9 +174,11 @@ impl App {
         }
         let library = self.player.library();
         let loaded = self.on_deck.as_ref().map(|d| d.file.as_path());
-        self.browser
-            .as_ref()
-            .map(|b| self.screens.browse.view(b, &library, loaded))
+        self.browser.as_ref().map(|b| {
+            self.screens
+                .browse
+                .view(b, &library, self.soulseek_seen.as_ref(), loaded)
+        })
     }
 
     /// The INFO screen's view, when it is up.

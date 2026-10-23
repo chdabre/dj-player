@@ -5,16 +5,24 @@ use std::path::Path;
 
 use browser::{Browser, Entry, Kind, Source, Tags};
 use player_api::PlaylistKind;
+use soulseek::Snapshot;
 
 use super::editing::Modal;
 use super::state::BrowseState;
-use super::{BrowseView, InfoView, ModalView, ROWS, Row, RowKind, length};
+use super::{BrowseView, InfoView, ModalView, ROWS, Row, RowKind, SearchSource, length};
 use crate::app::engine::LibraryView;
 use crate::app::track::track_title;
 
 impl BrowseState {
-    /// What the browse screen shows of the browser; `loaded` is the file on the deck.
-    pub fn view(&self, b: &Browser, lib: &LibraryView, loaded: Option<&Path>) -> BrowseView {
+    /// What the browse screen shows of the browser (or, searching there, of SoulSeek);
+    /// `loaded` is the file on the deck.
+    pub fn view(
+        &self,
+        b: &Browser,
+        lib: &LibraryView,
+        soulseek: Option<&Snapshot>,
+        loaded: Option<&Path>,
+    ) -> BrowseView {
         let l = b.level();
         let rows = l
             .entries
@@ -29,13 +37,14 @@ impl BrowseState {
         let empty = empty(b, query, library);
         let scan = lib.scan.filter(|&(done, total)| done < total || total == 0);
         let side = self.side.then(|| info_view(b, library, loaded)).flatten();
-        BrowseView {
+        let mut v = BrowseView {
             side,
             header,
             at_root: b.at_root(),
             library,
             sort: b.sort_label(),
             searching: query.is_some(),
+            search_source: self.source,
             keyboard: (self.keyboard && query.is_some()) || self.editing.naming(),
             shift: self.shift,
             tag_list: b.source() == Source::TagList,
@@ -69,12 +78,19 @@ impl BrowseState {
             total: l.entries.len(),
             empty,
             has_tracks: l.entries.iter().any(|e| e.kind == Kind::Track),
+        };
+        if query.is_some() && self.source == SearchSource::Soulseek {
+            self.soulseek_view(&mut v, soulseek, loaded);
         }
+        v
     }
 
     /// The shown rows' tags have all been read, and the library has said what it has (for
     /// screenshots).
     pub fn settled(&self, b: &Browser, lib: &LibraryView) -> bool {
+        if b.search_query().is_some() && self.source == SearchSource::Soulseek {
+            return true;
+        }
         if (b.source() != Source::Folders && (lib.listing.is_none() || lib.playlists.is_none()))
             || lib.scanning()
         {

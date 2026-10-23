@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use player_api::DeckCommand;
 use player_api::{Edit, PlaylistId};
+use soulseek::Hit;
 
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -29,6 +30,10 @@ pub enum Effect {
     /// Analyse these files in a batch.
     AnalyzeAll(Vec<PathBuf>),
     StopAnalyzeAll,
+    /// Search SoulSeek for this.
+    SoulseekSearch(String),
+    /// Download this SoulSeek hit into the stick's downloads folder.
+    Download(Hit),
 }
 
 /// Effects in the order they were asked for.

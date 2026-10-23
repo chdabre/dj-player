@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use browser::Browser;
 use player_api::{DeckCommand, OnDeck, Port};
+use soulseek::{Credentials, DOWNLOADS_DIR, Snapshot, Soulseek};
 use winit::keyboard::ModifiersState;
 
 use crate::args::{self, Args};
@@ -56,6 +57,11 @@ pub struct App {
     track: Track,
     /// The stick's folder tree, when there is a stick (`LIBRARY_DIR`).
     browser: Option<Browser>,
+    /// The SoulSeek client, with a stick and an account (`SOULSEEK_USERNAME`,
+    /// `SOULSEEK_PASSWORD`); it downloads into the stick's [`DOWNLOADS_DIR`].
+    soulseek: Option<Soulseek>,
+    /// What it had at the start of the frame: what the screen shows and input acts on.
+    soulseek_seen: Option<Snapshot>,
     /// A `--search` query still to start.
     pending_search: Option<String>,
     /// Which screen is up, each screen's state, and the touch in progress.
@@ -106,6 +112,10 @@ impl App {
         };
         let deck = player.deck();
         let on_deck = player.on_deck();
+        let soulseek = root
+            .as_ref()
+            .zip(Credentials::from_env())
+            .map(|(r, c)| Soulseek::start(c, r.join(DOWNLOADS_DIR)));
         let browser = root.map(|r| {
             let mut b = Browser::new(r, ROWS);
             if let Some(s) = args.sort {
@@ -129,6 +139,8 @@ impl App {
             track,
             player,
             browser,
+            soulseek,
+            soulseek_seen: None,
             // Applied once the library's listing is in (a library search needs it).
             pending_search: args.search.clone(),
             screens,
@@ -179,6 +191,7 @@ impl App {
             deck: &self.deck,
             browser: self.browser.as_mut(),
             library: self.player.library(),
+            soulseek: self.soulseek_seen.as_ref(),
             loaded: self.on_deck.as_ref().map(|d| d.file.as_path()),
             shown: self.track.last_shown.map(|(_, p)| p),
             effects: &mut self.effects,
@@ -230,6 +243,16 @@ impl App {
                     }
                 }
                 Effect::StopAnalyzeAll => self.player.stop_analyze_all(),
+                Effect::SoulseekSearch(query) => {
+                    if let Some(s) = &self.soulseek {
+                        s.search(&query);
+                    }
+                }
+                Effect::Download(hit) => {
+                    if let Some(s) = &self.soulseek {
+                        s.download(&hit);
+                    }
+                }
             }
         }
     }
