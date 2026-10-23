@@ -41,6 +41,7 @@ pub fn view(deck: &DeckSnapshot) -> View<'_> {
         save: Some(SaveState::Unsaved),
         browse: None,
         info: None,
+        settings: None,
     }
 }
 
@@ -53,6 +54,7 @@ pub fn cx<'a>(
         deck,
         browser,
         library: LibraryView::default(),
+        soulseek: None,
         loaded: None,
         shown: None,
         effects: fx,

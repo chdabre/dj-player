@@ -139,8 +139,15 @@ impl App {
                 return;
             }
         }
+        if screen == ScreenKind::Settings {
+            let (screens, mut cx) = self.split();
+            if screens.settings.key(&key, &mut cx) {
+                return;
+            }
+        }
         let ctx = KeyContext {
-            browsing,
+            // The arrows and Enter move through the settings as through a list.
+            browsing: browsing || screen == ScreenKind::Settings,
             info: screen == ScreenKind::Info,
             shift: self.modifiers.shift_key(),
         };

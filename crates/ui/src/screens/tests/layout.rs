@@ -122,6 +122,34 @@ fn browse_screen_fits_and_targets_do_not_overlap() {
             ..base.clone()
         },
         BrowseView {
+            searching: true,
+            keyboard: true,
+            library: true,
+            can_scan: true,
+            unanalysed: 12,
+            search_source: browse::SearchSource::Soulseek,
+            header: "SOULSEEK:  burial archangel▏  ·  SEARCHING 120".into(),
+            queue_chip: Some("QUEUE 12 · 100 %".into()),
+            queue_lit: true,
+            ..base.clone()
+        },
+        BrowseView {
+            library: true,
+            can_scan: true,
+            unanalysed: 12,
+            analyzing: Some((3, 12, false)),
+            queue_chip: Some("QUEUE · 3".into()),
+            ..base.clone()
+        },
+        BrowseView {
+            header: "DOWNLOADS".into(),
+            queue_chip: Some("QUEUE 2 · 43 %".into()),
+            queue_lit: true,
+            queue_open: true,
+            cancel: Some("CANCEL"),
+            ..base.clone()
+        },
+        BrowseView {
             has_tracks: false,
             ..base.clone()
         },
@@ -244,12 +272,39 @@ fn browse_screen_fits_and_targets_do_not_overlap() {
             assert!(scene.texts().any(|t| &t.text == h));
         }
         assert_eq!(has(Target::Browse(BrowseTarget::Back)), !b.at_root);
+        // While searching, the source chips take the library's place; the queue has only
+        // its own.
+        let managing = b.library && b.scan.is_none() && !b.searching && !b.queue_open;
         assert_eq!(
-            has(Target::Browse(BrowseTarget::Scan)),
-            b.library && b.scan.is_none()
+            has(Target::Browse(BrowseTarget::Queue)),
+            b.queue_chip.is_some()
         );
+        assert_eq!(
+            has(Target::Browse(BrowseTarget::Cancel)),
+            b.cancel.is_some()
+        );
+        assert_eq!(has(Target::Browse(BrowseTarget::Search)), !b.queue_open);
+        assert_eq!(has(Target::Browse(BrowseTarget::Scan)), managing);
         assert_eq!(has(Target::Browse(BrowseTarget::ScanYes)), b.ask_scan);
-        let analyze = b.library && b.scan.is_none() && (b.unanalysed > 0 || b.analyzing.is_some());
+        let sources = [
+            browse::SearchSource::Library,
+            browse::SearchSource::Soulseek,
+        ];
+        for src in sources {
+            assert_eq!(
+                has(Target::Browse(BrowseTarget::SearchSource(src))),
+                b.searching && !b.queue_open
+            );
+        }
+        let soulseek = b.searching && b.search_source == browse::SearchSource::Soulseek;
+        assert_eq!(
+            has(Target::Browse(BrowseTarget::Sort)),
+            !soulseek && !b.queue_open
+        );
+        if soulseek && b.keyboard {
+            assert!(scene.texts().any(|t| t.text == "SEARCH" && t.y > 400.0));
+        }
+        let analyze = managing && (b.unanalysed > 0 || b.analyzing.is_some());
         assert_eq!(has(Target::Browse(BrowseTarget::AnalyzeAll)), analyze);
         if b.analyzing.is_some() {
             assert!(scene.texts().any(|t| t.text == "ANALYZING 3 / 12"));
@@ -416,4 +471,64 @@ fn builds_without_a_grid() {
         &mut scene,
     );
     assert!(scene.texts().any(|t| t.text == "--.-"));
+}
+
+#[test]
+fn settings_screen_fits_and_its_keyboard_covers_the_lower_bands() {
+    use crate::screens::settings::{ROWS, SettingsState};
+    let d = deck(None);
+    let mut state = SettingsState::default();
+    let quiet = state.view(None);
+    state.editing = Some((crate::screens::settings::Field::Password, "x".repeat(200)));
+    let typing = state.view(None);
+    for s in [&quiet, &typing] {
+        let mut v = view(&d);
+        v.screen = ScreenKind::Settings;
+        v.settings = Some(s);
+        let mut scene = Scene::default();
+        let hits = build(
+            &v,
+            &Theme::default(),
+            &mut OverviewCache::default(),
+            &mut scene,
+        );
+        for r in scene.rects() {
+            assert!(
+                r.x >= 0.0 && r.y >= 0.0 && r.x + r.w <= 1024.0 + 0.5 && r.y + r.h <= 600.0,
+                "{r:?}"
+            );
+        }
+        for (i, a) in hits.iter().enumerate() {
+            for b in &hits[i + 1..] {
+                assert!(
+                    !a.rect.overlaps(b.rect),
+                    "{:?} overlaps {:?}",
+                    a.target,
+                    b.target
+                );
+            }
+        }
+        let rows = hits
+            .iter()
+            .filter(|h| matches!(h.target, Target::Settings(SettingsTarget::Row(_))))
+            .inspect(|h| assert!(h.rect.bottom() <= 391.0, "{h:?} is in the body"))
+            .count();
+        assert_eq!(rows, ROWS.len());
+        let keys = hits
+            .iter()
+            .filter(|h| matches!(h.target, Target::Settings(SettingsTarget::Key(_))))
+            .count();
+        assert_eq!(keys > 0, s.editing);
+        assert!(
+            hits.iter()
+                .any(|h| h.target == Target::Chrome(ChromeTarget::Menu))
+        );
+        // A long value stays in its row.
+        assert!(
+            scene
+                .texts()
+                .filter(|t| t.text.starts_with("xxx"))
+                .all(|t| t.max_width.is_some())
+        );
+    }
 }

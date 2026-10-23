@@ -2,6 +2,7 @@
 //! library's save state and the UI's own state.
 
 use super::browse::{BrowseView, InfoView};
+use super::settings::SettingsView;
 use super::{PerfState, ScreenKind, Target};
 use crate::app::engine::DeckSnapshot;
 use crate::waves::WaveSettings;
@@ -28,6 +29,8 @@ pub struct View<'a> {
     pub browse: Option<&'a BrowseView>,
     /// The INFO screen's track.
     pub info: Option<&'a InfoView>,
+    /// The settings screen.
+    pub settings: Option<&'a SettingsView>,
 }
 
 /// What the status band says about the library.

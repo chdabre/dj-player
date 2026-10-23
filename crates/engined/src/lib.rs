@@ -12,7 +12,7 @@
 
 mod analysis;
 pub mod batch;
-mod config;
+pub mod config;
 pub mod controls;
 mod player;
 pub mod store;

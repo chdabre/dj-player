@@ -134,8 +134,9 @@ pub fn key_char(i: u8) -> Option<char> {
     keys().nth(usize::from(i)).map(|k| k.1)
 }
 
-/// The search keyboard, over the status band and the bottom strip.
-pub(super) fn keyboard(ui: &mut Ui, shift: Shift) {
+/// The search keyboard, over the status band and the bottom strip; `done` labels DONE (which
+/// starts a SoulSeek search), and `target` names key `i`'s touch target (the screen it is on).
+pub(crate) fn keyboard(ui: &mut Ui, shift: Shift, done: &str, target: impl Fn(u8) -> Target) {
     let t = ui.t;
     let Rect { x: x0, y: y0, w, h } = KEYBOARD;
     ui.section(Rect::new(x0, y0, w, h));
@@ -160,6 +161,7 @@ pub(super) fn keyboard(ui: &mut Ui, shift: Shift) {
             // Letters show the case they type.
             let shown = match (ch, shift) {
                 (SHIFT, Shift::Lock) => "CAPS".to_string(),
+                (DONE, _) => done.to_string(),
                 (c, Shift::Off) if c.is_alphabetic() => label.to_lowercase(),
                 _ => label.to_string(),
             };
@@ -169,7 +171,7 @@ pub(super) fn keyboard(ui: &mut Ui, shift: Shift) {
                 t.text.button
             };
             ui.button_styled(
-                Target::Browse(BrowseTarget::Key(index)),
+                target(index),
                 Rect::new(x, y, kw, row_h),
                 &shown,
                 None,

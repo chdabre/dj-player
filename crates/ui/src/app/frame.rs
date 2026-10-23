@@ -6,10 +6,13 @@ use std::time::{Duration, Instant};
 
 use browser::Browser;
 use player_api::Persistence;
+use soulseek::Soulseek;
 
 use super::App;
 use super::capture::write_png;
+use super::effects::Effect;
 use crate::render;
+use crate::screens::browse::SearchSource;
 use crate::screens::browse::{BrowseView, InfoView};
 use crate::screens::info::{self, OnDeck};
 use crate::screens::{self, SaveState, ScreenKind, View};
@@ -45,6 +48,7 @@ impl App {
             .map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f64());
         self.last_frame = Some(now);
         self.player.tick_controls(dt);
+        self.soulseek_seen = self.soulseek.as_ref().map(Soulseek::snapshot);
         // Held controls act before the deck is read, as a press would.
         self.apply_effects();
         self.deck = self.player.deck();
@@ -96,6 +100,10 @@ impl App {
             if let Some(q) = self.pending_search.take() {
                 b.search_begin();
                 b.set_query(&q);
+                if self.screens.browse.source == SearchSource::Soulseek {
+                    self.screens.browse.soulseek.query = q.clone();
+                    self.effects.push(Effect::SoulseekSearch(q));
+                }
             }
         }
         b.refresh();
@@ -104,6 +112,16 @@ impl App {
 
     /// Start what the CLI asked for once the library was in, and carry out what is pending.
     fn start_requests(&mut self, startup: Startup) {
+        if self.pending_queue
+            && let Some(s) = &self.soulseek_seen
+            && !s.hits.is_empty()
+        {
+            for h in s.hits.iter().take(4) {
+                self.effects.push(Effect::Download(h.clone()));
+            }
+            self.screens.browse.queue = Some(Default::default());
+            self.pending_queue = false;
+        }
         let (screens, mut cx) = self.split();
         if startup.analyze {
             screens.browse.analyze_all(&mut cx);
@@ -130,6 +148,8 @@ impl App {
         wave_style.track_gain = self.track.gain();
         let browse = self.browse_view();
         let info = self.info_view();
+        let settings = (self.screens.screen == ScreenKind::Settings)
+            .then(|| self.screens.settings.view(self.soulseek_seen.as_ref()));
         let view = View {
             deck: &self.deck,
             title: &self.track.title,
@@ -142,6 +162,7 @@ impl App {
             save: self.save_state(),
             browse: browse.as_ref(),
             info: info.as_ref(),
+            settings: settings.as_ref(),
             wave: (!self.track.wave.is_empty()).then_some(screens::Wave {
                 entries: &self.track.wave,
                 entries_per_second: f64::from(waveform::compute::ENTRIES_PER_SECOND),
@@ -172,9 +193,11 @@ impl App {
         }
         let library = self.player.library();
         let loaded = self.on_deck.as_ref().map(|d| d.file.as_path());
-        self.browser
-            .as_ref()
-            .map(|b| self.screens.browse.view(b, &library, loaded))
+        self.browser.as_ref().map(|b| {
+            self.screens
+                .browse
+                .view(b, &library, self.soulseek_seen.as_ref(), loaded)
+        })
     }
 
     /// The INFO screen's view, when it is up.

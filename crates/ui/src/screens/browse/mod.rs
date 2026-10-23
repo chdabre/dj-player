@@ -5,7 +5,11 @@
 //! Tapping a folder opens it; tapping a track selects it and tapping the selected track
 //! loads it. The header goes up a level when not at the top; its chips change the sort
 //! order, search (with an on-screen keyboard in place of the status band) and, in LIBRARY,
-//! scan the stick. A drag on the list scrolls it. The browse knob (stand-in) and the arrow
+//! scan the stick. While searching, the header's source chips choose what is searched: the
+//! stick (LIBRARY) as it is shown, or SoulSeek (`soulseek.rs`), whose hits are listed best
+//! quality first and download into the stick's downloads folder. While there are downloads, a
+//! QUEUE chip shows their progress and opens the queue (`queue.rs`), where one can be
+//! cancelled. A drag on the list scrolls it. The browse knob (stand-in) and the arrow
 //! keys move the cursor, push / Enter loads, BACK / Esc goes up. A stick with no library
 //! asks once whether to scan it.
 
@@ -18,19 +22,22 @@ mod keyboard;
 mod list;
 mod modal;
 mod panels;
+mod queue;
+mod soulseek;
 mod state;
 mod view;
 
 #[cfg(test)]
 pub use keyboard::key_count;
+pub(crate) use keyboard::keyboard;
 pub use keyboard::{BACKSPACE, CLEAR, DONE, SHIFT, Shift, key_char};
 pub(crate) use panels::info_panel;
+pub use soulseek::{HitCursor, SoulseekSearch};
 pub use state::BrowseState;
 #[cfg(test)]
 pub use state::Focus;
 pub(crate) use view::info_fields;
 // The parts' layout constants and drawing, for each other (`use super::*`).
-use keyboard::*;
 use list::*;
 use modal::*;
 use panels::*;
@@ -62,6 +69,20 @@ pub enum BrowseTarget {
     Key(u8),
     /// A row of a modal over the browse list (its index among all the modal's rows).
     ModalRow(u16),
+    /// A source chip of the search.
+    SearchSource(SearchSource),
+    /// The downloads' progress: opens (or closes) the queue.
+    Queue,
+    /// In the queue: cancel the selected download, or take a finished one off.
+    Cancel,
+}
+
+/// What a search looks through: the stick as the browser shows it, or SoulSeek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchSource {
+    #[default]
+    Library,
+    Soulseek,
 }
 
 /// Rows shown at once.
@@ -140,6 +161,8 @@ pub struct BrowseView {
     pub sort: &'static str,
     /// Searching; the keyboard is up.
     pub searching: bool,
+    /// What the search looks through (its chips show while searching).
+    pub search_source: SearchSource,
     pub keyboard: bool,
     /// The keyboard's shift: letters show (and type) in capitals while it is on.
     pub shift: Shift,
@@ -173,6 +196,13 @@ pub struct BrowseView {
     pub modal: Option<ModalView>,
     /// Shown in the header instead of `header` (naming, moving).
     pub header_override: Option<String>,
+    /// The downloads' progress chip (`QUEUE 2 · 43 %`) while there are downloads, lit while
+    /// any is under way.
+    pub queue_chip: Option<String>,
+    pub queue_lit: bool,
+    /// The queue is shown in place of the list; `cancel` labels its action on the selection.
+    pub queue_open: bool,
+    pub cancel: Option<&'static str>,
 }
 
 pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut OverviewCache) {
@@ -207,7 +237,11 @@ pub(crate) fn build(ui: &mut Ui, v: &View, b: &BrowseView, overview: &mut Overvi
         side_panel(ui, side);
     }
     if b.keyboard {
-        keyboard(ui, b.shift);
+        let done = match b.search_source {
+            SearchSource::Soulseek if b.header_override.is_none() => "SEARCH",
+            _ => "DONE",
+        };
+        keyboard(ui, b.shift, done, |i| Target::Browse(BrowseTarget::Key(i)));
     } else {
         status(ui, v);
         bottom(ui, v, overview);

@@ -1,4 +1,5 @@
-//! The list and its header: the path and the chips (SEARCH, SORT, SCAN, ANALYZE ALL), seven
+//! The list and its header: the path and the chips (SEARCH, SORT, SCAN, ANALYZE ALL, and
+//! the search's sources), seven
 //! rows with jacket, title, artist and details, and the scroll bar.
 
 use super::*;
@@ -39,6 +40,14 @@ pub(super) const SCAN_CHIP: (f32, f32) = (706.0, 84.0);
 
 pub(super) const ANALYZE_CHIP: (f32, f32) = (576.0, 124.0);
 
+/// While searching, the source chips left of SORT: LIBRARY, SOULSEEK.
+pub(super) const LIBRARY_CHIP: (f32, f32) = (586.0, 100.0);
+
+pub(super) const SOULSEEK_CHIP: (f32, f32) = (690.0, 100.0);
+
+/// The downloads' progress chip, left of the others.
+pub(super) const QUEUE_W: f32 = 130.0;
+
 /// The chips' touch targets run from the section's top to the first row.
 const CHIP_HIT: (f32, f32) = (66.0, LIST_Y - 66.0);
 
@@ -78,86 +87,101 @@ pub(super) fn header(ui: &mut Ui, b: &BrowseView) {
 fn chips(ui: &mut Ui, b: &BrowseView) -> f32 {
     let t = ui.t;
     let Rect { y, h, .. } = HEADER;
-    let (hit_y, hit_h) = CHIP_HIT;
-    let mut chips_left = SORT_CHIP.0;
-    let chip = |ui: &mut Ui, target: Target, (cx, cw): (f32, f32), label: &str, on: bool| {
-        ui.button_styled(
-            target,
-            Rect::new(cx, y + 1.0, cw, h - 3.0),
-            label,
-            None,
-            on,
-            t.text.small.semibold().color(t.color.text),
-        );
-        // Taller than drawn, for a finger.
-        if let Some(last) = ui.hits.last_mut() {
-            last.rect.y = hit_y;
-            last.rect.h = hit_h;
+    let mut left = if b.queue_open {
+        if let Some(label) = b.cancel {
+            chip(ui, BrowseTarget::Cancel, SEARCH_CHIP, label, false);
         }
+        SEARCH_CHIP.0
+    } else {
+        source_chips(ui, b)
     };
-    chip(
-        ui,
-        Target::Browse(BrowseTarget::Search),
-        SEARCH_CHIP,
-        "SEARCH",
-        b.searching,
-    );
-    chip(
-        ui,
-        Target::Browse(BrowseTarget::Sort),
-        SORT_CHIP,
-        &format!("SORT: {}", b.sort),
-        false,
-    );
-    if b.library && b.can_scan && b.scan.is_none() {
-        chip(
-            ui,
-            Target::Browse(BrowseTarget::Scan),
-            SCAN_CHIP,
-            "SCAN",
-            false,
-        );
-        chips_left = SCAN_CHIP.0;
-        match b.analyzing {
-            Some((done, total, stopping)) => {
-                chip(
-                    ui,
-                    Target::Browse(BrowseTarget::AnalyzeAll),
-                    ANALYZE_CHIP,
-                    if stopping { "STOPPING" } else { "STOP" },
-                    true,
-                );
-                ui.text(
-                    format!("ANALYZING {done} / {total}"),
-                    ANALYZE_CHIP.0 - 10.0,
-                    y + (h - t.font.small * t.font.line_height) * 0.5,
-                    t.text.small.semibold().color(t.color.cue_text).right(),
-                );
-                chips_left = ANALYZE_CHIP.0 - 150.0;
-            }
-            None if b.unanalysed > 0 => {
-                chip(
-                    ui,
-                    Target::Browse(BrowseTarget::AnalyzeAll),
-                    ANALYZE_CHIP,
-                    "ANALYZE ALL",
-                    false,
-                );
-                chips_left = ANALYZE_CHIP.0;
-            }
-            None => {}
-        }
+    // The downloads' progress: it opens the queue.
+    if let Some(label) = &b.queue_chip {
+        let x = left - 6.0 - QUEUE_W;
+        chip(ui, BrowseTarget::Queue, (x, QUEUE_W), label, b.queue_lit);
+        left = x;
     }
-    if let Some((done, total)) = b.scan {
+    let progress = match (b.analyzing, b.scan) {
+        _ if b.searching || b.queue_open => None,
+        (Some((done, total, _)), None) if b.library && b.can_scan => {
+            Some(format!("ANALYZING {done} / {total}"))
+        }
+        (_, Some((done, total))) => Some(format!("SCANNING {done} / {total}")),
+        _ => None,
+    };
+    if let Some(text) = progress {
         ui.text(
-            format!("SCANNING {done} / {total}"),
-            SORT_CHIP.0 - 10.0,
+            text,
+            left - 10.0,
             y + (h - t.font.small * t.font.line_height) * 0.5,
             t.text.small.semibold().color(t.color.cue_text).right(),
         );
-        chips_left = SORT_CHIP.0 - 150.0;
+        left -= 150.0;
     }
-    chips_left
+    left
+}
+
+/// A header chip at (`x`, `w`).
+fn chip(ui: &mut Ui, target: BrowseTarget, (x, w): (f32, f32), label: &str, on: bool) {
+    let t = ui.t;
+    let Rect { y, h, .. } = HEADER;
+    let (hit_y, hit_h) = CHIP_HIT;
+    ui.button_styled(
+        Target::Browse(target),
+        Rect::new(x, y + 1.0, w, h - 3.0),
+        label,
+        None,
+        on,
+        t.text.small.semibold().color(t.color.text),
+    );
+    // Taller than drawn, for a finger.
+    if let Some(last) = ui.hits.last_mut() {
+        last.rect.y = hit_y;
+        last.rect.h = hit_h;
+    }
+}
+
+/// SEARCH, SORT, and then the search's sources, or SCAN and ANALYZE ALL; returns the
+/// leftmost chip's edge.
+fn source_chips(ui: &mut Ui, b: &BrowseView) -> f32 {
+    chip(ui, BrowseTarget::Search, SEARCH_CHIP, "SEARCH", b.searching);
+    // SoulSeek's hits are in quality order.
+    if b.search_source == SearchSource::Library || !b.searching {
+        let sort = format!("SORT: {}", b.sort);
+        chip(ui, BrowseTarget::Sort, SORT_CHIP, &sort, false);
+    }
+    if b.searching {
+        for (source, pos, label) in [
+            (SearchSource::Library, LIBRARY_CHIP, "LIBRARY"),
+            (SearchSource::Soulseek, SOULSEEK_CHIP, "SOULSEEK"),
+        ] {
+            let on = b.search_source == source;
+            chip(ui, BrowseTarget::SearchSource(source), pos, label, on);
+        }
+        return LIBRARY_CHIP.0;
+    }
+    if !(b.library && b.can_scan && b.scan.is_none()) {
+        return SORT_CHIP.0;
+    }
+    chip(ui, BrowseTarget::Scan, SCAN_CHIP, "SCAN", false);
+    match b.analyzing {
+        Some((_, _, stopping)) => {
+            let label = if stopping { "STOPPING" } else { "STOP" };
+            chip(ui, BrowseTarget::AnalyzeAll, ANALYZE_CHIP, label, true);
+            ANALYZE_CHIP.0
+        }
+        None if b.unanalysed > 0 => {
+            chip(
+                ui,
+                BrowseTarget::AnalyzeAll,
+                ANALYZE_CHIP,
+                "ANALYZE ALL",
+                false,
+            );
+            ANALYZE_CHIP.0
+        }
+        None => SCAN_CHIP.0,
+    }
 }
 
 pub(super) fn list(ui: &mut Ui, b: &BrowseView) {

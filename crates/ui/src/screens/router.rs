@@ -5,8 +5,11 @@
 use std::path::Path;
 
 use browser::{Browser, Source};
+use soulseek::Snapshot;
 
-use super::{BrowseState, BrowseTarget, DeckDisplay, HitBox, PerfState, ScreenKind, Target};
+use super::{
+    BrowseState, BrowseTarget, DeckDisplay, HitBox, PerfState, ScreenKind, SettingsState, Target,
+};
 use super::{chrome, perform};
 use crate::app::effects::Effects;
 use crate::app::engine::{DeckSnapshot, LibraryView};
@@ -18,6 +21,8 @@ pub struct Cx<'a> {
     pub deck: &'a DeckSnapshot,
     pub browser: Option<&'a mut Browser>,
     pub library: LibraryView<'a>,
+    /// What SoulSeek has, as of this frame; `None` without an account (or a stick).
+    pub soulseek: Option<&'a Snapshot>,
     /// The file on the deck, if any.
     pub loaded: Option<&'a Path>,
     /// The playhead the last frame showed (frames).
@@ -37,6 +42,7 @@ pub struct Screens {
     pub deck: DeckDisplay,
     pub perform: PerfState,
     pub browse: BrowseState,
+    pub settings: SettingsState,
     /// The target the finger is on (drawn pressed), until it lifts or drags the list.
     pub pressed: Option<Target>,
 }
@@ -67,6 +73,7 @@ impl Screens {
                 }
             }
             Target::Browse(t) => self.browse.tap(t, y, cx),
+            Target::Settings(t) => self.settings.tap(t, cx),
         }
     }
 
@@ -97,6 +104,10 @@ impl Screens {
             self.screen = ScreenKind::Main;
             return;
         }
+        if self.screen == ScreenKind::Settings {
+            let show = self.settings.nav(n, cx);
+            return self.show(show);
+        }
         if n == Nav::Tag || n == Nav::Untag {
             let browsing = self.screen == ScreenKind::Browse;
             return self.browse.tag_track(n == Nav::Untag, browsing, cx);
@@ -117,10 +128,8 @@ impl Screens {
 
     /// The mouse wheel turned `rows` over the device screen.
     pub fn wheel(&mut self, rows: i32, cx: &mut Cx) {
-        if self.screen == ScreenKind::Browse
-            && let Some(b) = cx.browser.as_deref_mut()
-        {
-            b.scroll_by(rows as isize);
+        if self.screen == ScreenKind::Browse {
+            self.browse.scroll_by(rows as isize, cx);
         }
     }
 
@@ -147,6 +156,15 @@ impl Screens {
         if self.browse.search(cx) {
             self.screen = ScreenKind::Browse;
         }
+    }
+
+    /// MENU on a playback screen: the settings, or back to the main screen.
+    pub fn toggle_settings(&mut self) {
+        self.settings.editing = None;
+        self.screen = match self.screen {
+            ScreenKind::Settings => ScreenKind::Main,
+            _ => ScreenKind::Settings,
+        };
     }
 
     /// INFO: in the browser, the selected track's details beside the list (or not); on any

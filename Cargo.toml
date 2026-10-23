@@ -6,7 +6,7 @@ members = ["crates/*", "spikes/*"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-rust-version = "1.89"
+rust-version = "1.91"
 
 [workspace.dependencies]
 engine-core = { path = "crates/engine-core" }
@@ -20,6 +20,7 @@ rekordbox = { path = "crates/rekordbox" }
 surface = { path = "crates/surface" }
 player-api = { path = "crates/player-api" }
 browser = { path = "crates/browser" }
+soulseek = { path = "crates/soulseek" }
 rtrb = "0.4"
 symphonia = { version = "0.6", default-features = false }
 rubato = "5"
@@ -39,6 +40,8 @@ blake3 = { version = "1", default-features = false, features = ["std"] }
 sha2 = "0.10"
 getrandom = "0.3"
 unicode-normalization = "0.1"
+# SoulSeek's protocol (MIT, no dependencies of its own); needs Rust 1.91.
+soulseek-rs-lib = "19.1"
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 
 [workspace.lints.rust]

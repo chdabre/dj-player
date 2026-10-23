@@ -44,6 +44,7 @@ Our own library (the overlay library on the stick or a cloud folder: one SQLite 
 - **Step 2:** the engine part is done; known gaps are in its Status section ([`docs/plan/step-2.md`](docs/plan/step-2.md)). Analysis work is in [`docs/plan/analysis.md`](docs/plan/analysis.md).
 - **UI shell spike:** the main screen at 1024×600 with real waveforms ([`docs/spikes/ui-shell.md`](docs/spikes/ui-shell.md)).
 - **Keylock:** Bungee Basic ported to pure Rust is the only keylock (PR #2); Signalsmith is gone.
+- **SoulSeek downloads (2026-10-23):** the search's second source, in `crates/soulseek` on the UI's side ([`docs/plan/soulseek.md`](docs/plan/soulseek.md)).
 - **Structure pass (2026-10-22):** every crate split into modules, the UI talks to the player through `player-api`'s `Port`, the browser and Rekordbox reading are their own crates, the controls' vocabulary is `surface` ([`docs/plan/structure.md`](docs/plan/structure.md), "Outcome").
 
 ## Working conventions
