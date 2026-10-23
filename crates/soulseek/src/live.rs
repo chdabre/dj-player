@@ -6,18 +6,18 @@ use std::time::Duration;
 
 use soulseek_rs::{Client, ClientSettings, DownloadStatus, SearchResult};
 
-use super::{Credentials, Format, Hit, Network, Progress, Quality};
+use super::{Credentials, Format, Hit, HitKey, Network, Progress, Quality};
 
 /// A SoulSeek session, made when first needed and again after it drops.
 pub struct Live {
-    credentials: Credentials,
+    credentials: Option<Credentials>,
     client: Option<Client>,
     /// Peer responses already read for the search under way.
     responses: usize,
 }
 
 impl Live {
-    pub fn new(credentials: Credentials) -> Self {
+    pub fn new(credentials: Option<Credentials>) -> Self {
         Self {
             credentials,
             client: None,
@@ -31,6 +31,24 @@ impl Live {
 }
 
 impl Network for Live {
+    fn has_account(&self) -> bool {
+        self.credentials.is_some()
+    }
+
+    fn set_account(&mut self, account: Option<Credentials>) {
+        if account != self.credentials {
+            // Dropping the client logs out.
+            self.client = None;
+            self.credentials = account;
+        }
+    }
+
+    fn cancel(&mut self, key: &HitKey) {
+        if let Some(c) = &self.client {
+            let _ = c.cancel_download(&key.user, &key.path);
+        }
+    }
+
     fn connect(&mut self) -> Result<(), String> {
         if self
             .client
@@ -40,7 +58,10 @@ impl Network for Live {
             return Ok(());
         }
         self.client = None;
-        let settings = ClientSettings::new(&self.credentials.user, &self.credentials.password);
+        let Some(account) = &self.credentials else {
+            return Err("no SoulSeek account: set one in MENU".into());
+        };
+        let settings = ClientSettings::new(&account.user, &account.password);
         let mut client = Client::with_settings(settings);
         client.connect().map_err(|e| e.to_string())?;
         match client.login() {

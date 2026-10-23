@@ -1,6 +1,6 @@
 //! The client's thread: it takes searches and downloads from the UI, logs in when first
 //! needed, gathers a search's hits while its window is open (ranked, and published as they
-//! come), and follows each download to its end. The network is behind [`Network`], so all of
+//! come), follows each download to its end or cancels it, and changes account when asked. The network is behind [`Network`], so all of
 //! this runs in tests without one.
 
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{Hit, HitKey, Request, Snapshot, Status, Transfer, best_first};
+use super::{Credentials, Hit, HitKey, Queued, Request, Snapshot, Status, Transfer, best_first};
 
 /// How long a search gathers hits. Peers answer when they get round to it, and the late
 /// ones are often the better sources.
@@ -20,6 +20,10 @@ const POLL: Duration = Duration::from_millis(250);
 
 /// What the worker needs of a SoulSeek network. Calls block at most for a login.
 pub trait Network: Send {
+    /// An account is set.
+    fn has_account(&self) -> bool;
+    /// Use `account` from now on, ending the session under way.
+    fn set_account(&mut self, account: Option<Credentials>);
     /// Log in, unless a session is up.
     fn connect(&mut self) -> Result<(), String>;
     /// Send a search for `query`; the hits arrive later ([`Network::hits`]).
@@ -31,6 +35,8 @@ pub trait Network: Send {
     fn forget(&mut self, query: &str);
     /// Ask `hit`'s peer for the file, to be written to `dir` under [`Hit::name`].
     fn download(&mut self, hit: &Hit, dir: &Path) -> Result<Receiver<Progress>, String>;
+    /// Stop the download of `key`, removing its partial file.
+    fn cancel(&mut self, key: &HitKey);
 }
 
 /// A download's progress, as the network reports it.
@@ -54,6 +60,9 @@ pub(super) struct Worker {
 
 impl Worker {
     pub(super) fn new(net: Box<dyn Network>, dir: PathBuf, shared: Arc<Mutex<Snapshot>>) -> Self {
+        if let Ok(mut s) = shared.lock() {
+            s.account = net.has_account();
+        }
         Self {
             net,
             dir,
@@ -85,7 +94,30 @@ impl Worker {
         match request {
             Request::Search(query) => self.start_search(query.trim(), now),
             Request::Download(hit) => self.start_download(hit),
+            Request::Cancel(key) => self.cancel(&key),
+            Request::Account(account) => {
+                let set = account.is_some();
+                self.net.set_account(account);
+                self.update(|s| {
+                    s.account = set;
+                    // A failed login says nothing about the new account.
+                    if matches!(s.status, Status::Failed(_)) {
+                        s.status = Status::Idle;
+                    }
+                });
+            }
         }
+    }
+
+    /// Stop `key`'s download if it is under way, and take it off the queue.
+    fn cancel(&mut self, key: &HitKey) {
+        if self.downloads.remove(key).is_some() {
+            self.net.cancel(key);
+        }
+        self.update(|s| {
+            s.transfers
+                .retain(|q| q.hit.user != key.user || q.hit.path != key.path)
+        });
     }
 
     fn start_search(&mut self, query: &str, now: Instant) {
@@ -127,9 +159,7 @@ impl Worker {
             }
             Err(e) => Transfer::Failed(e),
         };
-        self.update(|s| {
-            s.transfers.insert(key, transfer);
-        });
+        self.update(|s| set(s, &hit, transfer));
     }
 
     /// Publish new hits, close the search's window, and follow the downloads.
@@ -177,9 +207,26 @@ impl Worker {
                     Progress::Done => Transfer::Done(dir.join(file_name(&key.path))),
                     Progress::Failed(e) => Transfer::Failed(e),
                 };
-                s.transfers.insert(key, transfer);
+                if let Some(q) = s
+                    .transfers
+                    .iter_mut()
+                    .find(|q| q.hit.user == key.user && q.hit.path == key.path)
+                {
+                    q.transfer = transfer;
+                }
             }
         });
+    }
+}
+
+/// `hit`'s place in the queue says `transfer` (at the end, if it has none).
+fn set(s: &mut Snapshot, hit: &Hit, transfer: Transfer) {
+    match s.transfers.iter_mut().find(|q| q.hit.key() == hit.key()) {
+        Some(q) => q.transfer = transfer,
+        None => s.transfers.push(Queued {
+            hit: hit.clone(),
+            transfer,
+        }),
     }
 }
 
@@ -205,9 +252,23 @@ mod tests {
         given: usize,
         senders: Arc<Mutex<Vec<Sender<Progress>>>>,
         forgotten: Arc<Mutex<Vec<String>>>,
+        accounts: Arc<Mutex<Vec<Option<String>>>>,
+        cancelled: Arc<Mutex<Vec<String>>>,
     }
 
     impl Network for Script {
+        fn has_account(&self) -> bool {
+            true
+        }
+
+        fn set_account(&mut self, account: Option<Credentials>) {
+            self.accounts.lock().unwrap().push(account.map(|a| a.user));
+        }
+
+        fn cancel(&mut self, key: &HitKey) {
+            self.cancelled.lock().unwrap().push(key.path.clone());
+        }
+
         fn connect(&mut self) -> Result<(), String> {
             let refused = self.refuse.take();
             self.logins.lock().unwrap().push(refused.is_none());
@@ -369,5 +430,61 @@ mod tests {
             snap(&shared).transfer(&h),
             Some(Transfer::Failed(_))
         ));
+    }
+
+    #[test]
+    fn cancelling_stops_a_download_and_takes_finished_ones_off_the_queue() {
+        let net = Script::default();
+        let (senders, cancelled) = (Arc::clone(&net.senders), Arc::clone(&net.cancelled));
+        let (mut w, shared) = worker(net);
+        let (a, b) = (hit("a.mp3", 320), hit("b.flac", 0));
+        w.handle(Request::Download(a.clone()), Instant::now());
+        w.handle(Request::Download(b.clone()), Instant::now());
+        let order: Vec<_> = snap(&shared)
+            .transfers
+            .iter()
+            .map(|q| q.hit.name().to_string())
+            .collect();
+        assert_eq!(order, ["a.mp3", "b.flac"], "in the order asked for");
+        assert_eq!(snap(&shared).progress(), (2, 0));
+        senders.lock().unwrap()[1].send(Progress::Done).unwrap();
+        w.poll(Instant::now());
+        assert_eq!(snap(&shared).progress(), (1, 0), "one under way");
+
+        w.handle(Request::Cancel(a.key()), Instant::now());
+        assert_eq!(
+            cancelled.lock().unwrap().as_slice(),
+            std::slice::from_ref(&a.path)
+        );
+        w.handle(Request::Cancel(b.key()), Instant::now());
+        assert_eq!(
+            cancelled.lock().unwrap().len(),
+            1,
+            "a finished one is only taken off"
+        );
+        assert!(snap(&shared).transfers.is_empty());
+    }
+
+    #[test]
+    fn a_new_account_clears_a_failed_login() {
+        let net = Script {
+            refuse: Some("Authentication failed".into()),
+            ..Script::default()
+        };
+        let accounts = Arc::clone(&net.accounts);
+        let (mut w, shared) = worker(net);
+        assert!(snap(&shared).account);
+        w.handle(Request::Search("x".into()), Instant::now());
+        w.handle(
+            Request::Account(Some(Credentials {
+                user: "new".into(),
+                password: "p".into(),
+            })),
+            Instant::now(),
+        );
+        assert_eq!(snap(&shared).status, Status::Idle);
+        w.handle(Request::Account(None), Instant::now());
+        assert!(!snap(&shared).account);
+        assert_eq!(*accounts.lock().unwrap(), [Some("new".into()), None]);
     }
 }

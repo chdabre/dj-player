@@ -4,17 +4,22 @@ use std::path::PathBuf;
 
 use library::DeviceId;
 
-/// This device's id, kept next to the player's settings on its own storage
-/// (`$DJPLAYER_CONFIG`, else `$XDG_CONFIG_HOME/djplayer`, else `~/.config/djplayer`), never
-/// on a stick. Made on first use. Returns a warning if it could not be kept.
-pub fn device_id() -> (DeviceId, Option<String>) {
-    let dir = std::env::var_os("DJPLAYER_CONFIG")
+/// The player's settings folder on its own storage: `$DJPLAYER_CONFIG`, else
+/// `$XDG_CONFIG_HOME/djplayer`, else `~/.config/djplayer`.
+pub fn dir() -> Option<PathBuf> {
+    std::env::var_os("DJPLAYER_CONFIG")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|d| PathBuf::from(d).join("djplayer")))
         .or_else(|| {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("djplayer"))
-        });
-    let Some(dir) = dir else {
+        })
+}
+
+/// This device's id, kept next to the player's settings on its own storage
+/// (`$DJPLAYER_CONFIG`, else `$XDG_CONFIG_HOME/djplayer`, else `~/.config/djplayer`), never
+/// on a stick. Made on first use. Returns a warning if it could not be kept.
+pub fn device_id() -> (DeviceId, Option<String>) {
+    let Some(dir) = dir() else {
         return (
             DeviceId::random(),
             Some("no config folder: a new device id for this run".into()),

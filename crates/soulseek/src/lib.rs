@@ -5,18 +5,22 @@
 //! The network runs on a thread of its own ([`worker`]), so nothing here blocks a frame:
 //! [`Soulseek::search`] and [`Soulseek::download`] queue a request, and [`Soulseek::snapshot`]
 //! reads what has come in. It logs in when first asked for something, with the account from
-//! [`Credentials`], and logs in again after the session drops. Nothing is shared with the
-//! network yet.
+//! [`Credentials`] (kept on the player's own storage, [`Credentials::load`]), and logs in
+//! again after the session drops or the account changes. Downloads can be cancelled. Nothing
+//! is shared with the network yet.
 
+mod account;
+mod demo;
 mod live;
 mod quality;
 mod worker;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
+pub use account::ACCOUNT_FILE;
+pub use demo::Demo;
 pub use live::Live;
 pub use quality::{Format, Quality, best_first};
 pub use worker::{Network, Progress};
@@ -129,20 +133,58 @@ impl Transfer {
     }
 }
 
-/// What the client has: the search, its hits best first, and the downloads.
+/// A download in the queue: the file, and where it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    pub hit: Hit,
+    pub transfer: Transfer,
+}
+
+/// What the client has: the account, the search, its hits best first, and the downloads.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
+    /// An account is set (it may still be refused).
+    pub account: bool,
     /// The query last searched for.
     pub query: String,
     pub status: Status,
     /// Best first ([`best_first`]).
     pub hits: Arc<Vec<Hit>>,
-    pub transfers: HashMap<HitKey, Transfer>,
+    /// The downloads, in the order they were asked for (finished ones stay until removed).
+    pub transfers: Vec<Queued>,
 }
 
 impl Snapshot {
     pub fn transfer(&self, hit: &Hit) -> Option<&Transfer> {
-        self.transfers.get(&hit.key())
+        self.queued(&hit.key()).map(|q| &q.transfer)
+    }
+
+    pub fn queued(&self, key: &HitKey) -> Option<&Queued> {
+        self.transfers
+            .iter()
+            .find(|q| q.hit.user == key.user && q.hit.path == key.path)
+    }
+
+    /// Downloads under way, and how far they are together (0–100), counting a queued one
+    /// as not started.
+    pub fn progress(&self) -> (usize, u32) {
+        let (mut n, mut done, mut total) = (0, 0u64, 0u64);
+        for q in &self.transfers {
+            match q.transfer {
+                Transfer::Queued => {
+                    n += 1;
+                    total += q.hit.size;
+                }
+                Transfer::Receiving { done: d, total: t } => {
+                    n += 1;
+                    done += d;
+                    total += t;
+                }
+                _ => {}
+            }
+        }
+        let pct = (done * 100).checked_div(total).unwrap_or(0) as u32;
+        (n, pct.min(100))
     }
 }
 
@@ -151,6 +193,10 @@ impl Snapshot {
 enum Request {
     Search(String),
     Download(Hit),
+    /// Stop a download (removing what it wrote), or take a finished one off the queue.
+    Cancel(HitKey),
+    /// Log in as this account from now on (`None`: no account).
+    Account(Option<Credentials>),
 }
 
 /// A SoulSeek client on its own thread.
@@ -160,9 +206,14 @@ pub struct Soulseek {
 }
 
 impl Soulseek {
-    /// A client logging in as `credentials`, downloading into `dir`.
-    pub fn start(credentials: Credentials, dir: PathBuf) -> Self {
+    /// A client logging in as `credentials` (once there are some), downloading into `dir`.
+    pub fn start(credentials: Option<Credentials>, dir: PathBuf) -> Self {
         Self::with_network(Box::new(Live::new(credentials)), dir)
+    }
+
+    /// A client on the stand-in network ([`Demo`]), for screenshots.
+    pub fn demo(dir: PathBuf) -> Self {
+        Self::with_network(Box::new(Demo::default()), dir)
     }
 
     /// A client on `net` (a stand-in network, for tests), downloading into `dir`.
@@ -187,6 +238,17 @@ impl Soulseek {
         let _ = self.requests.send(Request::Download(hit.clone()));
     }
 
+    /// Stop the download of `key` (its partial file is removed), or take it off the queue
+    /// if it has finished (the file stays).
+    pub fn cancel(&self, key: &HitKey) {
+        let _ = self.requests.send(Request::Cancel(key.clone()));
+    }
+
+    /// Log in as `credentials` from now on; the session under way ends.
+    pub fn set_account(&self, credentials: Option<Credentials>) {
+        let _ = self.requests.send(Request::Account(credentials));
+    }
+
     /// What has come in so far.
     pub fn snapshot(&self) -> Snapshot {
         self.shared.lock().map(|s| s.clone()).unwrap_or_default()
@@ -203,7 +265,7 @@ mod tests {
             user: "u".into(),
             path: "@@abc\\Music/Artist\\01 Track.flac".into(),
             size: 0,
-            quality: Quality::new(Format::Flac, &HashMap::new()),
+            quality: Quality::new(Format::Flac, &Default::default()),
             free_slot: true,
             speed: 0,
         };
