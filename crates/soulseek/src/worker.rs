@@ -1,6 +1,8 @@
 //! The client's thread: it takes searches and downloads from the UI, logs in when first
 //! needed, gathers a search's hits while its window is open (ranked, and published as they
-//! come), follows each download to its end or cancels it, and changes account when asked. The network is behind [`Network`], so all of
+//! come), follows each download to its end or cancels it, and changes account when asked.
+//! A search stops gathering when its window closes, when the DJ leaves it, or when a
+//! download starts. On start it removes the partial files a previous run left behind. The network is behind [`Network`], so all of
 //! this runs in tests without one.
 
 use std::collections::HashMap;
@@ -74,6 +76,7 @@ impl Worker {
 
     /// Serve requests until the client is dropped.
     pub(super) fn run(mut self, requests: Receiver<Request>) {
+        clean(&self.dir);
         loop {
             match requests.recv_timeout(POLL) {
                 Ok(r) => self.handle(r, Instant::now()),
@@ -95,6 +98,7 @@ impl Worker {
             Request::Search(query) => self.start_search(query.trim(), now),
             Request::Download(hit) => self.start_download(hit),
             Request::Cancel(key) => self.cancel(&key),
+            Request::StopSearch => self.stop_search(),
             Request::Account(account) => {
                 let set = account.is_some();
                 self.net.set_account(account);
@@ -148,6 +152,8 @@ impl Worker {
         if self.downloads.contains_key(&key) {
             return;
         }
+        // The DJ has found what they wanted; the search's traffic would slow the download.
+        self.stop_search();
         let started = self
             .net
             .connect()
@@ -162,17 +168,30 @@ impl Worker {
         self.update(|s| set(s, &hit, transfer));
     }
 
+    /// Stop gathering hits, keeping those in: the search is done.
+    fn stop_search(&mut self) {
+        let Some((query, _)) = self.search.take() else {
+            return;
+        };
+        self.publish_hits(&query);
+        self.net.forget(&query);
+        self.update(|s| s.status = Status::Done);
+    }
+
+    /// Publish `query`'s hits, ranked, if new ones came in.
+    fn publish_hits(&mut self, query: &str) {
+        if let Some(mut hits) = self.net.hits(query) {
+            hits.sort_by(best_first);
+            self.update(|s| s.hits = Arc::new(hits));
+        }
+    }
+
     /// Publish new hits, close the search's window, and follow the downloads.
     fn poll(&mut self, now: Instant) {
-        if let Some((query, sent)) = &self.search {
-            if let Some(mut hits) = self.net.hits(query) {
-                hits.sort_by(best_first);
-                self.update(|s| s.hits = Arc::new(hits));
-            }
-            if now.duration_since(*sent) >= SEARCH_WINDOW {
-                self.net.forget(query);
-                self.search = None;
-                self.update(|s| s.status = Status::Done);
+        if let Some((query, sent)) = self.search.clone() {
+            self.publish_hits(&query);
+            if now.duration_since(sent) >= SEARCH_WINDOW {
+                self.stop_search();
             }
         }
         let mut changed = Vec::new();
@@ -229,6 +248,23 @@ fn set(s: &mut Snapshot, hit: &Hit, transfer: Transfer) {
         }),
     }
 }
+
+/// The partial files (`.part`) in the downloads folder `dir`: what a run that ended with
+/// downloads under way left behind. Nothing else is touched. Returns how many went.
+fn clean(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(PART_SUFFIX))
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
+/// What a download writes to until it is complete (`soulseek-rs-lib`'s suffix).
+const PART_SUFFIX: &str = ".part";
 
 /// A peer's file name without its folders.
 fn file_name(path: &str) -> &str {
@@ -486,5 +522,44 @@ mod tests {
         w.handle(Request::Account(None), Instant::now());
         assert!(!snap(&shared).account);
         assert_eq!(*accounts.lock().unwrap(), [Some("new".into()), None]);
+    }
+
+    #[test]
+    fn leaving_the_search_or_starting_a_download_stops_it_and_keeps_the_hits() {
+        let net = Script {
+            hits: vec![hit("a.mp3", 320)],
+            ..Script::default()
+        };
+        let forgotten = Arc::clone(&net.forgotten);
+        let (mut w, shared) = worker(net);
+        w.handle(Request::Search("q".into()), Instant::now());
+        w.handle(Request::StopSearch, Instant::now());
+        assert_eq!(snap(&shared).status, Status::Done);
+        assert_eq!(snap(&shared).hits.len(), 1, "the hits in by then are kept");
+        assert_eq!(*forgotten.lock().unwrap(), ["q"]);
+        w.handle(Request::StopSearch, Instant::now());
+        assert_eq!(forgotten.lock().unwrap().len(), 1, "once");
+
+        w.handle(Request::Search("r".into()), Instant::now());
+        w.handle(Request::Download(hit("a.mp3", 320)), Instant::now());
+        assert_eq!(snap(&shared).status, Status::Done);
+        assert_eq!(*forgotten.lock().unwrap(), ["q", "r"]);
+    }
+
+    #[test]
+    fn partial_files_left_behind_are_removed_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("soulseek-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub.part")).unwrap();
+        for f in ["a.flac.part", "b.mp3", "c.part.mp3", "sub.part/d.mp3.part"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert_eq!(clean(&dir), 1);
+        assert!(!dir.join("a.flac.part").exists());
+        for kept in ["b.mp3", "c.part.mp3", "sub.part/d.mp3.part"] {
+            assert!(dir.join(kept).exists(), "{kept}");
+        }
+        assert_eq!(clean(&dir.join("missing")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

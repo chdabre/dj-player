@@ -405,3 +405,31 @@ fn files_go_into_playlists_and_the_playlists_come_back() {
         }
     }
 }
+
+#[test]
+fn imported_files_get_records_and_join_the_listing() {
+    let dir = temp_dir("import");
+    let a = dir.join("SoulSeek Downloads").join("a.wav");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    write_wav(&a, 440.0);
+    let w = LibraryWorker::start(
+        Some(DeviceId::random()),
+        LibraryChoice::Folder(dir.join("DJPLAYER")),
+    )
+    .unwrap();
+    w.import(vec![a.clone()]);
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < until,
+            "the listing never showed the import"
+        );
+        match w.try_recv() {
+            Some(Reply::Listing(l)) if l.contains_key("SoulSeek Downloads/a.wav") => break,
+            Some(Reply::Playlists(p)) => assert!(p.entries.values().all(Vec::is_empty)),
+            Some(Reply::Failed(e)) => panic!("{e}"),
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}

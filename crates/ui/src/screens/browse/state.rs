@@ -244,8 +244,11 @@ impl BrowseState {
 
     /// The knob and BACK on the list.
     fn list_nav(&mut self, n: Nav, cx: &mut Cx) -> Show {
-        // On SoulSeek the knob is on the hits; BACK leaves the search as it does on the stick.
-        if self.on_soulseek(cx) && n != Nav::Back {
+        // On SoulSeek the knob is on the hits; BACK leaves the search as it does on the stick,
+        // and stops the network's.
+        if self.on_soulseek(cx) && n == Nav::Back {
+            cx.effects.push(Effect::StopSearch);
+        } else if self.on_soulseek(cx) {
             match n {
                 Nav::Up => self.soulseek_move(-1, cx),
                 Nav::Down => self.soulseek_move(1, cx),

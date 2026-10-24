@@ -208,6 +208,17 @@ impl Player {
         }
     }
 
+    /// Give `files` a library record each where they have none, in the background.
+    pub fn import(&mut self, files: Vec<PathBuf>) -> bool {
+        match &self.library {
+            Some(lib) if !files.is_empty() => {
+                lib.import(files);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// MAKE PLAYLIST from `files`: a new list at the end of folder `parent`.
     pub fn new_playlist(
         &mut self,

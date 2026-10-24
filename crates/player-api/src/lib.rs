@@ -74,6 +74,9 @@ pub trait Port {
     fn library_edit(&mut self, edit: Edit) -> bool;
     /// Add `files` at the end of `playlist` (records made where missing).
     fn add_files(&mut self, playlist: PlaylistId, files: Vec<PathBuf>) -> bool;
+    /// Give `files` a library record each (with their tags) where they have none: files that
+    /// arrived on the stick, such as downloads. False without a library.
+    fn import(&mut self, files: Vec<PathBuf>) -> bool;
     /// A new playlist of `files` at the end of folder `parent`.
     fn new_playlist(
         &mut self,

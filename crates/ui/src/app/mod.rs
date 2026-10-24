@@ -13,13 +13,14 @@ mod platform;
 mod start;
 pub mod track;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use browser::Browser;
 use player_api::{DeckCommand, OnDeck, Port};
-use soulseek::{Credentials, DOWNLOADS_DIR, Snapshot, Soulseek};
+use soulseek::{Credentials, DOWNLOADS_DIR, Snapshot, Soulseek, Transfer};
 use winit::keyboard::ModifiersState;
 
 use crate::args::{self, Args};
@@ -64,6 +65,8 @@ pub struct App {
     config: Option<PathBuf>,
     /// What it had at the start of the frame: what the screen shows and input acts on.
     soulseek_seen: Option<Snapshot>,
+    /// Downloads already handed to the library to import.
+    imported: HashSet<PathBuf>,
     /// A `--search` query still to start.
     pending_search: Option<String>,
     /// Which screen is up, each screen's state, and the touch in progress.
@@ -153,6 +156,7 @@ impl App {
             soulseek,
             config,
             soulseek_seen: None,
+            imported: HashSet::new(),
             // Applied once the library's listing is in (a library search needs it).
             pending_search: args.search.clone(),
             screens,
@@ -261,6 +265,11 @@ impl App {
                         s.search(&query);
                     }
                 }
+                Effect::StopSearch => {
+                    if let Some(s) = &self.soulseek {
+                        s.stop_search();
+                    }
+                }
                 Effect::Download(hit) => {
                     if let Some(s) = &self.soulseek {
                         s.download(&hit);
@@ -273,6 +282,29 @@ impl App {
                 }
                 Effect::SetAccount(account) => self.set_account(account),
             }
+        }
+    }
+
+    /// Downloads that finished since the last frame get their library records, so they show
+    /// under LIBRARY without a scan.
+    fn import_downloads(&mut self) {
+        let Some(s) = &self.soulseek_seen else {
+            return;
+        };
+        let done: Vec<PathBuf> = s
+            .transfers
+            .iter()
+            .filter_map(|q| match &q.transfer {
+                Transfer::Done(path) if !self.imported.contains(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        if done.is_empty() {
+            return;
+        }
+        self.imported.extend(done.iter().cloned());
+        if !self.player.import(done) {
+            eprintln!("soulseek: no library to import the download into");
         }
     }
 

@@ -32,6 +32,8 @@ pub enum Effect {
     StopAnalyzeAll,
     /// Search SoulSeek for this.
     SoulseekSearch(String),
+    /// Stop gathering hits for the SoulSeek search (its hits stay).
+    StopSearch,
     /// Download this SoulSeek hit into the stick's downloads folder.
     Download(Hit),
     /// Stop this download (or take a finished one off the queue).

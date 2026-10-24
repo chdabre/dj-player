@@ -6,8 +6,9 @@
 //! [`Soulseek::search`] and [`Soulseek::download`] queue a request, and [`Soulseek::snapshot`]
 //! reads what has come in. It logs in when first asked for something, with the account from
 //! [`Credentials`] (kept on the player's own storage, [`Credentials::load`]), and logs in
-//! again after the session drops or the account changes. Downloads can be cancelled. Nothing
-//! is shared with the network yet.
+//! again after the session drops or the account changes. Downloads can be cancelled; the
+//! partial files of a run that ended mid-download are removed at the next start. Nothing is
+//! shared with the network yet.
 
 mod account;
 mod demo;
@@ -197,6 +198,8 @@ enum Request {
     Cancel(HitKey),
     /// Log in as this account from now on (`None`: no account).
     Account(Option<Credentials>),
+    /// Stop gathering hits for the search under way.
+    StopSearch,
 }
 
 /// A SoulSeek client on its own thread.
@@ -236,6 +239,11 @@ impl Soulseek {
     /// Download `hit` into the downloads folder (again, if it failed).
     pub fn download(&self, hit: &Hit) {
         let _ = self.requests.send(Request::Download(hit.clone()));
+    }
+
+    /// Stop gathering hits for the search under way (the DJ left it); its hits stay.
+    pub fn stop_search(&self) {
+        let _ = self.requests.send(Request::StopSearch);
     }
 
     /// Stop the download of `key` (its partial file is removed), or take it off the queue

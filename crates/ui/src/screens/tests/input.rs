@@ -316,6 +316,11 @@ fn soulseek_searches_on_done_and_a_picked_hit_downloads_then_loads() {
     // BACK leaves the search; the source is kept for the next one.
     with(&mut s, &d, &mut b, &mut fx, &net, Nav::Back);
     assert!(b.search_query().is_none());
+    assert_eq!(
+        said(&fx).last(),
+        Some(&format!("{:?}", Effect::StopSearch)),
+        "and stops the network's search"
+    );
     assert_eq!(s.browse.source, browse::SearchSource::Soulseek);
     let _ = std::fs::remove_dir_all(&dir);
 }

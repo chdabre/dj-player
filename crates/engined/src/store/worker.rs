@@ -96,7 +96,7 @@ struct Worker<'a> {
     open: Vec<Open>,
     scan: Option<Scan>,
     /// Files still to add to playlists, in order, and when the playlists were last sent.
-    adding: VecDeque<(PlaylistId, PathBuf)>,
+    adding: VecDeque<(Option<PlaylistId>, PathBuf)>,
     adding_sent: Instant,
     /// The listing changed since it was last published.
     listing_stale: bool,
@@ -199,12 +199,12 @@ impl<'a> Worker<'a> {
         match open(l, &file, &|_| {}) {
             Ok((track, _)) => {
                 refresh_tags(&mut l.lib, track, &file, &say);
-                let add = Edit::AddEntries {
+                let add = playlist.map(|playlist| Edit::AddEntries {
                     playlist,
                     tracks: vec![track],
                     before: None,
-                };
-                if let Err(e) = l.lib.apply(add) {
+                });
+                if let Some(Err(e)) = add.map(|a| l.lib.apply(a)) {
                     say(format!("library: {e}"));
                 }
             }
@@ -439,7 +439,7 @@ impl<'a> Worker<'a> {
         match loc.lib.apply(make) {
             Ok(_) => {
                 publish_playlists(&loc.lib, self.replies);
-                self.adding.extend(files.into_iter().map(|f| (id, f)));
+                self.adding.extend(files.into_iter().map(|f| (Some(id), f)));
                 self.adding_sent = Instant::now();
             }
             Err(e) => sayer(self.replies)(format!("library: {e}")),

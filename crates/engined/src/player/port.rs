@@ -118,6 +118,10 @@ impl Port for Player {
         Player::add_files(self, playlist, files)
     }
 
+    fn import(&mut self, files: Vec<PathBuf>) -> bool {
+        Player::import(self, files)
+    }
+
     fn new_playlist(
         &mut self,
         id: PlaylistId,

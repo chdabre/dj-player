@@ -80,9 +80,10 @@ enum Request {
         file: PathBuf,
     },
     Store(Box<BatchResult>),
-    /// Files into a playlist, in order, records made where missing.
+    /// Files into a playlist, in order, records made where missing; with no playlist,
+    /// only the records (an import).
     AddFiles {
-        playlist: PlaylistId,
+        playlist: Option<PlaylistId>,
         files: Vec<PathBuf>,
     },
     /// A new list made of files (MAKE PLAYLIST on a folder).
@@ -209,7 +210,19 @@ impl LibraryWorker {
     /// hundreds of files doesn't hold up a load); files without a record get one. Playlist
     /// edits go through [`LibraryWorker::edit`]; the playlists are published after either.
     pub fn add_files(&self, playlist: PlaylistId, files: Vec<PathBuf>) {
-        self.send(Request::AddFiles { playlist, files });
+        self.send(Request::AddFiles {
+            playlist: Some(playlist),
+            files,
+        });
+    }
+
+    /// Give `files` a record each (with their tags) where they have none, in the background
+    /// as [`LibraryWorker::add_files`] does; the listing is published once they are in.
+    pub fn import(&self, files: Vec<PathBuf>) {
+        self.send(Request::AddFiles {
+            playlist: None,
+            files,
+        });
     }
 
     /// MAKE PLAYLIST: a new list `id` at the end of folder `parent`, of `files` in order.
