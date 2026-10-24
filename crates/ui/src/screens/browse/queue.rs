@@ -176,6 +176,7 @@ mod tests {
         assert_eq!(queue_chip(&s), None, "no downloads, no chip");
         s.transfers = vec![
             Queued {
+                path: Default::default(),
                 hit: hit("a.mp3"),
                 transfer: Transfer::Receiving {
                     done: 50,
@@ -183,10 +184,12 @@ mod tests {
                 },
             },
             Queued {
+                path: Default::default(),
                 hit: hit("b.mp3"),
                 transfer: Transfer::Queued,
             },
             Queued {
+                path: Default::default(),
                 hit: hit("c.mp3"),
                 transfer: Transfer::Done("/x/c.mp3".into()),
             },
@@ -194,6 +197,7 @@ mod tests {
         assert_eq!(queue_chip(&s), Some(("QUEUE 2 · 25 %".into(), true)));
         s.transfers.clear();
         s.transfers.push(Queued {
+            path: Default::default(),
             hit: hit("c.mp3"),
             transfer: Transfer::Failed("gone".into()),
         });

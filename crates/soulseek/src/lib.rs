@@ -134,11 +134,20 @@ impl Transfer {
     }
 }
 
-/// A download in the queue: the file, and where it is.
+/// A download in the queue: the file, where it is, and where it lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queued {
     pub hit: Hit,
     pub transfer: Transfer,
+    /// The file once complete, in the downloads folder ([`part`] while it arrives).
+    pub path: PathBuf,
+}
+
+/// Where a download is written until it is complete (and renamed to `path`).
+pub fn part(path: &std::path::Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(worker::PART_SUFFIX);
+    PathBuf::from(p)
 }
 
 /// What the client has: the account, the search, its hits best first, and the downloads.

@@ -134,6 +134,44 @@ impl Player {
     /// Load `file` onto the deck, replacing what is there (paused at the cue point once it
     /// is known). The previous track's last cue edits go to the library first.
     pub fn load(&mut self, file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.load_with(file, false)
+    }
+
+    /// Load `file` while it is still arriving at `part`, `len` bytes in all (a download):
+    /// the decode and the analysis start now and wait for the rest as they go, so playback can
+    /// start once the first chunk is decoded. The library record follows once
+    /// [`Player::arrived`] says the file is complete. Fails if what has arrived is not yet
+    /// enough to open it (try again with more).
+    pub fn load_arriving(
+        &mut self,
+        file: &Path,
+        part: &Path,
+        len: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        engine_media::arriving(file, part, len);
+        self.load_with(file, true)
+    }
+
+    /// The download of `file` ended, complete or not. If the deck holds it, a complete file
+    /// gets its library record now; otherwise the deck keeps what arrived, unrecorded.
+    pub fn arrived(&mut self, file: &Path, complete: bool) -> Option<String> {
+        engine_media::arrived(file, complete);
+        let d = self
+            .deck
+            .loaded
+            .as_mut()
+            .filter(|d| d.arriving && d.file == file)?;
+        d.arriving = false;
+        if !complete {
+            return Some("the download stopped: playing what arrived, nothing is stored".into());
+        }
+        if let Some(lib) = &self.library {
+            lib.open(d.serial, file.to_path_buf());
+        }
+        None
+    }
+
+    fn load_with(&mut self, file: &Path, arriving: bool) -> Result<(), Box<dyn std::error::Error>> {
         let waveform = Arc::new(LiveWaveform::default());
         let tap = WaveTap::new(self.format.sample_rate, Arc::clone(&waveform))
             .with_first_sound(self.auto_cue.threshold());
@@ -151,11 +189,19 @@ impl Player {
             DeckCommand::Load(Arc::clone(&loading.source)),
         )?;
         self.loads += 1;
+        if let Some(previous) = &self.deck.loaded
+            && previous.arriving
+        {
+            // Its decode and analysis wait no longer; the download itself goes on.
+            engine_media::arrived(&previous.file, false);
+        }
         if let Some(lib) = &self.library {
             if let Some(previous) = &self.deck.loaded {
                 lib.close(previous.serial);
             }
-            lib.open(self.loads, file.to_path_buf());
+            if !arriving {
+                lib.open(self.loads, file.to_path_buf());
+            }
         }
         // Dropping the previous track stops its decode and analysis where they are.
         self.deck.loaded = Some(LoadedTrack {
@@ -169,9 +215,17 @@ impl Player {
             analysed: None,
             waveform,
             lib: LibState::default(),
+            arriving,
         });
         if self.library.is_none() {
             self.no_record();
+        } else if arriving {
+            // A new download has no stored cues to wait for (a known one gets them when its
+            // record comes), and its analysis need not wait for the record.
+            if let Some(d) = self.deck.loaded.as_mut() {
+                d.lib.cues.memory_cues.get_or_insert(0);
+            }
+            self.start_analysis(BTreeMap::new(), true);
         }
         Ok(())
     }

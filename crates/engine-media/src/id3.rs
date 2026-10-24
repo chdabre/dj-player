@@ -1,8 +1,9 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use symphonia::core::io::MediaSource;
+
+use crate::arriving::MediaFile;
 
 /// A file with any leading ID3v2 tags skipped: offset 0 is the first byte after them.
 ///
@@ -10,16 +11,18 @@ use symphonia::core::io::MediaSource;
 /// finds a false frame sync inside the picture, takes the wrong stream parameters and then
 /// fails to decode every packet. Audio never needs the tag, and gapless (LAME/Xing) info sits
 /// in the first audio frame after it, so skipping it ourselves loses nothing.
+///
+/// The file may still be arriving ([`crate::arriving`]): its length is then the final one.
 pub(crate) struct AfterId3 {
-    file: File,
+    file: MediaFile,
     offset: u64,
     len: u64,
 }
 
 impl AfterId3 {
     pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
-        let mut file = File::open(path)?;
-        let total = file.metadata()?.len();
+        let mut file = MediaFile::open(path)?;
+        let total = file.len()?;
         let mut offset = 0u64;
         let mut header = [0u8; 10];
         // A file may carry more than one tag back to back.

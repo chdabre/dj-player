@@ -88,6 +88,14 @@ impl Port for Player {
         Player::load(self, file).map_err(|e| e.to_string())
     }
 
+    fn load_arriving(&mut self, file: &Path, part: &Path, len: u64) -> Result<(), String> {
+        Player::load_arriving(self, file, part, len).map_err(|e| e.to_string())
+    }
+
+    fn arrived(&mut self, file: &Path, complete: bool) -> Option<String> {
+        Player::arrived(self, file, complete)
+    }
+
     fn poll(&mut self) -> Vec<String> {
         Player::poll(self)
     }

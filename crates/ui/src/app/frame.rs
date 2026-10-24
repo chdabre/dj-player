@@ -50,6 +50,7 @@ impl App {
         self.player.tick_controls(dt);
         self.soulseek_seen = self.soulseek.as_ref().map(Soulseek::snapshot);
         self.import_downloads();
+        self.follow_arrival();
         // Held controls act before the deck is read, as a press would.
         self.apply_effects();
         self.deck = self.player.deck();

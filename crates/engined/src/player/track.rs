@@ -28,6 +28,9 @@ pub struct LoadedTrack {
     pub analysed: Option<Analysed>,
     pub(super) waveform: Arc<LiveWaveform>,
     pub(super) lib: LibState,
+    /// The file is still arriving (a download): the library opens its record once it is
+    /// complete, since its identity is its content.
+    pub(super) arriving: bool,
 }
 
 impl Drop for LoadedTrack {

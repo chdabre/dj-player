@@ -32,6 +32,11 @@ pub type Tap = Box<dyn FnMut(&[f32]) + Send>;
 ///
 /// If the container does not state the track length, the whole file is decoded on the calling
 /// thread first (the source is then complete when this returns).
+///
+/// A file still arriving ([`crate::arriving`]) is probed without waiting: if what has
+/// arrived is not enough to probe it, or its container does not state the length, this
+/// fails (try again later, or once it is complete). The loader thread then waits for the
+/// rest as it decodes.
 pub fn load_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Loading, LoadError> {
     load_file_tapped(path, sample_rate, None)
 }
@@ -44,7 +49,13 @@ pub fn load_file_tapped(
 ) -> Result<Loading, LoadError> {
     let path = path.as_ref().to_path_buf();
     let cancel = Cancel::new();
-    let mut decoding = Decoding::open(&path)?;
+    let mut decoding = crate::arriving::without_waiting(|| Decoding::open(&path))?;
+    if decoding.frames.is_none() && crate::arriving::is_arriving(&path) {
+        return Err(LoadError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "its length is known only once it has arrived",
+        )));
+    }
     decoding.cancel = Some(cancel.clone());
     let info = TrackInfo {
         path: path.clone(),

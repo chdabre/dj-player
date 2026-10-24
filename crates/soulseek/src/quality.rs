@@ -44,6 +44,13 @@ impl Format {
         )
     }
 
+    /// Whether a file can be played from its start while the rest is still arriving: its
+    /// container states the length up front and keeps nothing needed at its end (an `.m4a`
+    /// may keep its index there).
+    pub fn streams(self) -> bool {
+        !matches!(self, Format::Alac | Format::M4a)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Format::Flac => "FLAC",
@@ -174,6 +181,7 @@ mod tests {
         assert_eq!(Format::of("cover.jpg"), None);
         assert_eq!(Format::of("no extension"), None);
         assert!(Format::Wav.lossless() && !Format::Mp3.lossless());
+        assert!(Format::Flac.streams() && Format::Mp3.streams() && !Format::M4a.streams());
     }
 
     #[test]

@@ -303,6 +303,7 @@ fn soulseek_searches_on_done_and_a_picked_hit_downloads_then_loads() {
     fx.clear();
     // Under way: pushing again does nothing. Downloaded: it loads.
     net.transfers = vec![Queued {
+        path: Default::default(),
         hit: hits[1].clone(),
         transfer: Transfer::Queued,
     }];
@@ -383,6 +384,7 @@ fn the_queue_chip_opens_the_queue_where_cancel_stops_the_selected_download() {
         ..Screens::default()
     };
     let file = |name: &str, transfer| Queued {
+        path: Default::default(),
         hit: Hit {
             user: "peer".into(),
             path: format!("@@share\\{name}"),

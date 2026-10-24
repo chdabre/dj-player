@@ -4,6 +4,7 @@
 //! (`keymap.rs`); what the controls do is the player's (`engined::controls`). [`App`] owns
 //! all of it.
 
+mod arrival;
 mod capture;
 pub mod effects;
 pub mod engine;
@@ -65,6 +66,8 @@ pub struct App {
     config: Option<PathBuf>,
     /// What it had at the start of the frame: what the screen shows and input acts on.
     soulseek_seen: Option<Snapshot>,
+    /// The download the deck takes as it arrives, if one was started with the deck paused.
+    arrival: Option<arrival::Arrival>,
     /// Downloads already handed to the library to import.
     imported: HashSet<PathBuf>,
     /// A `--search` query still to start.
@@ -157,6 +160,7 @@ impl App {
             config,
             soulseek_seen: None,
             imported: HashSet::new(),
+            arrival: None,
             // Applied once the library's listing is in (a library search needs it).
             pending_search: args.search.clone(),
             screens,
@@ -271,6 +275,13 @@ impl App {
                     }
                 }
                 Effect::Download(hit) => {
+                    let downloads = self.soulseek_seen.as_ref();
+                    if let (Some(root), true) = (
+                        self.browser.as_ref().map(|b| b.root()),
+                        arrival::follow(self.deck.playing, downloads, &hit),
+                    ) {
+                        self.arrival = Some(arrival::Arrival::new(&hit, &root.join(DOWNLOADS_DIR)));
+                    }
                     if let Some(s) = &self.soulseek {
                         s.download(&hit);
                     }
@@ -329,9 +340,7 @@ impl App {
             eprintln!("can't load {}: {e}", path.display());
             return;
         }
-        let tags = self.browser.as_ref().and_then(|b| b.info(path));
-        self.track = Track::new(path, tags.as_ref(), self.player.output().sample_rate);
-        self.on_deck = self.player.on_deck();
+        self.took(path);
         self.screens.loaded();
         eprintln!("loaded {}", path.display());
     }

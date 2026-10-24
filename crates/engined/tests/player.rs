@@ -87,3 +87,59 @@ fn hot_cues_follow_their_track_across_loads() {
     );
     assert!(!p.state().playing.load(Ordering::Relaxed));
 }
+
+#[test]
+#[ignore = "needs an audio output device"]
+fn a_track_plays_and_analyses_while_it_arrives_and_is_recorded_once_complete() {
+    use std::io::Write;
+    let dir = temp_dir("arriving");
+    let src = dir.join("src.wav");
+    write_wav(&src, 440.0);
+    let bytes = std::fs::read(&src).unwrap();
+    let downloads = dir.join("SoulSeek Downloads");
+    std::fs::create_dir_all(&downloads).unwrap();
+    let (file, part) = (downloads.join("a.wav"), downloads.join("a.wav.part"));
+    let mut out = std::fs::File::create(&part).unwrap();
+    out.write_all(&bytes[..256 * 1024]).unwrap();
+    out.flush().unwrap();
+
+    let options = Options {
+        library: LibraryChoice::Folder(dir.join("DJPLAYER")),
+        auto_cue: AutoCue::Off,
+        ..Options::default()
+    };
+    let mut p = Player::start(&CpalBackend::new(), &StreamRequest::default(), options).unwrap();
+    // Not enough to open: the load says so and nothing waits.
+    let early = dir.join("early.wav");
+    std::fs::write(dir.join("early.wav.part"), &bytes[..8]).unwrap();
+    assert!(
+        p.load_arriving(&early, &dir.join("early.wav.part"), bytes.len() as u64)
+            .is_err()
+    );
+
+    p.load_arriving(&file, &part, bytes.len() as u64).unwrap();
+    assert_eq!(p.loaded().unwrap().file(), file.as_path());
+    // Playable from the first chunk; the rest follows as it arrives.
+    poll_until(&mut p, "the first chunk", |p| {
+        p.loaded().unwrap().source.chunks_ready() > 0
+    });
+    assert!(
+        !p.loaded().unwrap().source.is_complete(),
+        "only what arrived"
+    );
+    out.write_all(&bytes[256 * 1024..]).unwrap();
+    out.flush().unwrap();
+    poll_until(&mut p, "the analysis, before the download ended", |p| {
+        p.loaded().unwrap().analysed.is_some()
+    });
+    assert!(p.track().is_none(), "no record while it arrives");
+
+    std::fs::rename(&part, &file).unwrap();
+    assert_eq!(p.arrived(&file, true), None);
+    poll_until(&mut p, "the record, with the analysis stored", |p| {
+        p.track().is_some()
+            && p.listing()
+                .and_then(|l| l.get("SoulSeek Downloads/a.wav"))
+                .is_some_and(|l| l.analysed)
+    });
+}

@@ -1,10 +1,10 @@
-use std::fs::File;
 use std::path::Path;
 
 use symphonia::core::formats::FormatReader;
 use symphonia::core::meta::StandardTag as S;
 
 use crate::LoadError;
+use crate::arriving::MediaFile;
 use crate::artwork::{self, Artwork};
 use crate::decode::{Decoding, probe_format};
 use crate::id3::AfterId3;
@@ -32,7 +32,12 @@ pub struct Tags {
 /// file (leading ID3v2 included); the length from the probe the loader makes, which skips the
 /// ID3v2 tag. A file without a leading tag is probed once, since both see the same bytes.
 pub fn tags(path: impl AsRef<Path>) -> Result<Tags, LoadError> {
-    let path = path.as_ref();
+    // A file still arriving is read as far as it has: tags are read on threads that must
+    // not wait (the UI's).
+    crate::arriving::without_waiting(|| tags_now(path.as_ref()))
+}
+
+fn tags_now(path: &Path) -> Result<Tags, LoadError> {
     let file = AfterId3::open(path)?;
     let skipped = file.skipped();
     let mut decoding = Decoding::from_after_id3(path, file)?;
@@ -47,7 +52,7 @@ pub fn tags(path: impl AsRef<Path>) -> Result<Tags, LoadError> {
         return Ok(tags);
     }
     // A file whose tag trips the probe still has a length.
-    if let Ok(mut format) = probe_format(path, Box::new(File::open(path)?)) {
+    if let Ok(mut format) = probe_format(path, Box::new(MediaFile::open(path)?)) {
         read_into(&mut *format, &mut tags);
     }
     Ok(tags)

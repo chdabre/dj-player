@@ -165,7 +165,8 @@ impl Worker {
             }
             Err(e) => Transfer::Failed(e),
         };
-        self.update(|s| set(s, &hit, transfer));
+        let path = self.dir.join(hit.name());
+        self.update(|s| set(s, &hit, transfer, path));
     }
 
     /// Stop gathering hits, keeping those in: the search is done.
@@ -239,12 +240,13 @@ impl Worker {
 }
 
 /// `hit`'s place in the queue says `transfer` (at the end, if it has none).
-fn set(s: &mut Snapshot, hit: &Hit, transfer: Transfer) {
+fn set(s: &mut Snapshot, hit: &Hit, transfer: Transfer, path: PathBuf) {
     match s.transfers.iter_mut().find(|q| q.hit.key() == hit.key()) {
         Some(q) => q.transfer = transfer,
         None => s.transfers.push(Queued {
             hit: hit.clone(),
             transfer,
+            path,
         }),
     }
 }
@@ -264,7 +266,7 @@ fn clean(dir: &Path) -> usize {
 }
 
 /// What a download writes to until it is complete (`soulseek-rs-lib`'s suffix).
-const PART_SUFFIX: &str = ".part";
+pub(crate) const PART_SUFFIX: &str = ".part";
 
 /// A peer's file name without its folders.
 fn file_name(path: &str) -> &str {

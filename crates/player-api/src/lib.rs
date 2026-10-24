@@ -62,6 +62,13 @@ pub trait Port {
     fn on_deck(&self) -> Option<OnDeck>;
     /// Load `file` onto the deck, replacing what is there.
     fn load(&mut self, file: &Path) -> Result<(), String>;
+    /// Load `file` while it is still arriving at `part` (a download), `len` bytes in all:
+    /// decode and analysis wait for the rest as they go, so playback starts as soon as the
+    /// first chunk is decoded. Fails if not enough has arrived to open it yet.
+    fn load_arriving(&mut self, file: &Path, part: &Path, len: u64) -> Result<(), String>;
+    /// `file`'s download ended, complete or not (it gets its library record if complete and
+    /// on the deck). A line worth showing may come back.
+    fn arrived(&mut self, file: &Path, complete: bool) -> Option<String>;
     /// Take in what the player's workers finished; lines worth showing come back.
     fn poll(&mut self) -> Vec<String>;
     /// The audio callback's load since the last call.

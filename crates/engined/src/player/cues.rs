@@ -109,6 +109,7 @@ impl Player {
             }
             let need_hash = !l.record.audio_hash.is_some_and(|a| a.is_current());
             self.start_analysis(l.analysis, need_hash);
+            self.store_early_analysis();
         }
     }
 
@@ -157,6 +158,22 @@ impl Player {
         let sr = f64::from(self.format.sample_rate);
         for (slot, cue) in d.lib.cues.write_back(applied, positions, sr) {
             lib.edit(Edit::SetHotCue(t.track, slot, cue));
+        }
+    }
+
+    /// An analysis that finished before the record came (a track loaded while it arrived):
+    /// its results go to the library now.
+    fn store_early_analysis(&mut self) {
+        let (Some(d), Some(lib)) = (self.deck.loaded.as_mut(), &self.library) else {
+            return;
+        };
+        let Some(done) = d.analysed.as_mut() else {
+            return;
+        };
+        lib.analysis(d.serial, std::mem::take(&mut done.fresh));
+        lib.analysed(d.serial, done.bpm, done.key.clone());
+        if let Some(h) = done.audio_hash {
+            lib.audio_hash(d.serial, h);
         }
     }
 }
